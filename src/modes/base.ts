@@ -374,7 +374,7 @@ export async function updateModeState(
       cwd,
       baseStateDir,
       state: updated as Record<string, unknown>,
-      explicitSessionId,
+      explicitSessionId: scope.sessionId,
     });
     if (!ralplanCompletionHandled) {
       await syncCanonicalSkillStateForMode({

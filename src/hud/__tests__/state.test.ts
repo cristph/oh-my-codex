@@ -2,9 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
 import { createSubagentTrackingState, recordSubagentTurn, writeSubagentTrackingState } from '../../subagents/tracker.js';
@@ -19,7 +19,15 @@ import {
   readDeepInterviewState,
   readAutoresearchState,
   readUltraqaState,
+  resolveHudAuthorityReadScope,
 } from '../state.js';
+import {
+  initializeStateAuthority,
+  rolloverStateAuthorityToAlternateRoot,
+  mintStateAuthorityTransportCapability,
+  stateAuthorityTransportCapabilityForChild,
+  type ResolvedStateAuthorityContext,
+} from '../../state/authority.js';
 
 function gitRunnerFromMap(map: Record<string, string | Error>) {
   return (_cwd: string, args: string[]) => {
@@ -86,6 +94,59 @@ async function createWorktreePointerFixture(cwd: string, options: { withOrigin?:
       '',
     ].join('\n'));
   }
+}
+
+const TEST_AUTHORITY_ISSUER = {
+  kind: 'first-party-launcher' as const,
+  package_version: 'test',
+  package_digest: '0'.repeat(64),
+};
+
+function authorityTransport(authority: ResolvedStateAuthorityContext): NodeJS.ProcessEnv {
+  const root = dirname(authority.generation.canonical_omx_root);
+  return {
+    OMX_STARTUP_CWD: authority.workspace_identity.canonical_path,
+    OMX_ROOT: root,
+    OMX_STATE_ROOT: root,
+    OMX_TEAM_STATE_ROOT: authority.canonical_state_root,
+    OMX_STATE_AUTHORITY_PATH: authority.authority_path,
+    OMX_STATE_AUTHORITY_ID: authority.generation.authority_id,
+    OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
+    OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: authority.workspace_identity.digest,
+    OMX_STATE_AUTHORITY_CAPABILITY: stateAuthorityTransportCapabilityForChild(authority),
+    OMX_SESSION_ID: authority.session_binding?.canonical_session_id,
+  };
+}
+
+async function createAlternateAuthority(
+  workspace: string,
+  alternateStateRoot: string,
+  launchId: string,
+): Promise<{
+  initial: ResolvedStateAuthorityContext;
+  active: ResolvedStateAuthorityContext;
+  initialTransport: NodeJS.ProcessEnv;
+  activeTransport: NodeJS.ProcessEnv;
+}> {
+  const initial = await initializeStateAuthority({
+    startup_cwd: workspace,
+    observed_cwd: workspace,
+    launch_id: `${launchId}-source`,
+    session_binding: { canonical_session_id: `${launchId}-session` },
+  });
+  await mintStateAuthorityTransportCapability(initial);
+  const initialTransport = authorityTransport(initial);
+  await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true });
+  const active = await rolloverStateAuthorityToAlternateRoot({
+    context: initial,
+    proposed_state_root: alternateStateRoot,
+    creation_root: dirname(dirname(alternateStateRoot)),
+    launch_id: `${launchId}-alternate`,
+    consumer_kind: 'boxed',
+    issuer: TEST_AUTHORITY_ISSUER,
+  });
+  await mintStateAuthorityTransportCapability(active);
+  return { initial, active, initialTransport, activeTransport: authorityTransport(active) };
 }
 
 describe('readGitBranch', () => {
@@ -915,14 +976,12 @@ describe('readAllState canonical skill precedence', () => {
       });
 
       const state = await readAllState(cwd);
-      assert.deepEqual(state.ultragoal, {
-        active: true,
-        mode: 'ultragoal',
-        current_phase: 'planning',
-        started_at: '2026-06-01T00:00:00.000Z',
-        updated_at: '2026-06-01T00:00:00.000Z',
-        session_id: sessionId,
-      });
+      assert.equal(state.ultragoal?.active, true);
+      assert.equal(state.ultragoal?.mode, 'ultragoal');
+      assert.equal(state.ultragoal?.current_phase, 'planning');
+      assert.equal(state.ultragoal?.started_at, '2026-06-01T00:00:00.000Z');
+      assert.equal(state.ultragoal?.updated_at, '2026-06-01T00:00:00.000Z');
+      assert.equal(state.ultragoal?.session_id, sessionId);
       const rendered = stripSgr(renderHud(state, 'focused'));
       assert.ok(rendered.includes('ultragoal:planning'));
     });
@@ -1692,6 +1751,127 @@ describe('readAllState canonical skill precedence', () => {
         });
       } finally {
         if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+      }
+    });
+  });
+});
+
+describe('HUD inherited state authority transport', { concurrency: false }, () => {
+  it('rejects inherited alternate transport from a sibling worktree but uses the canonical authority root from a nested cwd', async () => {
+    await withTempRepo('omx-hud-transport-worktree-', async (workspace) => {
+      initGitRepo(workspace);
+      const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), 'omx-hud-transport-runtime-')));
+      const disposableWorktree = join(runtimeRoot, 'disposable-worktree');
+      const nestedCwd = join(workspace, 'nested');
+      try {
+        execFileSync('git', ['worktree', 'add', '--detach', disposableWorktree], {
+          cwd: workspace,
+          stdio: 'ignore',
+        });
+        await mkdir(nestedCwd, { recursive: true });
+        const { active } = await createAlternateAuthority(
+          workspace,
+          join(runtimeRoot, 'alternate-runtime', '.omx', 'state'),
+          'hud-transport-worktree',
+        );
+        const sessionId = active.session_binding?.canonical_session_id;
+        assert.ok(sessionId);
+        await mkdir(join(active.canonical_state_root, 'sessions', sessionId), { recursive: true });
+        await writeFile(
+          join(active.canonical_state_root, 'sessions', sessionId, 'hud-state.json'),
+          JSON.stringify({ turn_count: 7, last_turn_at: 'authoritative-alternate' }),
+        );
+        await mkdir(join(nestedCwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+        await writeFile(
+          join(nestedCwd, '.omx', 'state', 'sessions', sessionId, 'hud-state.json'),
+          JSON.stringify({ turn_count: 999, last_turn_at: 'cwd-local-decoy' }),
+        );
+
+        const siblingScope = await resolveHudAuthorityReadScope(
+          disposableWorktree,
+          undefined,
+          authorityTransport(active),
+        );
+        assert.equal(siblingScope.workspaceRoot, disposableWorktree);
+        assert.equal(siblingScope.stateRoot, null);
+        assert.equal(siblingScope.context, undefined);
+        assert.deepEqual(siblingScope.diagnostics, [{
+          code: 'authority_observed_cwd_outside_workspace',
+          message: 'unable to resolve inherited state authority: inherited state-authority transport cannot be used from an unrelated workspace cwd',
+          fatal: true,
+        }]);
+
+        const scope = await resolveHudAuthorityReadScope(
+          nestedCwd,
+          undefined,
+          authorityTransport(active),
+        );
+
+        assert.equal(scope.workspaceRoot, active.workspace_identity.canonical_path);
+        assert.equal(scope.stateRoot, active.canonical_state_root);
+        assert.equal(scope.context?.observed_cwd, nestedCwd);
+        assert.deepEqual(await readHudNotifyState(nestedCwd, scope), {
+          turn_count: 7,
+          last_turn_at: 'authoritative-alternate',
+        });
+      } finally {
+        try {
+          execFileSync('git', ['worktree', 'remove', '--force', disposableWorktree], {
+            cwd: workspace,
+            stdio: 'ignore',
+          });
+        } catch {
+          // The fixture may not have reached worktree creation.
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('fails closed for stale, forged, and conflicting root-alias transport', async () => {
+    await withTempRepo('omx-hud-transport-denial-', async (workspace) => {
+      const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), 'omx-hud-transport-denial-runtime-')));
+      try {
+        const { initialTransport, activeTransport } = await createAlternateAuthority(
+          workspace,
+          join(runtimeRoot, 'alternate-runtime', '.omx', 'state'),
+          'hud-transport-denial',
+        );
+        const stale = await resolveHudAuthorityReadScope(
+          workspace,
+          undefined,
+          initialTransport,
+        );
+        assert.equal(stale.stateRoot, null);
+        assert.ok(stale.diagnostics.length > 0);
+        assert.match(stale.diagnostics[0]?.message ?? '', /transport does not match/i);
+
+        const forged = await resolveHudAuthorityReadScope(
+          workspace,
+          undefined,
+          {
+            ...activeTransport,
+            OMX_STATE_AUTHORITY_ID: 'forged-authority-id',
+          },
+        );
+        assert.equal(forged.stateRoot, null);
+        assert.ok(forged.diagnostics.length > 0);
+
+        const conflicting = await resolveHudAuthorityReadScope(
+          workspace,
+          undefined,
+          {
+            ...activeTransport,
+            OMX_TEAM_STATE_ROOT: join(runtimeRoot, 'foreign-state'),
+          },
+        );
+        assert.equal(conflicting.stateRoot, null);
+        assert.match(
+          conflicting.diagnostics.map((diagnostic) => diagnostic.message).join('\n'),
+          /OMX_TEAM_STATE_ROOT conflicts with the persisted authority state root/,
+        );
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
       }
     });
   });

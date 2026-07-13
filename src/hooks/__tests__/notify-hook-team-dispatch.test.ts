@@ -924,12 +924,10 @@ exit 0
     }
   });
 
-  it('uses explicit stateDir when marking mailbox notified_at', async () => {
+  it('uses explicit canonical stateDir when marking mailbox notified_at', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
-    const stateDir = join(cwd, 'custom-state-root');
-    const previousStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    const stateDir = join(cwd, '.omx', 'state');
     try {
-      process.env.OMX_TEAM_STATE_ROOT = './custom-state-root';
       await initTeamState('alpha', 'task', 'executor', 1, cwd);
       const msg = await sendDirectMessage('alpha', 'worker-1', 'worker-1', 'hello', cwd);
       const queued = await enqueueDispatchRequest('alpha', {
@@ -959,8 +957,6 @@ exit 0
       const notifiedAt = await waitForMailboxNotifiedAt('alpha', 'worker-1', msg.message_id, cwd);
       assert.ok(notifiedAt || request.notified_at, 'expected dispatch state or mailbox shadow to record notified_at');
     } finally {
-      if (typeof previousStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
     }
   });

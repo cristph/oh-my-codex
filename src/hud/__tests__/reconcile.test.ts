@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname } from 'node:path';
+import { delimiter, dirname } from 'node:path';
 import { join } from 'node:path';
 import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from '../reconcile.js';
 import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_ULTRAGOAL_HEIGHT_LINES, HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from '../constants.js';
@@ -11,6 +11,19 @@ import { OMX_TMUX_HUD_LEADER_PANE_ENV } from '../tmux.js';
 
 const noOpRegisterHudResizeHook = () => true;
 const noOpUnregisterHudResizeHook = () => true;
+
+function prependPath(entry: string, previous: string | undefined): string {
+  return [entry, previous].filter((value): value is string => typeof value === 'string' && value !== '').join(delimiter);
+}
+
+async function installFakeTmuxExecutable(fakeBinDir: string, script: string): Promise<void> {
+  const scriptPath = join(fakeBinDir, 'tmux');
+  await writeFile(scriptPath, script);
+  await chmod(scriptPath, 0o755);
+  if (process.platform === 'win32') {
+    await writeFile(join(fakeBinDir, 'tmux.cmd'), '@echo off\r\nbash "%~dp0tmux" %*\r\n');
+  }
+}
 
 async function writeHudReconcileLock(cwd: string, owner: Record<string, unknown>): Promise<string> {
   const lockPath = join(cwd, '.omx', 'state', 'hud-reconcile.lock');
@@ -1905,13 +1918,12 @@ describe('reconcileHudForPromptSubmit cramped-window guard (#2754)', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-cramped-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
-    const tmuxBin = join(fakeBinDir, 'tmux');
     const originalPath = process.env.PATH;
 
     try {
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(
-        tmuxBin,
+      await installFakeTmuxExecutable(
+        fakeBinDir,
         `#!/usr/bin/env bash
 set -eu
 printf '[%s]' "$@" >> "${tmuxLogPath}"
@@ -1926,8 +1938,7 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 `,
       );
-      await chmod(tmuxBin, 0o755);
-      process.env.PATH = `${fakeBinDir}:${originalPath ?? ''}`;
+      process.env.PATH = prependPath(fakeBinDir, originalPath);
 
       const created: string[] = [];
       const result = await reconcileHudForPromptSubmit('/repo', {

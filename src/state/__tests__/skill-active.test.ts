@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -416,6 +417,62 @@ describe('skill-active state helpers', () => {
         })),
         [{ skill: 'custom-skill', phase: 'running', session_id: undefined }],
       );
+    });
+  });
+  it('rejects symlinked canonical files and session entries without external writes', async () => {
+    await withTempRepo('omx-skill-active-symlink-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionsDir = join(stateDir, 'sessions');
+      const outsideFile = join(cwd, 'outside-skill-active.json');
+      const outsideDir = join(cwd, 'outside-session');
+      const sessionId = 'sess-symlink';
+      const sessionDir = join(sessionsDir, sessionId);
+      await writeSkillActiveStateCopies(cwd, {
+        active: true,
+        skill: 'team',
+        active_skills: [{ skill: 'team', active: true }],
+      });
+      await writeFile(outsideFile, 'outside canonical skill state must remain unchanged\n');
+      await rm(rootPath);
+      await symlink(outsideFile, rootPath, 'file');
+
+      await assert.rejects(
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true }),
+        /symbolic link/,
+      );
+      assert.equal(await readFile(outsideFile, 'utf-8'), 'outside canonical skill state must remain unchanged\n');
+
+      await rm(rootPath);
+      await writeSkillActiveStateCopies(cwd, {
+        active: true,
+        skill: 'team',
+        active_skills: [{ skill: 'team', active: true }],
+      });
+      await mkdir(outsideDir, { recursive: true });
+      await mkdir(sessionsDir, { recursive: true });
+      await symlink(outsideDir, sessionDir, process.platform === 'win32' ? 'junction' : 'dir');
+      const rootBeforeAllSessions = await readFile(rootPath, 'utf-8');
+
+      await assert.rejects(
+        syncCanonicalSkillStateForMode({ cwd, mode: 'team', active: false, allSessions: true }),
+        /symbolic link/,
+      );
+      await assert.rejects(
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId }),
+        /symbolic link/,
+      );
+      assert.equal(await readFile(rootPath, 'utf-8'), rootBeforeAllSessions);
+      assert.equal(existsSync(join(outsideDir, 'skill-active-state.json')), false);
+
+      await unlink(sessionDir);
+      await rm(sessionsDir, { recursive: true });
+      await symlink(outsideDir, sessionsDir, process.platform === 'win32' ? 'junction' : 'dir');
+      await assert.rejects(
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId }),
+        /symbolic link/,
+      );
+      assert.equal(existsSync(join(outsideDir, 'skill-active-state.json')), false);
     });
   });
 });

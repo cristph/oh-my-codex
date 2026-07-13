@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { mcpParityCommand } from "../mcp-parity.js";
 import { writeSessionStart } from "../../hooks/session.js";
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from "../../state/authority.js";
+import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 
 const originalLog = console.log;
 
@@ -21,6 +23,55 @@ function captureLogs(): string[] {
   };
   return logs;
 }
+const STATE_AUTHORITY_ENV_KEYS = [
+  "OMX_STARTUP_CWD",
+  "OMX_ROOT",
+  "OMX_STATE_ROOT",
+  "OMX_TEAM_STATE_ROOT",
+  "OMX_STATE_AUTHORITY_PATH",
+  "OMX_STATE_AUTHORITY_ID",
+  "OMX_STATE_AUTHORITY_GENERATION_ID",
+  "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+  "OMX_STATE_AUTHORITY_CAPABILITY",
+  "OMX_SESSION_ID",
+] as const;
+
+async function withCommittedAuthority<T>(
+  cwd: string,
+  sessionId: string,
+  run: () => Promise<T>,
+  ownerSessionId?: string,
+): Promise<T> {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `mcp-parity-${sessionId}`,
+    session_binding: {
+      canonical_session_id: sessionId,
+      aliases: {
+        native_session_id: sessionId,
+        current_session_aliases: [sessionId],
+        ...(ownerSessionId ? { owner_session_aliases: [ownerSessionId] } : {}),
+      },
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const transport = buildStateAuthorityTransportEnv(authority, {
+    OMX_SESSION_ID: ownerSessionId ?? sessionId,
+  });
+  const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, transport);
+  try {
+    return await run();
+  } finally {
+    for (const key of STATE_AUTHORITY_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === "string") process.env[key] = value;
+      else delete process.env[key];
+    }
+  }
+}
+
 
 async function writeOwnerEvidenceTmux(cwd: string, ownerSessionId: string, canonicalSessionId: string): Promise<string> {
   const fakeBinDir = join(cwd, "fake-bin");
@@ -52,24 +103,27 @@ describe("mcpParityCommand", () => {
     const logs = captureLogs();
 
     try {
-      await mcpParityCommand("state", [
-        "state_write",
-        "--input",
-        JSON.stringify({ mode: "ralph", active: true, current_phase: "executing", workingDirectory: cwd }),
-        "--json",
-      ]);
-      const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
-      assert.match(writeResult.path ?? "", /ralph-state\.json$/);
+      await withCommittedAuthority(cwd, "state-parity", async () => {
+        await mcpParityCommand("state", [
+          "state_write",
+          "--input",
+          JSON.stringify({ mode: "ralph", active: true, current_phase: "executing", workingDirectory: cwd }),
+          "--json",
+        ]);
+        const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
+        assert.match(writeResult.path ?? "", /ralph-state\.json$/);
 
-      await mcpParityCommand("state", [
-        "state_read",
-        "--input",
-        JSON.stringify({ mode: "ralph", workingDirectory: cwd }),
-        "--json",
-      ]);
-      const readResult = JSON.parse(logs.pop() || "{}") as { active?: boolean; current_phase?: string };
-      assert.equal(readResult.active, true);
-      assert.equal(readResult.current_phase, "executing");
+        await mcpParityCommand("state", [
+          "state_read",
+          "--input",
+          JSON.stringify({ mode: "ralph", workingDirectory: cwd }),
+          "--json",
+        ]);
+        const readResult = JSON.parse(logs.pop() || "{}") as { active?: boolean; current_phase?: string };
+        assert.equal(readResult.active, true);
+        assert.equal(readResult.current_phase, "executing");
+      });
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -82,42 +136,45 @@ describe("mcpParityCommand", () => {
 
     try {
       process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = "1";
-      await mcpParityCommand("state", [
-        "write",
-        "--input",
-        JSON.stringify({
-          mode: "ralph",
-          active: true,
-          current_phase: "executing",
-          session_id: "session-fallback",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
-      const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
-      assert.equal(
-        writeResult.path,
-        join(cwd, ".omx", "state", "sessions", "session-fallback", "ralph-state.json"),
-      );
+      await withCommittedAuthority(cwd, "session-fallback", async () => {
+        await mcpParityCommand("state", [
+          "write",
+          "--input",
+          JSON.stringify({
+            mode: "ralph",
+            active: true,
+            current_phase: "executing",
+            session_id: "session-fallback",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
+        const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
+        assert.equal(
+          writeResult.path,
+          join(cwd, ".omx", "state", "sessions", "session-fallback", "ralph-state.json"),
+        );
 
-      await mcpParityCommand("state", [
-        "read",
-        "--input",
-        JSON.stringify({
-          mode: "ralph",
-          session_id: "session-fallback",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
-      const readResult = JSON.parse(logs.pop() || "{}") as {
-        active?: boolean;
-        current_phase?: string;
-        owner_omx_session_id?: string;
-      };
-      assert.equal(readResult.active, true);
-      assert.equal(readResult.current_phase, "executing");
-      assert.equal(readResult.owner_omx_session_id, "session-fallback");
+        await mcpParityCommand("state", [
+          "read",
+          "--input",
+          JSON.stringify({
+            mode: "ralph",
+            session_id: "session-fallback",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
+        const readResult = JSON.parse(logs.pop() || "{}") as {
+          active?: boolean;
+          current_phase?: string;
+          owner_omx_session_id?: string;
+        };
+        assert.equal(readResult.active, true);
+        assert.equal(readResult.current_phase, "executing");
+        assert.equal(readResult.owner_omx_session_id, "session-fallback");
+      });
+
     } finally {
       if (typeof previousDisable === "string") process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = previousDisable;
       else delete process.env.OMX_STATE_SERVER_DISABLE_AUTO_START;
@@ -128,34 +185,39 @@ describe("mcpParityCommand", () => {
   it("rejects unmatched implicit owner environment state writes", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-mcp-parity-unmatched-owner-"));
     const logs = captureLogs();
-    const previousSessionId = process.env.OMX_SESSION_ID;
-
     try {
-      const stateDir = join(cwd, ".omx", "state");
-      await writeSessionStart(cwd, "native-unmatched-id", { nativeSessionId: "native-unmatched-id" });
-      process.env.OMX_SESSION_ID = "omx-unmatched-id";
+      await withCommittedAuthority(cwd, "native-unmatched-id", async () => {
+        const stateDir = join(cwd, ".omx", "state");
+        await writeSessionStart(cwd, "native-unmatched-id", {
+          nativeSessionId: "native-unmatched-id",
+        });
+        process.env.OMX_SESSION_ID = "omx-unmatched-id";
 
-      await mcpParityCommand("state", [
-        "write",
-        "--input",
-        JSON.stringify({
-          mode: "ralplan",
-          active: true,
-          current_phase: "planning",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
+        await mcpParityCommand("state", [
+          "write",
+          "--input",
+          JSON.stringify({
+            mode: "ralplan",
+            active: true,
+            current_phase: "planning",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
 
-      assert.match(
-        logs.pop() ?? "",
-        /Cannot resolve writable state scope: OMX_SESSION_ID is not bound to session\.json\./,
-      );
-      assert.equal(existsSync(join(stateDir, "sessions", "native-unmatched-id", "ralplan-state.json")), false);
-      assert.equal(existsSync(join(stateDir, "sessions", "omx-unmatched-id", "ralplan-state.json")), false);
+        const failure = JSON.parse(logs.pop() || "{}") as { error?: string };
+        assert.equal(process.exitCode, 1);
+        assert.match(failure.error ?? "", /session.*binding|binding.*session/i);
+        assert.equal(
+          existsSync(join(stateDir, "sessions", "native-unmatched-id", "ralplan-state.json")),
+          false,
+        );
+        assert.equal(
+          existsSync(join(stateDir, "sessions", "omx-unmatched-id", "ralplan-state.json")),
+          false,
+        );
+      });
     } finally {
-      if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
-      else delete process.env.OMX_SESSION_ID;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -163,55 +225,45 @@ describe("mcpParityCommand", () => {
   it("converges owner-present env state writes on the canonical native session", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-mcp-parity-owner-session-"));
     const logs = captureLogs();
-    const previousSessionId = process.env.OMX_SESSION_ID;
-    const previousTmux = process.env.TMUX;
-    const previousTmuxPane = process.env.TMUX_PANE;
     const previousPath = process.env.PATH;
 
     try {
       const canonicalSessionId = "native-id";
       const ownerSessionId = "omx-owner-id";
-      process.env.OMX_SESSION_ID = ownerSessionId;
-      const stateDir = join(cwd, ".omx", "state");
-      await writeSessionStart(cwd, canonicalSessionId, {
-        nativeSessionId: canonicalSessionId,
-        ownerOmxSessionId: ownerSessionId,
-        ownerAliasVerified: true,
-        tmuxSessionName: "omx-owner-evidence",
-        tmuxPaneId: "%owner",
-      });
-      const fakeBinDir = await writeOwnerEvidenceTmux(cwd, ownerSessionId, canonicalSessionId);
-      process.env.TMUX = "/tmp/omx-owner";
-      process.env.TMUX_PANE = "%owner";
-      process.env.PATH = `${fakeBinDir}:${previousPath ?? ""}`;
+      await withCommittedAuthority(cwd, canonicalSessionId, async () => {
+        const stateDir = join(cwd, ".omx", "state");
+        await writeSessionStart(cwd, canonicalSessionId, {
+          nativeSessionId: canonicalSessionId,
+          ownerOmxSessionId: ownerSessionId,
+          tmuxSessionName: "omx-owner-evidence",
+          tmuxPaneId: "%owner",
+        });
+        const fakeBinDir = await writeOwnerEvidenceTmux(cwd, ownerSessionId, canonicalSessionId);
+        process.env.TMUX = "/tmp/omx-owner";
+        process.env.TMUX_PANE = "%owner";
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ""}`;
 
-      await mcpParityCommand("state", [
-        "write",
-        "--input",
-        JSON.stringify({
-          mode: "ralplan",
-          active: true,
-          current_phase: "planning",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
+        await mcpParityCommand("state", [
+          "write",
+          "--input",
+          JSON.stringify({
+            mode: "ralplan",
+            active: true,
+            current_phase: "planning",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
 
-      const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
-      assert.equal(
-        writeResult.path,
-        join(stateDir, "sessions", canonicalSessionId, "ralplan-state.json"),
-      );
-      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
+        const writeResult = JSON.parse(logs.pop() || "{}") as { path?: string };
+        assert.equal(
+          writeResult.path,
+          join(stateDir, "sessions", "native-id", "ralplan-state.json"),
+        );
+        assert.equal(existsSync(join(stateDir, "sessions", "omx-owner-id", "ralplan-state.json")), false);
+      }, "omx-owner-id");
+
     } finally {
-      if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
-      else delete process.env.OMX_SESSION_ID;
-      if (typeof previousTmux === "string") process.env.TMUX = previousTmux;
-      else delete process.env.TMUX;
-      if (typeof previousTmuxPane === "string") process.env.TMUX_PANE = previousTmuxPane;
-      else delete process.env.TMUX_PANE;
-      if (typeof previousPath === "string") process.env.PATH = previousPath;
-      else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -221,46 +273,48 @@ describe("mcpParityCommand", () => {
     const logs = captureLogs();
 
     try {
-      await mcpParityCommand("state", [
-        "write",
-        "--input",
-        JSON.stringify({
-          mode: "deep-interview",
-          active: false,
-          lifecycle_outcome: "finished",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
-      logs.pop();
+      await withCommittedAuthority(cwd, "outcome-parity", async () => {
+        await mcpParityCommand("state", [
+          "write",
+          "--input",
+          JSON.stringify({
+            mode: "deep-interview",
+            active: false,
+            lifecycle_outcome: "finished",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
+        logs.pop();
 
-      await mcpParityCommand("state", [
-        "write",
-        "--input",
-        JSON.stringify({
-          mode: "deep-interview",
-          active: true,
-          current_phase: "intent",
-          workingDirectory: cwd,
-        }),
-        "--json",
-      ]);
-      logs.pop();
+        await mcpParityCommand("state", [
+          "write",
+          "--input",
+          JSON.stringify({
+            mode: "deep-interview",
+            active: true,
+            current_phase: "intent",
+            workingDirectory: cwd,
+          }),
+          "--json",
+        ]);
+        logs.pop();
 
-      await mcpParityCommand("state", [
-        "read",
-        "--input",
-        JSON.stringify({ mode: "deep-interview", workingDirectory: cwd }),
-        "--json",
-      ]);
-      const readResult = JSON.parse(logs.pop() || "{}") as {
-        active?: boolean;
-        lifecycle_outcome?: string;
-        run_outcome?: string;
-      };
-      assert.equal(readResult.active, true);
-      assert.equal(readResult.lifecycle_outcome, undefined);
-      assert.equal(readResult.run_outcome, "continue");
+        await mcpParityCommand("state", [
+          "read",
+          "--input",
+          JSON.stringify({ mode: "deep-interview", workingDirectory: cwd }),
+          "--json",
+        ]);
+        const readResult = JSON.parse(logs.pop() || "{}") as {
+          active?: boolean;
+          lifecycle_outcome?: string;
+          run_outcome?: string;
+        };
+        assert.equal(readResult.active, true);
+        assert.equal(readResult.lifecycle_outcome, undefined);
+        assert.equal(readResult.run_outcome, "continue");
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

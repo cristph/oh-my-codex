@@ -157,30 +157,31 @@ describe('runtime-cli helpers', () => {
     assert.equal(liveBehavior.fixingWithNoWorkers, false);
   });
 
-  it('reads task results from explicit OMX_TEAM_STATE_ROOT during shutdown collection', async () => {
+  it('ignores ambient OMX_TEAM_STATE_ROOT during shutdown collection', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-env-root-cwd-'));
     const explicitStateRoot = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-env-root-state-'));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    process.env.OMX_TEAM_STATE_ROOT = explicitStateRoot;
+    delete process.env.OMX_TEAM_STATE_ROOT;
     try {
       await initTeamState('env-root-results', 'task', 'executor', 1, cwd);
       await createTask('env-root-results', {
         subject: 'completed task',
-        description: 'stored under explicit state root',
+        description: 'stored under canonical workspace state root',
         status: 'completed',
         owner: 'worker-1',
-        result: 'PASS: explicit root task result',
+        result: 'PASS: canonical root task result',
       }, cwd);
+      process.env.OMX_TEAM_STATE_ROOT = explicitStateRoot;
 
       const runtimeCli = await loadRuntimeCliModule();
       const stateRoot = runtimeCli.resolveRuntimeCliStateRoot(cwd);
-      assert.equal(stateRoot, explicitStateRoot);
+      assert.equal(stateRoot, join(cwd, '.omx', 'state'));
       assert.deepEqual(
         runtimeCli.collectTaskResults(stateRoot, 'env-root-results'),
         [{
           taskId: '1',
           status: 'completed',
-          summary: 'PASS: explicit root task result',
+          summary: 'PASS: canonical root task result',
         }],
       );
     } finally {

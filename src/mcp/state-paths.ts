@@ -2,8 +2,19 @@ import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'p
 import { existsSync, realpathSync } from 'fs';
 import { readFile, readdir } from 'fs/promises';
 import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync,
+  canonicalizeTrustedAuthorityWindowsDirectoryAliasComponentsSync,
+  resolveStateAuthorityForGuard,
+  resolveWorkspaceIdentity,
+  type ResolvedStateAuthorityContext,
+} from '../state/authority.js';
+import {
   isSessionStateUsable,
   readUsableSessionState,
+  resolveAuthenticatedStateAuthorityStartupCwd,
+  resolveAuthenticatedTransportAuthority,
   type SessionState,
 } from '../hooks/session.js';
 
@@ -23,7 +34,15 @@ export const WRITABLE_STATE_SCOPE_ERRORS = {
 } as const;
 
 
-export type StateRootSource = 'team-env' | 'omx-root-env' | 'omx-state-root-env' | 'cwd-default';
+export type StateRootSource = 'authority' | 'team-env' | 'omx-root-env' | 'omx-state-root-env' | 'cwd-default';
+
+function observedAmbientRootSources(): StateRootSource[] {
+  const sources: StateRootSource[] = [];
+  if (process.env[OMX_TEAM_STATE_ROOT_ENV]?.trim()) sources.push('team-env');
+  if (process.env[OMX_ROOT_ENV]?.trim()) sources.push('omx-root-env');
+  if (process.env[OMX_STATE_ROOT_ENV]?.trim()) sources.push('omx-state-root-env');
+  return sources;
+}
 export type SessionScopeSource = 'explicit' | 'env' | 'session-json' | 'native-alias' | 'root';
 
 export interface ResolvedSessionMetadata {
@@ -51,6 +70,11 @@ export interface ResolvedRuntimeStateScope {
   isSessionScoped: boolean;
   authoritativeActiveDirs: string[];
   compatibilityReadDirs: string[];
+}
+
+export interface ResolvedAuthorityRuntimeStateScope extends ResolvedRuntimeStateScope {
+  authority: ResolvedStateAuthorityContext;
+  observedRootSources: StateRootSource[];
 }
 
 export type StateFileScope = 'root' | 'session';
@@ -198,6 +222,7 @@ function canonicalizeExistingPath(path: string): string {
   return path;
 }
 
+
 function parseAllowedWorkingDirectoryRoots(): string[] {
   const raw = process.env[WORKDIR_ALLOWLIST_ENV];
   if (typeof raw !== 'string' || raw.trim() === '') return [];
@@ -213,7 +238,15 @@ function parseAllowedWorkingDirectoryRoots(): string[] {
       const resolvedRoot = resolvePath(part);
       const realRoot = canonicalizeExistingPath(resolvedRoot);
       if (realRoot !== resolvedRoot) {
-        throw new Error(`${WORKDIR_ALLOWLIST_ENV} root "${resolvedRoot}" resolves through a symlink to "${realRoot}"`);
+        const trustedRoot = process.platform === 'darwin'
+          ? canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(resolvedRoot)
+          : process.platform === 'win32'
+            ? canonicalizeTrustedAuthorityWindowsDirectoryAliasComponentsSync(resolvedRoot)
+            : undefined;
+        if (!trustedRoot || trustedRoot !== realRoot) {
+          throw new Error(`${WORKDIR_ALLOWLIST_ENV} root "${resolvedRoot}" resolves through a symlink to "${realRoot}"`);
+        }
+        return trustedRoot;
       }
       return realRoot;
     });
@@ -301,9 +334,19 @@ function resolveCanonicalSessionId(candidate: string | undefined, metadata: Reso
     : candidate;
 }
 
+function sessionStateMatchesWorkingDirectory(state: SessionState, cwd: string): boolean {
+  if (typeof state.cwd !== 'string' || !state.cwd.trim()) return true;
+  try {
+    return resolveWorkspaceIdentity(state.cwd).digest === resolveWorkspaceIdentity(cwd).digest;
+  } catch {
+    return false;
+  }
+}
+
 async function readUsableSessionStateFromBaseStateDir(
   cwd: string,
   baseStateDir = getBaseStateDir(cwd),
+  requireWorkingDirectoryMatch = false,
 ): Promise<SessionState | null> {
   const sessionPath = join(baseStateDir, 'session.json');
   if (!existsSync(sessionPath)) return null;
@@ -311,7 +354,10 @@ async function readUsableSessionStateFromBaseStateDir(
   try {
     const content = await readFile(sessionPath, 'utf-8');
     const state = JSON.parse(content) as SessionState;
-    return isSessionStateUsable(state, cwd) ? state : null;
+    return isSessionStateUsable(state, cwd)
+      && (!requireWorkingDirectoryMatch || sessionStateMatchesWorkingDirectory(state, cwd))
+      ? state
+      : null;
   } catch {
     return null;
   }
@@ -361,9 +407,17 @@ function normalizeSessionMetadata(state: SessionState | null, sourcePath?: strin
 async function readSessionMetadataFromBaseStateDir(
   cwd: string,
   baseStateDir = getBaseStateDir(cwd),
+  strict = false,
+  requireWorkingDirectoryMatch = false,
 ): Promise<ResolvedSessionMetadata | undefined> {
   const sessionPath = join(baseStateDir, 'session.json');
-  const session = await readUsableSessionStateFromBaseStateDir(cwd, baseStateDir);
+  const session = await readUsableSessionStateFromBaseStateDir(cwd, baseStateDir, requireWorkingDirectoryMatch);
+  if (strict && existsSync(sessionPath) && !session) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+      `committed authority session metadata is malformed or belongs to a foreign workspace: ${sessionPath}`,
+    );
+  }
   return normalizeSessionMetadata(session, sessionPath);
 }
 
@@ -405,7 +459,7 @@ export async function resolveWritableStateScope(
 ): Promise<ResolvedStateScope> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
   const baseStateDir = getBaseStateDir(cwd);
-  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
+  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir, false, true);
   const validatedExplicit = validateSessionId(explicitSessionId);
   if (validatedExplicit) {
     const sessionId = resolveCanonicalSessionId(validatedExplicit, metadata) ?? validatedExplicit;
@@ -518,6 +572,79 @@ export async function resolveRuntimeStateScope(
     authoritativeActiveDirs: [stateDir],
     compatibilityReadDirs: isSessionScoped && source !== 'explicit' ? [stateDir, baseStateDir] : [stateDir],
   };
+}
+
+/**
+ * Resolves active runtime state through the committed workspace authority.
+ * Ambient root variables remain observable diagnostics only; they never select
+ * the state root after an authority generation has been committed.
+ */
+async function resolveAuthorityStartupCwd(observedCwd: string): Promise<string> {
+  return resolveAuthenticatedStateAuthorityStartupCwd(observedCwd);
+}
+
+export async function resolveAuthorityRuntimeStateScope(
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<ResolvedAuthorityRuntimeStateScope> {
+  const cwd = resolveWorkingDirectoryForState(workingDirectory);
+  const transportedAuthority = await resolveAuthenticatedTransportAuthority(cwd);
+  const authority = transportedAuthority ?? await resolveStateAuthorityForGuard({
+    startup_cwd: await resolveAuthorityStartupCwd(cwd),
+    observed_cwd: cwd,
+  });
+  const baseStateDir = authority.canonical_state_root;
+  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir, true);
+  const validatedExplicit = validateSessionId(explicitSessionId);
+  const envSessionId = readSessionIdFromEnvironment();
+  let sessionId: string | undefined;
+  let source: SessionScopeSource = 'root';
+
+  if (validatedExplicit) {
+    const canonicalSessionId = resolveCanonicalSessionId(validatedExplicit, metadata);
+    sessionId = canonicalSessionId ?? validatedExplicit;
+    source = metadata && canonicalSessionId === metadata.sessionId && validatedExplicit !== metadata.sessionId
+      ? 'native-alias'
+      : 'explicit';
+  } else if (envSessionId) {
+    const canonicalSessionId = resolveCanonicalSessionId(envSessionId, metadata);
+    sessionId = canonicalSessionId ?? envSessionId;
+    source = metadata && canonicalSessionId === metadata.sessionId && envSessionId !== metadata.sessionId
+      ? 'native-alias'
+      : 'env';
+  } else if (metadata?.sessionId) {
+    sessionId = metadata.sessionId;
+    source = 'session-json';
+  }
+
+  const stateDir = sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir;
+  const isSessionScoped = Boolean(sessionId);
+  return {
+    cwd,
+    baseStateDir,
+    stateDir,
+    rootSource: 'authority',
+    ...(sessionId ? { sessionId } : {}),
+    source,
+    ...(metadata && (!sessionId || metadata.sessionId === sessionId) ? { metadata } : {}),
+    isSessionScoped,
+    authoritativeActiveDirs: [stateDir],
+    compatibilityReadDirs: isSessionScoped && source !== 'explicit' ? [stateDir, baseStateDir] : [stateDir],
+    authority,
+    observedRootSources: observedAmbientRootSources(),
+  };
+}
+
+/**
+ * Resolve runtime state only from an already committed, authenticated authority.
+ * This deliberately has no legacy-root or authority-initialization fallback and
+ * is the entry point for standalone command surfaces.
+ */
+export async function resolveCommittedAuthorityRuntimeStateScope(
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<ResolvedAuthorityRuntimeStateScope> {
+  return resolveAuthorityRuntimeStateScope(workingDirectory, explicitSessionId);
 }
 
 export async function getCompatibilityReadScopedStateDirs(

@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+
 import { mkdtemp, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -47,6 +49,7 @@ describe('nested help routing', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, expectedUsage);
         assert.doesNotMatch(result.stdout, /oh-my-codex \(omx\) - Multi-agent orchestration for Codex CLI/i);
+        if (argv[0] === 'hud') assert.equal(existsSync(join(cwd, '.omx')), false);
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }

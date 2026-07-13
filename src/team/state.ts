@@ -620,6 +620,20 @@ function normalizeTask(task: TeamTask): TeamTaskV2 {
 
 // Team state directory: .omx/state/team/{teamName}/
 function resolveTeamStateRoot(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (
+    env.OMX_STATE_AUTHORITY_PATH?.trim()
+    || env.OMX_STATE_AUTHORITY_ID?.trim()
+    || env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim()
+    || env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim()
+  ) {
+    return resolveCanonicalTeamStateRoot(cwd, env);
+  }
+  const teamStateRoot = env.OMX_TEAM_STATE_ROOT?.trim();
+  if (teamStateRoot) return resolve(cwd, teamStateRoot);
+  const omxRoot = env.OMX_ROOT?.trim();
+  if (omxRoot) return join(resolve(cwd, omxRoot), '.omx', 'state');
+  const omxStateRoot = env.OMX_STATE_ROOT?.trim();
+  if (omxStateRoot) return join(resolve(cwd, omxStateRoot), '.omx', 'state');
   return resolveCanonicalTeamStateRoot(cwd, env);
 }
 

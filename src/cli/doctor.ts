@@ -5,7 +5,8 @@
 import { constants, existsSync, readFileSync } from "fs";
 import { access, chown, lstat, mkdtemp, readdir, readFile, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, join, relative } from "path";
+import { basename, join, relative, resolve as resolvePath } from "path";
+
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -86,6 +87,13 @@ import {
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { getInstallableNativeAgentNames } from "../agents/policy.js";
 import { readCatalogManifest } from "../catalog/reader.js";
+import {
+	AUTHORITY_DIAGNOSTIC_CODES,
+	StateAuthorityError,
+	resolveStateAuthority,
+} from "../state/authority.js";
+import { resolveAuthenticatedTransportAuthority } from "../hooks/session.js";
+
 
 interface DoctorOptions {
 	verbose?: boolean;
@@ -408,6 +416,8 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 8: State directory
 	checks.push(checkDirectory("State dir", paths.stateDir));
+	const authorityCheck = await checkStateAuthority(cwd);
+	if (authorityCheck) checks.push(authorityCheck);
 	checks.push(await checkRepoArtifactOwnership(cwd));
 
 	// Check 9: MCP servers configured
@@ -456,15 +466,202 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 }
 
 interface TeamDoctorIssue {
-	code:
-		| "delayed_status_lag"
-		| "slow_shutdown"
-		| "orphan_tmux_session"
-		| "resume_blocker"
-		| "prompt_resume_unavailable"
-		| "stale_leader";
+	code: string;
 	message: string;
 	severity: "warn" | "fail";
+}
+
+interface AuthorityDoctorResolution {
+	stateDir: string | null;
+	issues: TeamDoctorIssue[];
+	validated: boolean;
+}
+
+function authorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
+	return [
+		env.OMX_STATE_AUTHORITY_PATH,
+		env.OMX_STATE_AUTHORITY_ID,
+		env.OMX_STATE_AUTHORITY_GENERATION_ID,
+		env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+	].some((value) => typeof value === "string" && value.trim() !== "");
+}
+
+function authoritySessionId(env: NodeJS.ProcessEnv): string | undefined {
+	const sessionId = env.OMX_SESSION_ID?.trim();
+	return sessionId || undefined;
+}
+
+function authorityRootConflict(
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	canonicalStateRoot: string,
+): string | null {
+	const candidates: Array<{ name: string; path?: string }> = [
+		{ name: "OMX_TEAM_STATE_ROOT", path: env.OMX_TEAM_STATE_ROOT?.trim() },
+		{
+			name: "OMX_ROOT",
+			path: env.OMX_ROOT?.trim()
+				? join(env.OMX_ROOT.trim(), ".omx", "state")
+				: undefined,
+		},
+		{
+			name: "OMX_STATE_ROOT",
+			path: env.OMX_STATE_ROOT?.trim()
+				? join(env.OMX_STATE_ROOT.trim(), ".omx", "state")
+				: undefined,
+		},
+	];
+	for (const candidate of candidates) {
+		if (candidate.path && resolvePath(cwd, candidate.path) !== resolvePath(canonicalStateRoot)) {
+			return candidate.name;
+		}
+	}
+	return null;
+}
+
+async function resolveAuthorityForDoctor(
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<AuthorityDoctorResolution> {
+	const hasLocator = authorityLocatorPresent(env);
+	if (hasLocator) {
+		try {
+			const context = await resolveAuthenticatedTransportAuthority(cwd, env);
+			if (!context) {
+				throw new StateAuthorityError(
+					AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+					"inherited state-authority transport is absent",
+				);
+			}
+			const issues: TeamDoctorIssue[] = [];
+			const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+			if (conflictingRoot) {
+				issues.push({
+					code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+					message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+					severity: "fail",
+				});
+			}
+			return {
+				stateDir: issues.length === 0 ? context.canonical_state_root : null,
+				issues,
+				validated: issues.length === 0,
+			};
+		} catch (error) {
+			return {
+				stateDir: null,
+				validated: false,
+				issues: [{
+					code: error instanceof StateAuthorityError
+						? error.code
+						: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+					message: `cannot resolve inherited authority: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				}],
+			};
+		}
+	}
+	try {
+		const resolution = await resolveStateAuthority({
+			startup_cwd: cwd,
+			observed_cwd: cwd,
+			session_id: authoritySessionId(env),
+		});
+		if (!resolution.context || !resolution.can_mutate) {
+			const anchorMissingOnly = resolution.diagnostics.length === 1
+				&& resolution.diagnostics[0]?.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing;
+			if (!hasLocator && anchorMissingOnly) {
+				return { stateDir: omxStateDir(cwd), issues: [], validated: false };
+			}
+			return {
+				stateDir: null,
+				validated: false,
+				issues: resolution.diagnostics.map((diagnostic) => ({
+					code: diagnostic.code,
+					message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
+					severity: "fail" as const,
+				})),
+			};
+		}
+
+		const context = resolution.context;
+		const issues: TeamDoctorIssue[] = [...resolution.diagnostics].map((diagnostic) => ({
+			code: diagnostic.code,
+			message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
+			severity: "fail",
+		}));
+		const locator = env.OMX_STATE_AUTHORITY_PATH?.trim();
+		if (locator && resolvePath(cwd, locator) !== resolvePath(context.authority_path)) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+				message: "inherited authority locator does not match the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_ID?.trim() && env.OMX_STATE_AUTHORITY_ID.trim() !== context.generation.authority_id) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: "inherited authority ID conflicts with the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim() && env.OMX_STATE_AUTHORITY_GENERATION_ID.trim() !== context.generation.generation_id) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+				message: "inherited authority generation ID conflicts with the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim() && env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST.trim() !== context.workspace_identity.digest) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: "inherited authority workspace digest conflicts with the persisted workspace",
+				severity: "fail",
+			});
+		}
+		const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+		if (conflictingRoot) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+				severity: "fail",
+			});
+		}
+		return {
+			stateDir: issues.length === 0 ? context.canonical_state_root : null,
+			issues,
+			validated: issues.length === 0,
+		};
+	} catch (error) {
+		return {
+			stateDir: hasLocator ? null : omxStateDir(cwd),
+			validated: false,
+			issues: hasLocator
+				? [{
+					code: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+					message: `cannot resolve inherited authority: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				}]
+				: [],
+		};
+	}
+}
+
+async function checkStateAuthority(cwd: string): Promise<Check | null> {
+	const authority = await resolveAuthorityForDoctor(cwd);
+	if (!authority.validated && authority.issues.length === 0) return null;
+	if (authority.issues.length > 0) {
+		return {
+			name: "State authority",
+			status: "fail",
+			message: authority.issues.map((issue) => `${issue.code}: ${issue.message}`).join("; "),
+		};
+	}
+	return {
+		name: "State authority",
+		status: "pass",
+		message: `validated workspace state root ${authority.stateDir}`,
+	};
 }
 
 async function doctorTeam(): Promise<void> {
@@ -496,8 +693,10 @@ async function doctorTeam(): Promise<void> {
 async function collectTeamDoctorIssues(
 	cwd: string,
 ): Promise<TeamDoctorIssue[]> {
-	const issues: TeamDoctorIssue[] = [];
-	const stateDir = omxStateDir(cwd);
+	const authority = await resolveAuthorityForDoctor(cwd);
+	const issues: TeamDoctorIssue[] = [...authority.issues];
+	if (!authority.stateDir) return dedupeIssues(issues);
+	const stateDir = authority.stateDir;
 	const teamsRoot = join(stateDir, "team");
 	const nowMs = Date.now();
 	const lagThresholdMs = 60_000;

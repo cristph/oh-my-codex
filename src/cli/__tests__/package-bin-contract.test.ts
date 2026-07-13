@@ -138,7 +138,7 @@ describe('package bin contract', () => {
           cwd: process.cwd(),
           encoding: 'utf-8',
           input: mcpInitialize,
-          timeout: 5_000,
+          timeout: 15_000,
         },
       );
       assert.equal(

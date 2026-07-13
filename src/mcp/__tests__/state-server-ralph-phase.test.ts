@@ -3,11 +3,47 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initializeStateAuthority } from '../../state/authority.js';
+
+const stateServerRalphAuthorityInitByWorkspace = new Map<string, Promise<void>>();
+
+async function ensureTestStateServerRalphAuthority(workingDirectory: string): Promise<void> {
+  const existing = stateServerRalphAuthorityInitByWorkspace.get(workingDirectory);
+  if (existing) return existing;
+  const initializing = initializeStateAuthority({
+    startup_cwd: workingDirectory,
+    launch_id: `state-server-ralph-phase-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    session_binding: {
+      canonical_session_id: `state-server-ralph-phase-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    },
+  }).then(() => undefined);
+  stateServerRalphAuthorityInitByWorkspace.set(workingDirectory, initializing);
+  try {
+    await initializing;
+  } catch (error) {
+    stateServerRalphAuthorityInitByWorkspace.delete(workingDirectory);
+    throw error;
+  }
+}
+
+async function getTestStateToolCall() {
+  const { handleStateToolCall } = await import('../state-server.js');
+  return async (request: Parameters<typeof handleStateToolCall>[0]) => {
+    const { name, arguments: rawArgs = {} } = request.params;
+    if (name === 'state_write' || name === 'state_clear') {
+      const workingDirectory = typeof rawArgs.workingDirectory === 'string'
+        ? rawArgs.workingDirectory
+        : process.cwd();
+      await ensureTestStateServerRalphAuthority(workingDirectory);
+    }
+    return handleStateToolCall(request);
+  };
+}
 
 describe('state-server Ralph phase contract', () => {
   it('normalizes legacy Ralph phase aliases on state_write', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
-    const { handleStateToolCall } = await import('../state-server.js');
+    const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ralph-phase-'));
     try {
@@ -36,7 +72,7 @@ describe('state-server Ralph phase contract', () => {
 
   it('rejects unknown Ralph phases on state_write', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
-    const { handleStateToolCall } = await import('../state-server.js');
+    const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ralph-phase-'));
     try {
@@ -61,7 +97,7 @@ describe('state-server Ralph phase contract', () => {
 
   it('rejects terminal Ralph phase when active=true', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
-    const { handleStateToolCall } = await import('../state-server.js');
+    const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ralph-phase-'));
     try {
@@ -86,7 +122,7 @@ describe('state-server Ralph phase contract', () => {
 
   it('rejects fractional iteration values for Ralph state', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
-    const { handleStateToolCall } = await import('../state-server.js');
+    const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ralph-phase-'));
     try {

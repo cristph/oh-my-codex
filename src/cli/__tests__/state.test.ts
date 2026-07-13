@@ -1,10 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { stateCommand } from '../state.js';
+import { writeSessionStart } from '../../hooks/session.js';
+import { canonicalizeExistingAuthorityPath } from '../../state/authority.js';
 
 describe('stateCommand', () => {
   it('prints help for empty args', async () => {
@@ -185,5 +187,51 @@ describe('stateCommand', () => {
         return true;
       },
     );
+  });
+
+  it('keeps CLI state operations bound to the parent authority after cwd changes into a nested directory', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-state-cli-authority-'));
+    const nested = join(workspace, 'nested');
+    const previousCwd = process.cwd();
+    const previousStartupCwd = process.env.OMX_STARTUP_CWD;
+    try {
+      await mkdir(join(workspace, '.git'), { recursive: true });
+      await mkdir(nested);
+      process.env.OMX_STARTUP_CWD = workspace;
+      await writeSessionStart(workspace, 'sess-cli-authority');
+
+      process.chdir(nested);
+      const writeOutput: string[] = [];
+      await stateCommand(['write', '--input', JSON.stringify({
+        mode: 'autoresearch',
+        active: true,
+        current_phase: 'running',
+      }), '--json'], {
+        stdout: (line) => writeOutput.push(line),
+        stderr: () => undefined,
+      });
+
+      const writeResult = JSON.parse(writeOutput[0]) as { path?: string };
+      assert.equal(
+        writeResult.path,
+        canonicalizeExistingAuthorityPath(join(workspace, '.omx', 'state', 'sessions', 'sess-cli-authority', 'autoresearch-state.json')),
+      );
+
+      const statusOutput: string[] = [];
+      await stateCommand(['get-status', '--mode', 'autoresearch', '--json'], {
+        stdout: (line) => statusOutput.push(line),
+        stderr: () => undefined,
+      });
+      const status = JSON.parse(statusOutput[0]) as {
+        statuses?: Record<string, { active?: boolean; path?: string }>;
+      };
+      assert.equal(status.statuses?.autoresearch?.active, true);
+      assert.equal(status.statuses?.autoresearch?.path, writeResult.path);
+    } finally {
+      process.chdir(previousCwd);
+      if (typeof previousStartupCwd === 'string') process.env.OMX_STARTUP_CWD = previousStartupCwd;
+      else delete process.env.OMX_STARTUP_CWD;
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 });

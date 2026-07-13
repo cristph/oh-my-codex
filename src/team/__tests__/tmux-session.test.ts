@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { delimiter, dirname, join } from 'path';
 import { tmpdir } from 'os';
 import {
   buildClientAttachedReconcileHookName,
@@ -58,6 +58,7 @@ import {
   dismissTrustPromptIfPresent,
   evaluateStartupDirectTriggerSafetyCapture,
   mitigateCopyModeUnderlineArtifacts,
+  buildTmuxOneShotWorkerImportCommand,
 } from '../tmux-session.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
@@ -68,14 +69,19 @@ const fsMutable = fs as typeof fs & {
   statSync: typeof fs.statSync;
 };
 
+function pathEnvironmentKey(): 'PATH' | 'Path' {
+  return Object.hasOwn(process.env, 'Path') ? 'Path' : 'PATH';
+}
+
 function withEmptyPath<T>(fn: () => T): T {
-  const prev = process.env.PATH;
-  process.env.PATH = '';
+  const key = pathEnvironmentKey();
+  const previousPath = process.env[key];
+  process.env[key] = '';
   try {
     return fn();
   } finally {
-    if (typeof prev === 'string') process.env.PATH = prev;
-    else delete process.env.PATH;
+    if (typeof previousPath === 'string') process.env[key] = previousPath;
+    else delete process.env[key];
   }
 }
 
@@ -149,16 +155,23 @@ async function withMockTmuxFixture<T>(
   const fakeBinDir = await mkdtemp(join(tmpdir(), dirPrefix));
   const logPath = join(fakeBinDir, 'tmux.log');
   const tmuxStubPath = join(fakeBinDir, 'tmux');
-  const previousPath = process.env.PATH;
+  const key = pathEnvironmentKey();
+  const previousPath = process.env[key];
 
   try {
-    await writeFile(tmuxStubPath, tmuxScript(logPath));
+    await writeFile(tmuxStubPath, tmuxScript(logPath.replaceAll('\\', '/')));
     await chmod(tmuxStubPath, 0o755);
-    process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+    if (process.platform === 'win32') {
+      await writeFile(
+        join(fakeBinDir, 'tmux.cmd'),
+        '@echo off\r\nsh "%~dp0tmux" %*\r\n',
+      );
+    }
+    process.env[key] = [fakeBinDir, previousPath].filter((entry): entry is string => Boolean(entry)).join(delimiter);
     return await run({ logPath });
   } finally {
-    if (typeof previousPath === 'string') process.env.PATH = previousPath;
-    else delete process.env.PATH;
+    if (typeof previousPath === 'string') process.env[key] = previousPath;
+    else delete process.env[key];
     await rm(fakeBinDir, { recursive: true, force: true });
   }
 }
@@ -308,13 +321,15 @@ describe('HUD resize hook command builders', () => {
 
   it('resolves the tmux executable for win32 hook shell snippets', async () => {
     const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-hook-tmux-'));
-    const prevPath = process.env.PATH;
+    const pathKey = pathEnvironmentKey();
+    const prevPath = process.env[pathKey];
     const prevPathext = process.env.PATHEXT;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
     try {
       const tmuxPath = join(fakeBin, 'tmux.exe');
+      const shellTmuxPath = tmuxPath.replaceAll('\\', '/');
       await writeFile(tmuxPath, '');
-      process.env.PATH = fakeBin;
+      process.env[pathKey] = fakeBin;
       process.env.PATHEXT = '.EXE';
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
@@ -322,16 +337,16 @@ describe('HUD resize hook command builders', () => {
       const delayedArgs = buildScheduleDelayedHudResizeArgs('%1');
       const reconcileArgs = buildReconcileHudResizeArgs('%1');
 
-      assert.match(resizeArgs[4] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.match(resizeArgs[4] ?? '', new RegExp(escapeRegExp(shellTmuxPath)));
       assert.doesNotMatch(resizeArgs[4] ?? '', /^run-shell -b 'tmux resize-pane/);
-      assert.match(delayedArgs[2] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.match(delayedArgs[2] ?? '', new RegExp(escapeRegExp(shellTmuxPath)));
       assert.doesNotMatch(delayedArgs[2] ?? '', /sleep \d+; tmux resize-pane/);
-      assert.match(reconcileArgs[1] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.match(reconcileArgs[1] ?? '', new RegExp(escapeRegExp(shellTmuxPath)));
       assert.doesNotMatch(reconcileArgs[1] ?? '', /^tmux resize-pane/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
-      if (typeof prevPath === 'string') process.env.PATH = prevPath;
-      else delete process.env.PATH;
+      if (typeof prevPath === 'string') process.env[pathKey] = prevPath;
+      else delete process.env[pathKey];
       if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
       else delete process.env.PATHEXT;
       await rm(fakeBin, { recursive: true, force: true });
@@ -340,24 +355,26 @@ describe('HUD resize hook command builders', () => {
 
   it('resolves the tmux executable twice for win32 client-attached one-shot hooks', async () => {
     const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-attached-hook-'));
-    const prevPath = process.env.PATH;
+    const pathKey = pathEnvironmentKey();
+    const prevPath = process.env[pathKey];
     const prevPathext = process.env.PATHEXT;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
     try {
       const tmuxPath = join(fakeBin, 'tmux.exe');
+      const shellTmuxPath = tmuxPath.replaceAll('\\', '/');
       await writeFile(tmuxPath, '');
-      process.env.PATH = fakeBin;
+      process.env[pathKey] = fakeBin;
       process.env.PATHEXT = '.EXE';
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-      const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
+      const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(shellTmuxPath), 'g')) || [];
       assert.equal(matches.length, 2, 'client-attached hook should resolve tmux for both resize and unregister commands');
       assert.doesNotMatch(args[4] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
-      if (typeof prevPath === 'string') process.env.PATH = prevPath;
-      else delete process.env.PATH;
+      if (typeof prevPath === 'string') process.env[pathKey] = prevPath;
+      else delete process.env[pathKey];
       if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
       else delete process.env.PATHEXT;
       await rm(fakeBin, { recursive: true, force: true });
@@ -3841,6 +3858,37 @@ esac
   });
 });
 
+describe('tmux one-shot worker environment import', () => {
+  it('keeps bearer values out of tmux argv and gives a first-party cleanup watchdog ownership', async () => {
+    const rawBearer = 'raw-bearer-must-not-reach-tmux-argv';
+    const command = buildTmuxOneShotWorkerImportCommand(
+      'team-session',
+      [{
+        sourceName: 'OMX_TMUX_IMPORT_nonce_0',
+        targetName: 'OMX_STATE_AUTHORITY_CAPABILITY',
+      }],
+      'omx-tmux-import-ack-nonce',
+      'exec worker-command',
+    );
+    assert.doesNotMatch(command, new RegExp(rawBearer));
+    assert.match(command, /unset[\s\S]*OMX_TMUX_IMPORT_nonce_0[\s\S]*OMX_STATE_AUTHORITY_CAPABILITY/);
+    assert.match(command, /tmux show-environment[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
+    assert.match(command, /tmux set-environment -u[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
+    assert.doesNotMatch(command, /env -u/);
+    assert.match(command, /tmux wait-for -S[\s\S]*omx-tmux-import-ack-nonce/);
+    assert.match(command, /exec worker-command/);
+    assert.doesNotMatch(command, /exec exec worker-command/);
+
+    const source = await readFile(new URL('../../../src/team/tmux-session.ts', import.meta.url), 'utf8');
+    assert.match(source, /"run-shell",\s*"-b"/);
+    assert.match(source, /restoreTmuxOneShotImportEnvironmentAfterDelay/);
+    assert.match(source, /setTimeout\([\s\S]*?restoreTmuxSessionEnvironment/);
+    assert.match(source, /TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS/);
+    assert.match(source, /waitForTmuxOneShotImportChannel[\s\S]*?TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS/);
+    assert.doesNotMatch(source, /injectTmuxWorkerAuthorityEnvironment/);
+  });
+});
+
 describe('createTeamSession tmux instance tagging', () => {
   it('rejects incompatible non-Codex and mixed Codex plans before any direct tmux mutation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-direct-policy-preflight-'));
@@ -4646,7 +4694,7 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /display-message -p #\{session_name\}:#\{window_index\} #\{pane_id\}/);
-          assert.match(tmuxLog, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand/);
+          assert.match(tmuxLog, /powershell(?:\.exe)? -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand/);
           assert.doesNotMatch(tmuxLog, /\/bin\/sh -lc/);
           assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
         },

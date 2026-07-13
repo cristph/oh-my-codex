@@ -4,22 +4,31 @@
  * Reads .omx/state/ files to build HUD render context.
  */
 
-import { readFile } from 'fs/promises';
+import { readFile, realpath } from 'fs/promises';
+import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, basename } from 'path';
+import { join, basename, resolve as resolvePath } from 'path';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { resolveOmxDisplayVersionSync } from '../utils/version.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
-import { getBaseStateDir, getStateFilePath, readCurrentSessionId, resolveRuntimeStateScope } from '../mcp/state-paths.js';
-import { teamReadPhase as readTeamPhase } from '../team/team-ops.js';
-
-import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
 import {
-  readSubagentTrackingState,
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  resolveStateAuthority,
+  validateStateAuthority,
+  type ResolvedStateAuthorityContext,
+} from '../state/authority.js';
+import { resolveAuthenticatedTransportAuthority } from '../hooks/session.js';
+import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
+
+
+import {
+  createSubagentTrackingState,
   summarizeSubagentSession,
   type SubagentTrackingState,
 } from '../subagents/tracker.js';
+
 import type {
   RalphStateForHud,
   UltragoalStateForHud,
@@ -42,6 +51,272 @@ import type {
 } from './types.js';
 import { DEFAULT_HUD_CONFIG } from './types.js';
 
+export interface HudAuthorityDiagnostic {
+  code: string;
+  message: string;
+  fatal: boolean;
+}
+
+export interface HudAuthorityReadScope {
+  workspaceRoot: string;
+  stateRoot: string | null;
+  sessionId?: string;
+  context?: ResolvedStateAuthorityContext;
+  diagnostics: HudAuthorityDiagnostic[];
+}
+
+function inheritedAuthorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
+  return [
+    env.OMX_STATE_AUTHORITY_PATH,
+    env.OMX_STATE_AUTHORITY_ID,
+    env.OMX_STATE_AUTHORITY_GENERATION_ID,
+    env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+  ].some((value) => typeof value === 'string' && value.trim() !== '');
+}
+
+function sessionCandidate(env: NodeJS.ProcessEnv): string | undefined {
+  const sessionId = env.OMX_SESSION_ID?.trim();
+  return sessionId || undefined;
+}
+
+async function canonicalPath(path: string): Promise<string> {
+  const resolved = resolvePath(path);
+  try {
+    return await realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function authorityDiagnostic(code: string, message: string, fatal = true): HudAuthorityDiagnostic {
+  return { code, message, fatal };
+}
+
+async function authorityLocatorDiagnostics(
+  context: ResolvedStateAuthorityContext,
+  env: NodeJS.ProcessEnv,
+): Promise<HudAuthorityDiagnostic[]> {
+  const diagnostics: HudAuthorityDiagnostic[] = [];
+  const locator = env.OMX_STATE_AUTHORITY_PATH?.trim();
+  if (locator) {
+    const [received, expected] = await Promise.all([
+      canonicalPath(locator),
+      canonicalPath(context.authority_path),
+    ]);
+    if (received !== expected) {
+      diagnostics.push(authorityDiagnostic(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        'inherited authority locator does not match the validated generation',
+      ));
+    }
+  }
+  if (env.OMX_STATE_AUTHORITY_ID?.trim() && env.OMX_STATE_AUTHORITY_ID.trim() !== context.generation.authority_id) {
+    diagnostics.push(authorityDiagnostic(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      'inherited authority ID does not match the validated generation',
+    ));
+  }
+  if (env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim() && env.OMX_STATE_AUTHORITY_GENERATION_ID.trim() !== context.generation.generation_id) {
+    diagnostics.push(authorityDiagnostic(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      'inherited authority generation ID does not match the active generation',
+    ));
+  }
+  if (env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim() && env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST.trim() !== context.workspace_identity.digest) {
+    diagnostics.push(authorityDiagnostic(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      'inherited authority workspace digest does not match the active workspace',
+    ));
+  }
+  const rootEvidence: Array<{ name: string; value?: string; stateRoot: string }> = [
+    {
+      name: 'OMX_TEAM_STATE_ROOT',
+      value: env.OMX_TEAM_STATE_ROOT?.trim(),
+      stateRoot: env.OMX_TEAM_STATE_ROOT?.trim() ?? '',
+    },
+    {
+      name: 'OMX_ROOT',
+      value: env.OMX_ROOT?.trim(),
+      stateRoot: env.OMX_ROOT?.trim() ? join(env.OMX_ROOT.trim(), '.omx', 'state') : '',
+    },
+    {
+      name: 'OMX_STATE_ROOT',
+      value: env.OMX_STATE_ROOT?.trim(),
+      stateRoot: env.OMX_STATE_ROOT?.trim() ? join(env.OMX_STATE_ROOT.trim(), '.omx', 'state') : '',
+    },
+  ];
+  for (const evidence of rootEvidence) {
+    if (!evidence.value) continue;
+    const [received, expected] = await Promise.all([
+      canonicalPath(evidence.stateRoot),
+      canonicalPath(context.canonical_state_root),
+    ]);
+    if (received !== expected) {
+      diagnostics.push(authorityDiagnostic(
+        AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+        `${evidence.name} conflicts with the persisted authority state root; remove the override and relaunch from the authority workspace`,
+      ));
+    }
+  }
+  return diagnostics;
+}
+
+function legacyHudScope(cwd: string, env: NodeJS.ProcessEnv): { workspaceRoot: string; stateRoot: string } {
+  const teamStateRoot = env.OMX_TEAM_STATE_ROOT?.trim();
+  if (teamStateRoot) {
+    return { workspaceRoot: resolvePath(cwd), stateRoot: resolvePath(cwd, teamStateRoot) };
+  }
+  const omxRoot = env.OMX_ROOT?.trim();
+  if (omxRoot) {
+    const workspaceRoot = resolvePath(cwd, omxRoot);
+    return { workspaceRoot, stateRoot: join(workspaceRoot, '.omx', 'state') };
+  }
+  const omxStateRoot = env.OMX_STATE_ROOT?.trim();
+  if (omxStateRoot) {
+    const workspaceRoot = resolvePath(cwd, omxStateRoot);
+    return { workspaceRoot, stateRoot: join(workspaceRoot, '.omx', 'state') };
+  }
+  const workspaceRoot = resolvePath(cwd);
+  return { workspaceRoot, stateRoot: join(workspaceRoot, '.omx', 'state') };
+}
+
+async function readLegacySessionId(stateRoot: string, cwd: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+  const fromEnv = sessionCandidate(env);
+  if (fromEnv) return fromEnv;
+  const session = await readJsonFile<{ session_id?: unknown; cwd?: unknown }>(join(stateRoot, 'session.json'));
+  if (typeof session?.cwd === 'string') {
+    const [recordedCwd, observedCwd] = await Promise.all([canonicalPath(session.cwd), canonicalPath(cwd)]);
+    if (recordedCwd !== observedCwd) return undefined;
+  }
+  return typeof session?.session_id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(session.session_id)
+    ? session.session_id
+    : undefined;
+}
+
+/**
+ * Resolve a validated authority context before reading runtime state. HUD
+ * configuration remains deliberately cwd-local; this scope is only for state
+ * and durable workspace artifacts.
+ */
+export async function resolveHudAuthorityReadScope(
+  cwd: string,
+  context?: ResolvedStateAuthorityContext,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<HudAuthorityReadScope> {
+  const locatorPresent = inheritedAuthorityLocatorPresent(env);
+  let resolvedContext = context;
+  let diagnostics: HudAuthorityDiagnostic[] = [];
+  if (locatorPresent) {
+    try {
+      const transportedContext = await resolveAuthenticatedTransportAuthority(cwd, env);
+      if (!transportedContext) {
+        return {
+          workspaceRoot: resolvePath(cwd),
+          stateRoot: null,
+          diagnostics: [authorityDiagnostic(
+            AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+            'inherited state authority transport is absent',
+          )],
+        };
+      }
+      resolvedContext = transportedContext;
+    } catch (error) {
+      return {
+        workspaceRoot: resolvePath(cwd),
+        stateRoot: null,
+        diagnostics: [authorityDiagnostic(
+          error instanceof StateAuthorityError
+            ? error.code
+            : AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+          `unable to resolve inherited state authority: ${error instanceof Error ? error.message : String(error)}`,
+        )],
+      };
+    }
+  }
+  if (!resolvedContext) {
+    try {
+      const resolution = await resolveStateAuthority({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: sessionCandidate(env),
+      });
+      if (resolution.context && resolution.can_mutate) {
+        resolvedContext = resolution.context;
+        diagnostics = resolution.diagnostics;
+      } else if (
+        !locatorPresent
+        && resolution.diagnostics.length === 1
+        && resolution.diagnostics[0]?.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing
+      ) {
+        const legacy = legacyHudScope(cwd, env);
+        return {
+          workspaceRoot: legacy.workspaceRoot,
+          stateRoot: legacy.stateRoot,
+          sessionId: await readLegacySessionId(legacy.stateRoot, cwd, env),
+          diagnostics: [],
+        };
+      } else {
+        return {
+          workspaceRoot: resolvePath(cwd),
+          stateRoot: null,
+          diagnostics: resolution.diagnostics,
+        };
+      }
+    } catch (error) {
+      if (!locatorPresent) {
+        const legacy = legacyHudScope(cwd, env);
+        return {
+          workspaceRoot: legacy.workspaceRoot,
+          stateRoot: legacy.stateRoot,
+          sessionId: await readLegacySessionId(legacy.stateRoot, cwd, env),
+          diagnostics: [],
+        };
+      }
+      return {
+        workspaceRoot: resolvePath(cwd),
+        stateRoot: null,
+        diagnostics: [authorityDiagnostic(
+          AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+          `unable to resolve persisted state authority: ${error instanceof Error ? error.message : String(error)}`,
+        )],
+      };
+    }
+  }
+
+  const validation = await validateStateAuthority(resolvedContext.generation, {
+    workspace_identity: resolvedContext.workspace_identity,
+    session_id: sessionCandidate(env),
+  });
+  diagnostics = [...diagnostics, ...validation.diagnostics];
+  if (resolvedContext.canonical_state_root !== resolvedContext.generation.canonical_state_root) {
+    diagnostics.push(authorityDiagnostic(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      'validated authority context state root differs from its generation record',
+    ));
+  }
+  diagnostics.push(...await authorityLocatorDiagnostics(resolvedContext, env));
+  if (diagnostics.some((diagnostic) => diagnostic.fatal) || !resolvedContext.session_binding) {
+    if (!resolvedContext.session_binding) {
+      diagnostics.push(authorityDiagnostic(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+        'active authority has no session binding',
+      ));
+    }
+    return {
+      workspaceRoot: resolvedContext.workspace_identity.canonical_path,
+      stateRoot: null,
+      diagnostics,
+    };
+  }
+  return {
+    workspaceRoot: resolvedContext.workspace_identity.canonical_path,
+    stateRoot: resolvedContext.canonical_state_root,
+    sessionId: resolvedContext.session_binding.canonical_session_id,
+    context: resolvedContext,
+    diagnostics: [],
+  };
+}
+
 async function readJsonFile<T>(path: string): Promise<T | null> {
   try {
     const content = await readFile(path, 'utf-8');
@@ -51,13 +326,23 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
   }
 }
 
-async function readAuthoritativeModeState<T>(cwd: string, mode: string): Promise<T | null> {
-  const sessionId = await readCurrentSessionId(cwd);
-  return readJsonFile<T>(getStateFilePath(`${mode}-state.json`, cwd, sessionId));
+function statePath(scope: HudAuthorityReadScope, fileName: string, sessionScoped = false): string | null {
+  if (!scope.stateRoot) return null;
+  return sessionScoped && scope.sessionId
+    ? join(scope.stateRoot, 'sessions', scope.sessionId, fileName)
+    : join(scope.stateRoot, fileName);
 }
 
-async function readCurrentAutopilotState(cwd: string): Promise<AutopilotStateForHud | null> {
-  return readJsonFile<AutopilotStateForHud>(join(getBaseStateDir(cwd), 'current-autopilot.json'));
+async function readAuthoritativeModeState<T>(cwd: string, mode: string, scope?: HudAuthorityReadScope): Promise<T | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  const path = statePath(resolvedScope, `${mode}-state.json`, Boolean(resolvedScope.sessionId));
+  return path ? readJsonFile<T>(path) : null;
+}
+
+async function readCurrentAutopilotState(cwd: string, scope?: HudAuthorityReadScope): Promise<AutopilotStateForHud | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  const path = statePath(resolvedScope, 'current-autopilot.json');
+  return path ? readJsonFile<AutopilotStateForHud>(path) : null;
 }
 
 function isValidPreset(value: unknown): value is ResolvedHudConfig['preset'] {
@@ -177,8 +462,13 @@ function isHudUnresolvedUltragoalGoal(goal: NormalizedUltragoalGoal, goals: Norm
   return isHudCompletionBlockingUltragoalGoal(goal, goals);
 }
 
-export async function readUltragoalState(cwd: string): Promise<UltragoalStateForHud | null> {
-  const plan = await readJsonFile<RawUltragoalPlan>(join(cwd, '.omx', 'ultragoal', 'goals.json'));
+export async function readUltragoalState(
+  cwd: string,
+  scope?: HudAuthorityReadScope,
+): Promise<UltragoalStateForHud | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  if (!resolvedScope.stateRoot) return null;
+  const plan = await readJsonFile<RawUltragoalPlan>(join(resolvedScope.workspaceRoot, '.omx', 'ultragoal', 'goals.json'));
   if (!plan || typeof plan !== 'object' || !Array.isArray(plan.goals)) return null;
 
   const goals = plan.goals.map(normalizeUltragoalGoal).filter((goal): goal is NormalizedUltragoalGoal => goal !== null);
@@ -243,23 +533,23 @@ export async function readUltragoalState(cwd: string): Promise<UltragoalStateFor
   };
 }
 
-export async function readRalphState(cwd: string): Promise<RalphStateForHud | null> {
-  const state = await readAuthoritativeModeState<RalphStateForHud>(cwd, 'ralph');
+export async function readRalphState(cwd: string, scope?: HudAuthorityReadScope): Promise<RalphStateForHud | null> {
+  const state = await readAuthoritativeModeState<RalphStateForHud>(cwd, 'ralph', scope);
   return state?.active ? state : null;
 }
 
-export async function readUltraworkState(cwd: string): Promise<UltraworkStateForHud | null> {
-  const state = await readAuthoritativeModeState<UltraworkStateForHud>(cwd, 'ultrawork');
+export async function readUltraworkState(cwd: string, scope?: HudAuthorityReadScope): Promise<UltraworkStateForHud | null> {
+  const state = await readAuthoritativeModeState<UltraworkStateForHud>(cwd, 'ultrawork', scope);
   return state?.active ? state : null;
 }
 
-export async function readAutopilotState(cwd: string): Promise<AutopilotStateForHud | null> {
-  const state = await readAuthoritativeModeState<AutopilotStateForHud>(cwd, 'autopilot');
+export async function readAutopilotState(cwd: string, scope?: HudAuthorityReadScope): Promise<AutopilotStateForHud | null> {
+  const state = await readAuthoritativeModeState<AutopilotStateForHud>(cwd, 'autopilot', scope);
   return state?.active ? state : null;
 }
 
-export async function readRalplanState(cwd: string): Promise<RalplanStateForHud | null> {
-  const state = await readAuthoritativeModeState<RalplanStateForHud>(cwd, 'ralplan');
+export async function readRalplanState(cwd: string, scope?: HudAuthorityReadScope): Promise<RalplanStateForHud | null> {
+  const state = await readAuthoritativeModeState<RalplanStateForHud>(cwd, 'ralplan', scope);
   return state?.active ? state : null;
 }
 
@@ -269,48 +559,52 @@ interface DeepInterviewRawState extends DeepInterviewStateForHud {
   };
 }
 
-export async function readDeepInterviewState(cwd: string): Promise<DeepInterviewStateForHud | null> {
-  const state = await readAuthoritativeModeState<DeepInterviewRawState>(cwd, 'deep-interview');
+export async function readDeepInterviewState(cwd: string, scope?: HudAuthorityReadScope): Promise<DeepInterviewStateForHud | null> {
+  const state = await readAuthoritativeModeState<DeepInterviewRawState>(cwd, 'deep-interview', scope);
   if (!state?.active) return null;
-
   return {
     ...state,
     input_lock_active: state.input_lock_active ?? state.input_lock?.active === true,
   };
 }
 
-export async function readAutoresearchState(cwd: string): Promise<AutoresearchStateForHud | null> {
-  const state = await readAuthoritativeModeState<AutoresearchStateForHud>(cwd, 'autoresearch');
+export async function readAutoresearchState(cwd: string, scope?: HudAuthorityReadScope): Promise<AutoresearchStateForHud | null> {
+  const state = await readAuthoritativeModeState<AutoresearchStateForHud>(cwd, 'autoresearch', scope);
   return state?.active ? state : null;
 }
 
-export async function readUltraqaState(cwd: string): Promise<UltraqaStateForHud | null> {
-  const state = await readAuthoritativeModeState<UltraqaStateForHud>(cwd, 'ultraqa');
+export async function readUltraqaState(cwd: string, scope?: HudAuthorityReadScope): Promise<UltraqaStateForHud | null> {
+  const state = await readAuthoritativeModeState<UltraqaStateForHud>(cwd, 'ultraqa', scope);
   return state?.active ? state : null;
 }
 
-export async function readTeamState(cwd: string): Promise<TeamStateForHud | null> {
-  const state = await readAuthoritativeModeState<TeamStateForHud>(cwd, 'team');
+export async function readTeamState(cwd: string, scope?: HudAuthorityReadScope): Promise<TeamStateForHud | null> {
+  const state = await readAuthoritativeModeState<TeamStateForHud>(cwd, 'team', scope);
   return state?.active ? state : null;
 }
 
-export async function readMetrics(cwd: string): Promise<HudMetrics | null> {
-  return readJsonFile<HudMetrics>(join(cwd, '.omx', 'metrics.json'));
+export async function readMetrics(cwd: string, scope?: HudAuthorityReadScope): Promise<HudMetrics | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  if (!resolvedScope.stateRoot) return null;
+  const omxRoot = resolvedScope.context?.generation.canonical_omx_root ?? join(resolvedScope.workspaceRoot, '.omx');
+  return readJsonFile<HudMetrics>(join(omxRoot, 'metrics.json'));
 }
 
-export async function readHudNotifyState(cwd: string): Promise<HudNotifyState | null> {
-  const sessionId = await readCurrentSessionId(cwd);
-  const hudStatePath = getStateFilePath('hud-state.json', cwd, sessionId);
-  return readJsonFile<HudNotifyState>(hudStatePath);
+export async function readHudNotifyState(cwd: string, scope?: HudAuthorityReadScope): Promise<HudNotifyState | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  const path = statePath(resolvedScope, 'hud-state.json', Boolean(resolvedScope.sessionId));
+  return path ? readJsonFile<HudNotifyState>(path) : null;
 }
 
-export async function readSessionState(cwd: string): Promise<SessionStateForHud | null> {
-  const scope = await resolveRuntimeStateScope(cwd);
-  const metadata = scope.metadata;
-  return metadata?.sessionId ? {
-    session_id: metadata.sessionId,
-    started_at: typeof metadata.raw?.started_at === 'string' ? metadata.raw.started_at : '',
-  } : null;
+export async function readSessionState(cwd: string, scope?: HudAuthorityReadScope): Promise<SessionStateForHud | null> {
+  const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
+  const path = statePath(resolvedScope, 'session.json');
+  const session = path ? await readJsonFile<{ session_id?: unknown; started_at?: unknown }>(path) : null;
+  if (typeof session?.session_id !== 'string' || session.session_id !== resolvedScope.sessionId) return null;
+  return {
+    session_id: session.session_id,
+    started_at: typeof session.started_at === 'string' ? session.started_at : '',
+  };
 }
 
 export async function readHudConfig(cwd: string): Promise<ResolvedHudConfig> {
@@ -516,10 +810,13 @@ function mergePhase<T extends { active?: boolean; current_phase?: string }>(
   return { active: true, current_phase: normalizedCanonicalPhase } as T;
 }
 
-async function readCanonicalTeamPhase(cwd: string, teamDetail: TeamStateForHud | null): Promise<string | undefined> {
+async function readCanonicalTeamPhase(
+  scope: HudAuthorityReadScope,
+  teamDetail: TeamStateForHud | null,
+): Promise<string | undefined> {
   const teamName = sanitizeOptionalString(teamDetail?.team_name);
-  if (!teamName) return undefined;
-  const phaseState = await readTeamPhase(teamName, cwd).catch(() => null);
+  if (!teamName || !scope.stateRoot) return undefined;
+  const phaseState = await readJsonFile<{ current_phase?: unknown }>(join(scope.stateRoot, 'team', teamName, 'phase.json'));
   return sanitizeOptionalString(phaseState?.current_phase);
 }
 
@@ -610,23 +907,38 @@ function codeReviewFromSubagentEvidence(
   };
 }
 
-/** Read all state files and build the full render context */
-export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFAULT_HUD_CONFIG): Promise<HudRenderContext> {
+export interface HudAuthorityStatus {
+  status: 'legacy' | 'validated' | 'invalid';
+  workspaceRoot: string;
+  stateRoot: string | null;
+  diagnostics: HudAuthorityDiagnostic[];
+}
+
+/** Read all state files and build the full render context. */
+export async function readAllState(
+  cwd: string,
+  config: ResolvedHudConfig = DEFAULT_HUD_CONFIG,
+  authorityContext?: ResolvedStateAuthorityContext,
+): Promise<HudRenderContext & { authority?: HudAuthorityStatus }> {
+  const authorityScope = await resolveHudAuthorityReadScope(cwd, authorityContext);
   const version = readVersion();
-  const gitBranch = buildGitBranchLabel(cwd, config);
-  const [metrics, hudNotify, session, currentSessionId, subagentTracking] = await Promise.all([
-    readMetrics(cwd),
-    readHudNotifyState(cwd),
-    readSessionState(cwd),
-    readCurrentSessionId(cwd),
-    readSubagentTrackingState(cwd),
+  const gitBranch = authorityScope.diagnostics[0]
+    ? `authority:${authorityScope.diagnostics[0].code}`
+    : buildGitBranchLabel(authorityScope.workspaceRoot, config);
+  const [metrics, hudNotify, session, subagentTracking] = await Promise.all([
+    readMetrics(cwd, authorityScope),
+    readHudNotifyState(cwd, authorityScope),
+    readSessionState(cwd, authorityScope),
+    authorityScope.stateRoot
+      ? readJsonFile<SubagentTrackingState>(join(authorityScope.stateRoot, 'subagent-tracking.json')).then((state) => state ?? createSubagentTrackingState())
+      : Promise.resolve(createSubagentTrackingState()),
   ]);
-  const stateDir = getBaseStateDir(cwd);
-  const canonicalSkillState = await readVisibleSkillActiveStateForStateDir(stateDir, currentSessionId);
+  const canonicalSkillState = authorityScope.stateRoot
+    ? await readVisibleSkillActiveStateForStateDir(authorityScope.stateRoot, authorityScope.sessionId)
+    : {};
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
   );
-
 
   const [
     ralphDetail,
@@ -641,18 +953,45 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     teamDetail,
     currentAutopilotDetail,
   ] = await Promise.all([
-    readAuthoritativeModeState<RalphStateForHud>(cwd, 'ralph'),
-    readUltragoalState(cwd),
-    readAuthoritativeModeState<UltragoalStateForHud>(cwd, 'ultragoal'),
-    readAuthoritativeModeState<UltraworkStateForHud>(cwd, 'ultrawork'),
-    readAuthoritativeModeState<AutopilotStateForHud>(cwd, 'autopilot'),
-    readAuthoritativeModeState<RalplanStateForHud>(cwd, 'ralplan'),
-    readAuthoritativeModeState<DeepInterviewRawState>(cwd, 'deep-interview'),
-    readAuthoritativeModeState<AutoresearchStateForHud>(cwd, 'autoresearch'),
-    readAuthoritativeModeState<UltraqaStateForHud>(cwd, 'ultraqa'),
-    readAuthoritativeModeState<TeamStateForHud>(cwd, 'team'),
-    readCurrentAutopilotState(cwd),
+    readAuthoritativeModeState<RalphStateForHud>(cwd, 'ralph', authorityScope),
+    readUltragoalState(cwd, authorityScope),
+    readAuthoritativeModeState<UltragoalStateForHud>(cwd, 'ultragoal', authorityScope),
+    readAuthoritativeModeState<UltraworkStateForHud>(cwd, 'ultrawork', authorityScope),
+    readAuthoritativeModeState<AutopilotStateForHud>(cwd, 'autopilot', authorityScope),
+    readAuthoritativeModeState<RalplanStateForHud>(cwd, 'ralplan', authorityScope),
+    readAuthoritativeModeState<DeepInterviewRawState>(cwd, 'deep-interview', authorityScope),
+    readAuthoritativeModeState<AutoresearchStateForHud>(cwd, 'autoresearch', authorityScope),
+    readAuthoritativeModeState<UltraqaStateForHud>(cwd, 'ultraqa', authorityScope),
+    readAuthoritativeModeState<TeamStateForHud>(cwd, 'team', authorityScope),
+    readCurrentAutopilotState(cwd, authorityScope),
   ]);
+  const canonicalSkillStateExists = authorityScope.stateRoot
+    ? [
+      join(authorityScope.stateRoot, 'skill-active-state.json'),
+      ...(authorityScope.sessionId
+        ? [join(authorityScope.stateRoot, 'sessions', authorityScope.sessionId, 'skill-active-state.json')]
+        : []),
+    ].some((path) => existsSync(path))
+    : false;
+  if (!canonicalSkillStateExists && canonicalSkills.size === 0) {
+    for (const [skill, detail] of [
+      ['ralph', ralphDetail],
+      ['ultrawork', ultraworkDetail],
+      ['autopilot', autopilotDetail],
+      ['ralplan', ralplanDetail],
+      ['deep-interview', deepInterviewDetail],
+      ['autoresearch', autoresearchDetail],
+      ['ultraqa', ultraqaDetail],
+      ['team', teamDetail],
+    ] as const) {
+      if (detail?.active === true) {
+        const phase = 'current_phase' in detail && typeof detail.current_phase === 'string'
+          ? detail.current_phase
+          : undefined;
+        canonicalSkills.set(skill, { skill, phase, active: true });
+      }
+    }
+  }
 
   const ralph = shouldSurfaceCanonicalSkill(canonicalSkills, 'ralph', ralphDetail)
     ? mergePhase(ralphDetail?.active === true ? ralphDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ralph'))
@@ -689,7 +1028,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
       'canonical-skill',
     )
     : supervisedAutopilotStage<CodeReviewStateForHud>(autopilot, 'code-review')
-      ?? codeReviewFromSubagentEvidence(canonicalSkills, subagentTracking, currentSessionId, autopilot);
+      ?? codeReviewFromSubagentEvidence(canonicalSkills, subagentTracking, authorityScope.sessionId, autopilot);
   const ultraqa = shouldSurfaceCanonicalSkill(canonicalSkills, 'ultraqa', ultraqaDetail)
     ? (() => {
       const detail = ultraqaDetail?.active === true ? ultraqaDetail : null;
@@ -697,7 +1036,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
       return detail ? merged : withLateGateSource(merged, 'canonical-skill');
     })()
     : supervisedAutopilotStage<UltraqaStateForHud>(autopilot, 'ultraqa');
-  const canonicalTeamPhase = await readCanonicalTeamPhase(cwd, teamDetail?.active === true ? teamDetail : null);
+  const canonicalTeamPhase = await readCanonicalTeamPhase(authorityScope, teamDetail?.active === true ? teamDetail : null);
   const team = shouldSurfaceCanonicalSkill(canonicalSkills, 'team', teamDetail)
     ? mergeTeamPhase(
       teamDetail?.active === true ? teamDetail : null,
@@ -712,11 +1051,9 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     )
     : null;
 
-  // When the Rust runtime bridge is enabled, prefer Rust-authored snapshot
-  // for authority/backlog/readiness display over JS-inferred state.
   let runtimeSnapshot: RuntimeSnapshot | null = null;
-  if (isBridgeEnabled()) {
-    const bridge = getDefaultBridge(stateDir);
+  if (isBridgeEnabled() && authorityScope.stateRoot) {
+    const bridge = getDefaultBridge(authorityScope.stateRoot);
     runtimeSnapshot = bridge.readCompatFile<RuntimeSnapshot>('snapshot.json');
   }
 
@@ -738,5 +1075,13 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     session,
     runtimeSnapshot,
     staleAutopilot,
+    authority: {
+      status: authorityScope.stateRoot
+        ? (authorityScope.context ? 'validated' : 'legacy')
+        : 'invalid',
+      workspaceRoot: authorityScope.workspaceRoot,
+      stateRoot: authorityScope.stateRoot,
+      diagnostics: authorityScope.diagnostics,
+    },
   };
 }

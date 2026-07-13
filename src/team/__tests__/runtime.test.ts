@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import ts from 'typescript-compiler-api';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'child_process';
 import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
@@ -2778,19 +2779,46 @@ esac
 
   it('startTeam saves interactive pane ids before concurrent readiness attempts', async () => {
     const source = await readFile(join(process.cwd(), 'src', 'team', 'runtime.ts'), 'utf-8');
-    const applyMatch = source.match(
-      /applyCreatedInteractiveSessionToConfig\(\s*config,\s*createdSession,\s*workerPaneIds\s*\);/m,
+    const sourceFile = ts.createSourceFile(
+      'runtime.ts',
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
     );
-    const saveMatch = source.match(/await saveTeamConfig\(config, leaderCwd\);/m);
-    const readyMatch = source.match(/waitForWorkerReadyAsync\(/m);
+    let startTeamDeclaration: ts.FunctionDeclaration | undefined;
+    const findStartTeam = (node: ts.Node): void => {
+      if (
+        ts.isFunctionDeclaration(node) &&
+        node.name?.text === 'startTeam'
+      ) {
+        startTeamDeclaration = node;
+        return;
+      }
+      ts.forEachChild(node, findStartTeam);
+    };
+    findStartTeam(sourceFile);
+    assert.notEqual(startTeamDeclaration, undefined);
 
-    const applyIndex = applyMatch?.index ?? -1;
-    const saveIndex = saveMatch?.index ?? -1;
-    const readyIndex = readyMatch?.index ?? -1;
+    const callPositions = new Map<string, number[]>();
+    const collectCalls = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        const positions = callPositions.get(node.expression.text) ?? [];
+        positions.push(node.getStart(sourceFile));
+        callPositions.set(node.expression.text, positions);
+      }
+      ts.forEachChild(node, collectCalls);
+    };
+    collectCalls(startTeamDeclaration!);
 
-    assert.notEqual(applyMatch, null);
-    assert.notEqual(saveMatch, null);
-    assert.notEqual(readyMatch, null);
+    const applyIndex = callPositions.get('applyCreatedInteractiveSessionToConfig')?.[0] ?? -1;
+    const saveIndex =
+      callPositions.get('saveTeamConfig')?.find((position) => position > applyIndex) ?? -1;
+    const readyIndex = callPositions.get('waitForWorkerReadyAsync')?.[0] ?? -1;
+
+    assert.notEqual(applyIndex, -1);
+    assert.notEqual(saveIndex, -1);
+    assert.notEqual(readyIndex, -1);
     assert.equal(applyIndex < saveIndex, true);
     assert.equal(saveIndex < readyIndex, true);
   });

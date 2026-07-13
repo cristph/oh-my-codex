@@ -115,11 +115,19 @@ import {
 } from './worker-bootstrap.js';
 import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
 import { synthesizeDelegationPlan } from './delegation-policy.js';
-import { coordinationPlansEqual, synthesizeCoordinationPlan, synthesizeCoordinationPlans } from './coordination-protocol.js';
+import {
+  coordinationPlansEqual,
+  synthesizeCoordinationPlan,
+  synthesizeCoordinationPlans,
+} from './coordination-protocol.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
 import { codexPromptsDir } from '../utils/paths.js';
-import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
+import {
+  isTerminalPhase,
+  type TeamPhase,
+  type TerminalPhase,
+} from './orchestrator.js';
 import {
   resolveTeamWorkerLaunchDiagnostics,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
@@ -131,14 +139,32 @@ import {
   type TeamReasoningEffort,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
-import { buildInternalTeamName, resolveTeamIdentityScope, resolveTeamNameForCurrentContext } from './team-identity.js';
-import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from './phase-controller.js';
+import {
+  buildInternalTeamName,
+  resolveTeamIdentityScope,
+  resolveTeamNameForCurrentContext,
+} from './team-identity.js';
+import {
+  inferPhaseTargetFromTaskCounts,
+  reconcilePhaseStateForMonitor,
+} from './phase-controller.js';
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
 import { readModeState, updateModeState } from '../modes/base.js';
-import { resolveWorktreeToolContext, worktreeToolContextEnv } from '../utils/worktree-tool-context.js';
+import {
+  resolveWorktreeToolContext,
+  worktreeToolContextEnv,
+} from '../utils/worktree-tool-context.js';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  resolveStateAuthority,
+  stateAuthorityTransportCapabilityForChild,
+  type ResolvedStateAuthorityContext,
+} from '../state/authority.js';
+import { resolveAuthenticatedTransportAuthority } from '../hooks/session.js';
 
 export { resolveTeamWorkerCliForResolvedLaunchArgs };
 import {
@@ -181,8 +207,12 @@ import {
   type CleanupResult,
 } from '../cli/cleanup.js';
 
-function joinContextSections(...sections: Array<string | undefined>): string | undefined {
-  const present = sections.filter((section): section is string => Boolean(section?.trim()));
+function joinContextSections(
+  ...sections: Array<string | undefined>
+): string | undefined {
+  const present = sections.filter((section): section is string =>
+    Boolean(section?.trim()),
+  );
   return present.length > 0 ? present.join('\n\n') : undefined;
 }
 
@@ -225,23 +255,34 @@ async function syncRootTeamModeStateOnTerminalPhase(
   phase: TeamPhase | TerminalPhase,
   cwd: string,
 ): Promise<void> {
-  if (phase !== 'complete' && phase !== 'failed' && phase !== 'cancelled') return;
+  if (phase !== 'complete' && phase !== 'failed' && phase !== 'cancelled')
+    return;
 
   try {
-    const localStatePath = join(resolve(cwd), '.omx', 'state', 'team-state.json');
+    const localStatePath = join(
+      resolve(cwd),
+      '.omx',
+      'state',
+      'team-state.json',
+    );
     const localTeamState = existsSync(localStatePath)
-      ? JSON.parse(await readFile(localStatePath, 'utf-8')) as Record<string, unknown>
+      ? (JSON.parse(await readFile(localStatePath, 'utf-8')) as Record<
+          string,
+          unknown
+        >)
       : null;
-    const teamState = localTeamState ?? await readModeState('team', cwd);
+    const teamState = localTeamState ?? (await readModeState('team', cwd));
     if (!teamState) return;
 
-    const stateTeamName = typeof teamState.team_name === 'string' ? teamState.team_name.trim() : '';
+    const stateTeamName =
+      typeof teamState.team_name === 'string' ? teamState.team_name.trim() : '';
     if (stateTeamName && stateTeamName !== teamName) return;
 
-    const alreadySynced = teamState.active === false
-      && teamState.current_phase === phase
-      && typeof teamState.completed_at === 'string'
-      && teamState.completed_at.length > 0;
+    const alreadySynced =
+      teamState.active === false &&
+      teamState.current_phase === phase &&
+      typeof teamState.completed_at === 'string' &&
+      teamState.completed_at.length > 0;
     if (alreadySynced) return;
 
     const updates: Record<string, unknown> = {
@@ -254,7 +295,11 @@ async function syncRootTeamModeStateOnTerminalPhase(
     }
 
     if (localTeamState) {
-      await writeFile(localStatePath, JSON.stringify({ ...localTeamState, ...updates }, null, 2), 'utf-8');
+      await writeFile(
+        localStatePath,
+        JSON.stringify({ ...localTeamState, ...updates }, null, 2),
+        'utf-8',
+      );
     } else {
       await updateModeState('team', updates, cwd);
     }
@@ -267,7 +312,8 @@ function matchesTeamModeStateForShutdown(
   state: Record<string, unknown> | null,
   teamName: string,
 ): boolean {
-  const stateTeamName = typeof state?.team_name === 'string' ? state.team_name.trim() : '';
+  const stateTeamName =
+    typeof state?.team_name === 'string' ? state.team_name.trim() : '';
   return !stateTeamName || stateTeamName === teamName;
 }
 
@@ -280,7 +326,10 @@ async function syncExactTeamModeStateOnShutdown(
   if (!existsSync(path)) return;
 
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<
+      string,
+      unknown
+    >;
     if (!matchesTeamModeStateForShutdown(parsed, teamName)) return;
 
     const next = {
@@ -288,7 +337,8 @@ async function syncExactTeamModeStateOnShutdown(
       active: false,
       current_phase: 'cancelled',
       completed_at:
-        typeof parsed.completed_at === 'string' && parsed.completed_at.trim().length > 0
+        typeof parsed.completed_at === 'string' &&
+        parsed.completed_at.trim().length > 0
           ? parsed.completed_at
           : new Date().toISOString(),
       team_name: teamName,
@@ -305,9 +355,14 @@ async function syncTeamModeStateOnShutdown(
   leaderSessionId?: string,
 ): Promise<void> {
   await syncExactTeamModeStateOnShutdown(teamName, cwd);
-  const normalizedLeaderSessionId = typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
+  const normalizedLeaderSessionId =
+    typeof leaderSessionId === 'string' ? leaderSessionId.trim() : '';
   if (normalizedLeaderSessionId) {
-    await syncExactTeamModeStateOnShutdown(teamName, cwd, normalizedLeaderSessionId);
+    await syncExactTeamModeStateOnShutdown(
+      teamName,
+      cwd,
+      normalizedLeaderSessionId,
+    );
   }
 }
 
@@ -318,7 +373,9 @@ async function assertTeamStartupIsNonDestructive(
 ): Promise<void> {
   const activeTeams = await findActiveTeams(cwd, leaderSessionId);
   if (activeTeams.length > 0) {
-    throw new Error(`leader_session_conflict: active team exists (${activeTeams.join(', ')})`);
+    throw new Error(
+      `leader_session_conflict: active team exists (${activeTeams.join(', ')})`,
+    );
   }
 
   const [existingConfig, existingManifest, existingPhase] = await Promise.all([
@@ -332,11 +389,14 @@ async function assertTeamStartupIsNonDestructive(
   const currentPhase = existingPhase?.current_phase;
   if (currentPhase && isTerminalPhase(currentPhase)) return;
 
-  const tmuxSession = existingConfig?.tmux_session ?? existingManifest?.tmux_session ?? `omx-team-${teamName}`;
+  const tmuxSession =
+    existingConfig?.tmux_session ??
+    existingManifest?.tmux_session ??
+    `omx-team-${teamName}`;
   const renderedPhase = currentPhase ?? 'team-exec';
   throw new Error(
-    `team_name_conflict: active team state already exists for "${teamName}" (phase: ${renderedPhase}, tmux: ${tmuxSession}). `
-    + `Use "omx team status ${teamName}", "omx team resume ${teamName}", or "omx team shutdown ${teamName}" instead of launching a duplicate team.`,
+    `team_name_conflict: active team state already exists for "${teamName}" (phase: ${renderedPhase}, tmux: ${tmuxSession}). ` +
+      `Use "omx team status ${teamName}", "omx team resume ${teamName}", or "omx team shutdown ${teamName}" instead of launching a duplicate team.`,
   );
 }
 
@@ -395,16 +455,17 @@ function collectShutdownPaneIds(params: {
     hudPaneId = config.hud_pane_id,
   } = params;
   const excludedPaneIds = new Set(
-    [
-      leaderPaneId,
-      hudPaneId,
-      restoredStandaloneHudPaneId,
-    ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%')),
+    [leaderPaneId, hudPaneId, restoredStandaloneHudPaneId].filter(
+      (paneId): paneId is string =>
+        typeof paneId === 'string' && paneId.trim().startsWith('%'),
+    ),
   );
 
   const paneIds = new Set<string>();
   for (const paneId of [
-    ...(includePersistedWorkerPaneIds ? config.workers.map((worker) => worker.pane_id) : []),
+    ...(includePersistedWorkerPaneIds
+      ? config.workers.map((worker) => worker.pane_id)
+      : []),
     ...candidatePaneIds,
   ]) {
     if (typeof paneId !== 'string') continue;
@@ -427,7 +488,8 @@ function filterSharedSessionShutdownWorkerPaneIdsByOwner(
   if (!expectedOwnerId) return [];
   return paneIds.filter((paneId) => {
     const actualOwnerId = readPaneTeamOwnerTagResult(paneId);
-    if (actualOwnerId.status === 'value') return actualOwnerId.value === expectedOwnerId;
+    if (actualOwnerId.status === 'value')
+      return actualOwnerId.value === expectedOwnerId;
     if (actualOwnerId.status === 'missing') {
       // Legacy, already-running Team panes may not have @omx_team_pane_owner_id.
       // Keep that compatibility path explicitly bounded to panes that are both
@@ -448,7 +510,13 @@ function isSharedSessionHudPaneReclaimable(params: {
   teamPaneOwnerId: string;
   onOwnerReadError?: (paneId: string, error: string) => void;
 }): boolean {
-  const { paneId, persistedHudPaneId, leaderOwnedHudPaneIds, teamPaneOwnerId, onOwnerReadError } = params;
+  const {
+    paneId,
+    persistedHudPaneId,
+    leaderOwnedHudPaneIds,
+    teamPaneOwnerId,
+    onOwnerReadError,
+  } = params;
   const expectedOwnerId = teamPaneOwnerId.trim();
   if (!expectedOwnerId) return false;
   const owner = readPaneTeamOwnerTagResult(paneId);
@@ -475,7 +543,9 @@ function isTrustedSharedSessionLeaderPaneForHudRestore(params: {
   return paneHasOmxInstanceTag(paneId, legacyInstanceId);
 }
 
-export function shouldPrekillInteractiveShutdownProcessTrees(sessionName: string): boolean {
+export function shouldPrekillInteractiveShutdownProcessTrees(
+  sessionName: string,
+): boolean {
   // Shared-window tmux sessions can expose overlapping ancestry around the
   // invoking leader client. Rely on pane-targeted teardown there so shutdown
   // does not signal the leader while tearing down worker panes.
@@ -493,12 +563,16 @@ export async function cleanupTeamWorkerLaunchOrphanedMcpProcesses(
     writeWarning?: (message: string) => void;
   } = {},
 ): Promise<void> {
-  const cleanup = dependencies.cleanup ?? (() =>
+  const cleanup =
+    dependencies.cleanup ??
+    (() =>
     cleanupOmxMcpProcesses([], {
       selectCandidates: findLaunchSafeCleanupCandidates,
       writeLine: () => {},
     }));
-  const writeWarning = dependencies.writeWarning ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const writeWarning =
+    dependencies.writeWarning ??
+    ((message: string) => process.stderr.write(`${message}\n`));
 
   try {
     const result = await cleanup();
@@ -508,7 +582,9 @@ export async function cleanupTeamWorkerLaunchOrphanedMcpProcesses(
       );
     }
   } catch (err) {
-    writeWarning(`[team/runtime] pre-launch MCP cleanup failed: ${err}; continuing worker launch.`);
+    writeWarning(
+      `[team/runtime] pre-launch MCP cleanup failed: ${err}; continuing worker launch.`,
+    );
   }
 }
 
@@ -522,7 +598,16 @@ async function logRuntimeDispatchOutcome(params: {
   outcome: DispatchOutcome;
   source?: string;
 }): Promise<void> {
-  const { cwd, teamName, workerName, requestId, messageId, intent, outcome, source = 'team.runtime' } = params;
+  const {
+    cwd,
+    teamName,
+    workerName,
+    requestId,
+    messageId,
+    intent,
+    outcome,
+    source = 'team.runtime',
+  } = params;
   await appendTeamDeliveryLogForCwd(cwd, {
     event: 'dispatch_result',
     source,
@@ -548,7 +633,17 @@ async function logStartupTiming(params: {
   requestId?: string;
   transport?: DispatchOutcome['transport'];
 }): Promise<void> {
-  const { cwd, teamName, workerName, event, paneId, elapsedMs, reason, requestId, transport } = params;
+  const {
+    cwd,
+    teamName,
+    workerName,
+    event,
+    paneId,
+    elapsedMs,
+    reason,
+    requestId,
+    transport,
+  } = params;
   await appendTeamDeliveryLogForCwd(cwd, {
     event: 'startup_timing',
     source: 'team.runtime',
@@ -556,14 +651,17 @@ async function logStartupTiming(params: {
     to_worker: workerName,
     startup_event: event,
     pane_id: paneId,
-    elapsed_ms: typeof elapsedMs === 'number' ? Math.round(elapsedMs) : undefined,
+    elapsed_ms:
+      typeof elapsedMs === 'number' ? Math.round(elapsedMs) : undefined,
     reason,
     request_id: requestId,
     transport,
   });
 }
 
-function collectProvisionedShutdownWorktrees(config: TeamConfig): EnsureWorktreeResult[] {
+function collectProvisionedShutdownWorktrees(
+  config: TeamConfig,
+): EnsureWorktreeResult[] {
   const seenWorktreePaths = new Set<string>();
   const worktrees: EnsureWorktreeResult[] = [];
 
@@ -613,7 +711,11 @@ interface WorkerShutdownMergeReport {
   leaderHeadAfter: string | null;
 }
 
-function runCommand(command: string, args: string[], cwd: string): CommandResult {
+function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+): CommandResult {
   const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf-8',
@@ -627,26 +729,48 @@ function runCommand(command: string, args: string[], cwd: string): CommandResult
   };
 }
 
-function runGitCommand(repoRoot: string, args: string[], cwd: string = repoRoot): CommandResult {
+function runGitCommand(
+  repoRoot: string,
+  args: string[],
+  cwd: string = repoRoot,
+): CommandResult {
   return runCommand('git', args, cwd);
 }
 
 function getWorktreeDiffText(worktreePath: string): string {
-  const staged = runGitCommand(worktreePath, ['diff', '--cached', '--stat', '--patch'], worktreePath);
+  const staged = runGitCommand(
+    worktreePath,
+    ['diff', '--cached', '--stat', '--patch'],
+    worktreePath,
+  );
   if (staged.ok && staged.stdout) return staged.stdout;
 
-  const unstaged = runGitCommand(worktreePath, ['diff', '--stat', '--patch'], worktreePath);
+  const unstaged = runGitCommand(
+    worktreePath,
+    ['diff', '--stat', '--patch'],
+    worktreePath,
+  );
   if (unstaged.ok && unstaged.stdout) return unstaged.stdout;
 
-  const againstHead = runGitCommand(worktreePath, ['diff', 'HEAD', '--stat', '--patch'], worktreePath);
+  const againstHead = runGitCommand(
+    worktreePath,
+    ['diff', 'HEAD', '--stat', '--patch'],
+    worktreePath,
+  );
   if (againstHead.ok && againstHead.stdout) return againstHead.stdout;
 
   return '';
 }
 
-function summarizeWorktreeDiffWithSparkShell(worktreePath: string): string | null {
+function summarizeWorktreeDiffWithSparkShell(
+  worktreePath: string,
+): string | null {
   const shellCommand = `git diff --cached --stat --patch || git diff --stat --patch || git diff HEAD --stat --patch`;
-  const result = runCommand('omx', ['sparkshell', 'sh', '-lc', shellCommand], worktreePath);
+  const result = runCommand(
+    'omx',
+    ['sparkshell', 'sh', '-lc', shellCommand],
+    worktreePath,
+  );
   if (!result.ok || !result.stdout) return null;
   return result.stdout;
 }
@@ -661,33 +785,69 @@ function resolveLeaderHead(repoRoot: string, leaderCwd: string): string | null {
   return head.ok && head.stdout ? head.stdout : null;
 }
 
-function listCommitRange(repoRoot: string, baseRef: string, headRef: string, cwd: string): string[] {
+function listCommitRange(
+  repoRoot: string,
+  baseRef: string,
+  headRef: string,
+  cwd: string,
+): string[] {
   if (!baseRef || !headRef || baseRef === headRef) return [];
-  const range = runGitCommand(repoRoot, ['rev-list', '--reverse', `${baseRef}..${headRef}`], cwd);
+  const range = runGitCommand(
+    repoRoot,
+    ['rev-list', '--reverse', `${baseRef}..${headRef}`],
+    cwd,
+  );
   if (!range.ok || !range.stdout) return [];
-  return range.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  return range.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function listConflictFiles(repoRoot: string, cwd: string): string[] {
-  const result = runGitCommand(repoRoot, ['diff', '--name-only', '--diff-filter=U'], cwd);
+  const result = runGitCommand(
+    repoRoot,
+    ['diff', '--name-only', '--diff-filter=U'],
+    cwd,
+  );
   if (!result.ok || !result.stdout) return [];
-  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  return result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 async function appendIntegrationEvent(
   teamName: string,
-  type: 'worker_cherry_pick_detected' | 'worker_cherry_pick_applied' | 'worker_cherry_pick_conflict' | 'worker_rebase_applied' | 'worker_rebase_conflict' | 'worker_auto_commit' | 'worker_merge_applied' | 'worker_merge_conflict' | 'worker_integration_failed' | 'worker_cross_rebase_applied' | 'worker_cross_rebase_conflict' | 'worker_cross_rebase_skipped',
+  type:
+    | 'worker_cherry_pick_detected'
+    | 'worker_cherry_pick_applied'
+    | 'worker_cherry_pick_conflict'
+    | 'worker_rebase_applied'
+    | 'worker_rebase_conflict'
+    | 'worker_auto_commit'
+    | 'worker_merge_applied'
+    | 'worker_merge_conflict'
+    | 'worker_integration_failed'
+    | 'worker_cross_rebase_applied'
+    | 'worker_cross_rebase_conflict'
+    | 'worker_cross_rebase_skipped',
   worker: WorkerInfo,
   metadata: Record<string, unknown>,
   cwd: string,
 ): Promise<void> {
-  await appendTeamEvent(teamName, {
+  await appendTeamEvent(
+    teamName,
+    {
     type,
     worker: worker.name,
     task_id: worker.assigned_tasks[0],
-    reason: typeof metadata.summary === 'string' ? metadata.summary : undefined,
+      reason:
+        typeof metadata.summary === 'string' ? metadata.summary : undefined,
     metadata,
-  }, cwd);
+    },
+    cwd,
+  );
 }
 
 async function sendIntegrationMessageToLeader(
@@ -696,10 +856,19 @@ async function sendIntegrationMessageToLeader(
   body: string,
   cwd: string,
 ): Promise<void> {
-  await sendWorkerMessage(teamName, worker.name, 'leader-fixed', body, cwd).catch(() => {});
+  await sendWorkerMessage(
+    teamName,
+    worker.name,
+    'leader-fixed',
+    body,
+    cwd,
+  ).catch(() => {});
 }
 
-function leaderHeadAdvanced(before: string, after: string | null): after is string {
+function leaderHeadAdvanced(
+  before: string,
+  after: string | null,
+): after is string {
   return typeof after === 'string' && after.length > 0 && after !== before;
 }
 
@@ -725,7 +894,11 @@ async function recordIntegrationFailure(
   state.conflict_commit = details.sourceCommit;
   state.conflict_files = undefined;
   state.updated_at = new Date().toISOString();
-  await appendIntegrationEvent(teamName, 'worker_integration_failed', worker, {
+  await appendIntegrationEvent(
+    teamName,
+    'worker_integration_failed',
+    worker,
+    {
     worker_name: worker.name,
     operation: details.operation,
     source_commit: details.sourceCommit,
@@ -733,14 +906,20 @@ async function recordIntegrationFailure(
     leader_head_after: leaderHeadAfter,
     worktree_path: details.worktreePath,
     summary: `${details.operation} for ${worker.name} reported success but leader HEAD did not advance`,
-  }, cwd);
-  appendIntegrationReport(teamName, {
+    },
+    cwd,
+  );
+  appendIntegrationReport(
+    teamName,
+    {
     workerName: worker.name,
     operation: details.operation,
     strategy: details.strategy,
     files: [],
     detail: `${details.operation} reported success for ${sourceShort}, but leader HEAD did not advance from ${leaderShort}; not marking worker as integrated.`,
-  }, cwd);
+    },
+    cwd,
+  );
   await sendIntegrationMessageToLeader(
     teamName,
     worker,
@@ -755,8 +934,12 @@ async function emitCanonicalWorkerEvent(
   context: Record<string, unknown>,
 ): Promise<void> {
   try {
-    const { buildNativeHookEvent } = await import('../hooks/extensibility/events.js');
-    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
+    const { buildNativeHookEvent } = await import(
+      '../hooks/extensibility/events.js'
+    );
+    const { dispatchHookEvent } = await import(
+      '../hooks/extensibility/dispatcher.js'
+    );
     const event = buildNativeHookEvent(eventName, {
       normalized_event: eventName,
       scope: 'team-runtime',
@@ -768,20 +951,30 @@ async function emitCanonicalWorkerEvent(
   }
 }
 
-function autoCommitDirtyWorktree(
-  worker: WorkerInfo,
-): { committed: boolean; commitHash: string | null } {
+function autoCommitDirtyWorktree(worker: WorkerInfo): {
+  committed: boolean;
+  commitHash: string | null;
+} {
   const worktreePath = resolve(worker.worktree_path!);
   const repoRoot = resolve(worker.worktree_repo_root!);
-  const status = runGitCommand(repoRoot, ['status', '--porcelain'], worktreePath);
-  if (!status.ok || !status.stdout.trim()) return { committed: false, commitHash: null };
+  const status = runGitCommand(
+    repoRoot,
+    ['status', '--porcelain'],
+    worktreePath,
+  );
+  if (!status.ok || !status.stdout.trim())
+    return { committed: false, commitHash: null };
 
   const taskId = worker.assigned_tasks[0] || 'unknown';
   const addResult = runGitCommand(repoRoot, ['add', '-A'], worktreePath);
   if (!addResult.ok) return { committed: false, commitHash: null };
 
   const msg = `omx(team): auto-checkpoint ${worker.name} [${taskId}]`;
-  const commitResult = runGitCommand(repoRoot, ['commit', '--no-verify', '-m', msg], worktreePath);
+  const commitResult = runGitCommand(
+    repoRoot,
+    ['commit', '--no-verify', '-m', msg],
+    worktreePath,
+  );
   if (!commitResult.ok) return { committed: false, commitHash: null };
 
   const head = runGitCommand(repoRoot, ['rev-parse', 'HEAD'], worktreePath);
@@ -800,24 +993,43 @@ function appendIntegrationReport(
   cwd: string,
 ): void {
   const teamStateRoot = resolveCanonicalTeamStateRoot(cwd);
-  const reportPath = join(teamStateRoot, 'team', teamName, 'integration-report.md');
+  const reportPath = join(
+    teamStateRoot,
+    'team',
+    teamName,
+    'integration-report.md',
+  );
   const dir = dirname(reportPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const timestamp = new Date().toISOString();
   const line = `- [${timestamp}] ${entry.workerName}: ${entry.operation} conflict auto-resolved (${entry.strategy}) on files: ${entry.files.join(', ') || 'unknown'}. ${entry.detail}\n`;
 
-  appendFileSync(reportPath, existsSync(reportPath) ? line : `# Integration Report\n\n${line}`);
+  appendFileSync(
+    reportPath,
+    existsSync(reportPath) ? line : `# Integration Report\n\n${line}`,
+  );
 }
 
-function resolveWorkerMergeRef(branchResult: CommandResult, workerHead: string): string {
+function resolveWorkerMergeRef(
+  branchResult: CommandResult,
+  workerHead: string,
+): string {
   const branchRef = branchResult.ok ? branchResult.stdout.trim() : '';
   if (!branchRef || branchRef === 'HEAD') return workerHead;
   return branchRef;
 }
 
-function leaderContainsCommit(repoRoot: string, cwd: string, commit: string): boolean {
-  return runGitCommand(repoRoot, ['merge-base', '--is-ancestor', commit, 'HEAD'], cwd).ok;
+function leaderContainsCommit(
+  repoRoot: string,
+  cwd: string,
+  commit: string,
+): boolean {
+  return runGitCommand(
+    repoRoot,
+    ['merge-base', '--is-ancestor', commit, 'HEAD'],
+    cwd,
+  ).ok;
 }
 
 async function integrateWorkerCommitsIntoLeader(params: {
@@ -827,23 +1039,39 @@ async function integrateWorkerCommitsIntoLeader(params: {
   cwd: string;
 }): Promise<Record<string, TeamWorkerIntegrationState>> {
   const { teamName, config, previous, cwd } = params;
-  const next: Record<string, TeamWorkerIntegrationState> = { ...(previous?.integrationByWorker ?? {}) };
-  const leaderHeadAtCycleStart = resolveLeaderHead(resolve(config.workers[0]?.worktree_repo_root ?? cwd), cwd);
+  const next: Record<string, TeamWorkerIntegrationState> = {
+    ...(previous?.integrationByWorker ?? {}),
+  };
+  const leaderHeadAtCycleStart = resolveLeaderHead(
+    resolve(config.workers[0]?.worktree_repo_root ?? cwd),
+    cwd,
+  );
   const integratedWorkerNames = new Set<string>();
   const commitHygieneEntries: TeamOperationalCommitEntry[] = [];
   const artifactCwd = resolveTeamCommitHygieneArtifactCwd(config, cwd);
 
   // ── Phase A: Auto-commit dirty worktrees ──
   for (const worker of config.workers) {
-    if (!worker.worktree_repo_root || !worker.worktree_path || !existsSync(worker.worktree_path)) continue;
+    if (
+      !worker.worktree_repo_root ||
+      !worker.worktree_path ||
+      !existsSync(worker.worktree_path)
+    )
+      continue;
     const { committed, commitHash } = autoCommitDirtyWorktree(worker);
     if (committed) {
-      await appendIntegrationEvent(teamName, 'worker_auto_commit', worker, {
+      await appendIntegrationEvent(
+        teamName,
+        'worker_auto_commit',
+        worker,
+        {
         worker_name: worker.name,
         commit_hash: commitHash,
         worktree_path: resolve(worker.worktree_path),
         summary: `auto-committed dirty worktree for ${worker.name}`,
-      }, cwd);
+        },
+        cwd,
+      );
       commitHygieneEntries.push({
         recorded_at: new Date().toISOString(),
         operation: 'auto_checkpoint',
@@ -852,27 +1080,40 @@ async function integrateWorkerCommitsIntoLeader(params: {
         status: 'applied',
         operational_commit: commitHash,
         worktree_path: resolve(worker.worktree_path),
-        detail: 'Dirty worker worktree checkpointed before runtime integration.',
+        detail:
+          'Dirty worker worktree checkpointed before runtime integration.',
       });
     }
   }
 
   // ── Phase B: Integrate worker commits to leader (hybrid strategy) ──
   for (const worker of config.workers) {
-    if (!worker.worktree_repo_root || !worker.worktree_path || !existsSync(worker.worktree_path)) continue;
+    if (
+      !worker.worktree_repo_root ||
+      !worker.worktree_path ||
+      !existsSync(worker.worktree_path)
+    )
+      continue;
     const repoRoot = resolve(worker.worktree_repo_root);
     const worktreePath = resolve(worker.worktree_path);
     const leaderHead = resolveLeaderHead(repoRoot, cwd);
     const workerHead = resolveWorkerHead(worktreePath);
     const previousState = next[worker.name] ?? {};
-    const state: TeamWorkerIntegrationState = { ...previousState, last_leader_head: leaderHead ?? previousState.last_leader_head };
+    const state: TeamWorkerIntegrationState = {
+      ...previousState,
+      last_leader_head: leaderHead ?? previousState.last_leader_head,
+    };
     if (!workerHead || !leaderHead) {
       next[worker.name] = state;
       continue;
     }
 
     state.last_seen_head = workerHead;
-    const alreadyMerged = runGitCommand(repoRoot, ['merge-base', '--is-ancestor', workerHead, 'HEAD'], cwd).ok;
+    const alreadyMerged = runGitCommand(
+      repoRoot,
+      ['merge-base', '--is-ancestor', workerHead, 'HEAD'],
+      cwd,
+    ).ok;
     if (alreadyMerged) {
       state.last_integrated_head = workerHead;
       state.status = 'idle';
@@ -882,26 +1123,56 @@ async function integrateWorkerCommitsIntoLeader(params: {
     }
 
     // Determine if worker is cleanly ahead of leader (merge) or diverged (cherry-pick)
-    const workerIsAheadOfLeader = runGitCommand(repoRoot, ['merge-base', '--is-ancestor', leaderHead, workerHead], cwd).ok;
+    const workerIsAheadOfLeader = runGitCommand(
+      repoRoot,
+      ['merge-base', '--is-ancestor', leaderHead, workerHead],
+      cwd,
+    ).ok;
 
     if (workerIsAheadOfLeader) {
       // Worker is cleanly ahead → merge --no-ff -X theirs
-      const workerBranch = runGitCommand(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], worktreePath);
+      const workerBranch = runGitCommand(
+        repoRoot,
+        ['rev-parse', '--abbrev-ref', 'HEAD'],
+        worktreePath,
+      );
       const branchRef = resolveWorkerMergeRef(workerBranch, workerHead);
-      const merge = runGitCommand(repoRoot, ['merge', '--no-ff', '-X', 'theirs', '-m', `omx(team): merge ${worker.name}`, branchRef], cwd);
+      const merge = runGitCommand(
+        repoRoot,
+        [
+          'merge',
+          '--no-ff',
+          '-X',
+          'theirs',
+          '-m',
+          `omx(team): merge ${worker.name}`,
+          branchRef,
+        ],
+        cwd,
+      );
 
       if (merge.ok) {
         const newLeaderHead = resolveLeaderHead(repoRoot, cwd) ?? leaderHead;
-        const workerIntegrated = leaderContainsCommit(repoRoot, cwd, workerHead);
+        const workerIntegrated = leaderContainsCommit(
+          repoRoot,
+          cwd,
+          workerHead,
+        );
         if (!leaderHeadAdvanced(leaderHead, newLeaderHead)) {
-          await recordIntegrationFailure(teamName, worker, state, {
+          await recordIntegrationFailure(
+            teamName,
+            worker,
+            state,
+            {
             operation: 'merge',
             sourceCommit: workerHead,
             leaderHeadBefore: leaderHead,
             leaderHeadAfter: newLeaderHead,
             worktreePath,
             strategy: '-X theirs',
-          }, cwd);
+            },
+            cwd,
+          );
         } else if (workerIntegrated) {
           state.last_integrated_head = workerHead;
           state.last_leader_head = newLeaderHead;
@@ -910,15 +1181,26 @@ async function integrateWorkerCommitsIntoLeader(params: {
           state.conflict_files = undefined;
           state.updated_at = new Date().toISOString();
           integratedWorkerNames.add(worker.name);
-          await appendIntegrationEvent(teamName, 'worker_merge_applied', worker, {
+          await appendIntegrationEvent(
+            teamName,
+            'worker_merge_applied',
+            worker,
+            {
             worker_name: worker.name,
             worker_head: workerHead,
             leader_head_before: leaderHead,
             leader_head_after: newLeaderHead,
             worktree_path: worktreePath,
             summary: `merged ${worker.name} into leader via --no-ff -X theirs`,
-          }, cwd);
-          await sendIntegrationMessageToLeader(teamName, worker, `INTEGRATED: merged ${worker.name} (${workerHead.slice(0, 12)}) into leader HEAD ${newLeaderHead.slice(0, 12)} via merge --no-ff.`, cwd);
+            },
+            cwd,
+          );
+          await sendIntegrationMessageToLeader(
+            teamName,
+            worker,
+            `INTEGRATED: merged ${worker.name} (${workerHead.slice(0, 12)}) into leader HEAD ${newLeaderHead.slice(0, 12)} via merge --no-ff.`,
+            cwd,
+          );
           commitHygieneEntries.push({
             recorded_at: new Date().toISOString(),
             operation: 'integration_merge',
@@ -930,20 +1212,30 @@ async function integrateWorkerCommitsIntoLeader(params: {
             leader_head_before: leaderHead,
             leader_head_after: newLeaderHead,
             worktree_path: worktreePath,
-            detail: 'Leader created a runtime merge commit to integrate worker history.',
+            detail:
+              'Leader created a runtime merge commit to integrate worker history.',
           });
         } else {
           state.last_leader_head = newLeaderHead;
           state.status = 'idle';
           state.updated_at = new Date().toISOString();
-          appendIntegrationReport(teamName, {
+          appendIntegrationReport(
+            teamName,
+            {
             workerName: worker.name,
             operation: 'merge',
             strategy: '-X theirs',
             files: [],
             detail: `merge reported success but leader HEAD did not advance cleanly (leader_before=${leaderHead.slice(0, 12)}, leader_after=${newLeaderHead.slice(0, 12)}, worker_integrated=${workerIntegrated}, merge_ref=${branchRef}).`,
-          }, cwd);
-          await sendIntegrationMessageToLeader(teamName, worker, `INTEGRATION NO-OP: merge for ${worker.name} using ${branchRef.slice(0, 12)} reported success but leader HEAD stayed ${newLeaderHead.slice(0, 12)}. Inspect ${worktreePath}.`, cwd);
+            },
+            cwd,
+          );
+          await sendIntegrationMessageToLeader(
+            teamName,
+            worker,
+            `INTEGRATION NO-OP: merge for ${worker.name} using ${branchRef.slice(0, 12)} reported success but leader HEAD stayed ${newLeaderHead.slice(0, 12)}. Inspect ${worktreePath}.`,
+            cwd,
+          );
           commitHygieneEntries.push({
             recorded_at: new Date().toISOString(),
             operation: 'integration_merge',
@@ -955,7 +1247,8 @@ async function integrateWorkerCommitsIntoLeader(params: {
             leader_head_before: leaderHead,
             leader_head_after: newLeaderHead,
             worktree_path: worktreePath,
-            detail: 'Merge command reported success but leader HEAD did not advance or contain the worker commit; runtime refused to report false integration.',
+            detail:
+              'Merge command reported success but leader HEAD did not advance or contain the worker commit; runtime refused to report false integration.',
           });
         }
       } else {
@@ -966,7 +1259,11 @@ async function integrateWorkerCommitsIntoLeader(params: {
         state.conflict_commit = workerHead;
         state.conflict_files = conflictFiles;
         state.updated_at = new Date().toISOString();
-        await appendIntegrationEvent(teamName, 'worker_merge_conflict', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_merge_conflict',
+          worker,
+          {
           worker_name: worker.name,
           worker_head: workerHead,
           leader_head: leaderHead,
@@ -974,22 +1271,44 @@ async function integrateWorkerCommitsIntoLeader(params: {
           conflict_files: conflictFiles,
           stderr: merge.stderr || merge.stdout,
           summary: `merge conflict for ${worker.name} (auto-resolve failed)`,
-        }, cwd);
-        appendIntegrationReport(teamName, {
+          },
+          cwd,
+        );
+        appendIntegrationReport(
+          teamName,
+          {
           workerName: worker.name,
           operation: 'merge',
           strategy: '-X theirs',
           files: conflictFiles,
           detail: `merge --no-ff -X theirs failed; aborted. stderr: ${(merge.stderr || '').slice(0, 200)}`,
-        }, cwd);
-        await sendIntegrationMessageToLeader(teamName, worker, `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s merge resolved with -X theirs failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`, cwd);
+          },
+          cwd,
+        );
+        await sendIntegrationMessageToLeader(
+          teamName,
+          worker,
+          `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s merge resolved with -X theirs failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`,
+          cwd,
+        );
       }
     } else {
       // Diverged → cherry-pick individual commits with -X theirs
-      const baseline = state.last_integrated_head && runGitCommand(repoRoot, ['rev-parse', '--verify', state.last_integrated_head], worktreePath).ok
+      const baseline =
+        state.last_integrated_head &&
+        runGitCommand(
+          repoRoot,
+          ['rev-parse', '--verify', state.last_integrated_head],
+          worktreePath,
+        ).ok
         ? state.last_integrated_head
         : leaderHead;
-      const commits = listCommitRange(repoRoot, baseline, workerHead, worktreePath);
+      const commits = listCommitRange(
+        repoRoot,
+        baseline,
+        workerHead,
+        worktreePath,
+      );
       if (commits.length === 0) {
         next[worker.name] = state;
         continue;
@@ -997,16 +1316,26 @@ async function integrateWorkerCommitsIntoLeader(params: {
 
       let allPicked = true;
       for (const commit of commits) {
-        await appendIntegrationEvent(teamName, 'worker_cherry_pick_detected', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cherry_pick_detected',
+          worker,
+          {
           worker_name: worker.name,
           worker_head: workerHead,
           commit,
           leader_head: resolveLeaderHead(repoRoot, cwd),
           worktree_path: worktreePath,
           summary: `detected worker commit ${commit.slice(0, 12)}`,
-        }, cwd);
+          },
+          cwd,
+        );
 
-        const pick = runGitCommand(repoRoot, ['cherry-pick', '--allow-empty', '-X', 'theirs', commit], cwd);
+        const pick = runGitCommand(
+          repoRoot,
+          ['cherry-pick', '--allow-empty', '-X', 'theirs', commit],
+          cwd,
+        );
         if (!pick.ok) {
           // Even -X theirs failed (binary conflict etc.) — abort this commit, log, continue
           const conflictFiles = listConflictFiles(repoRoot, cwd);
@@ -1015,7 +1344,11 @@ async function integrateWorkerCommitsIntoLeader(params: {
           state.conflict_commit = commit;
           state.conflict_files = conflictFiles;
           state.updated_at = new Date().toISOString();
-          await appendIntegrationEvent(teamName, 'worker_cherry_pick_conflict', worker, {
+          await appendIntegrationEvent(
+            teamName,
+            'worker_cherry_pick_conflict',
+            worker,
+            {
             worker_name: worker.name,
             commit,
             leader_head: leaderHead,
@@ -1023,29 +1356,46 @@ async function integrateWorkerCommitsIntoLeader(params: {
             conflict_files: conflictFiles,
             stderr: pick.stderr || pick.stdout,
             summary: `cherry-pick conflict for ${worker.name} at ${commit.slice(0, 12)} (auto-resolve failed)`,
-          }, cwd);
-          appendIntegrationReport(teamName, {
+            },
+            cwd,
+          );
+          appendIntegrationReport(
+            teamName,
+            {
             workerName: worker.name,
             operation: 'cherry-pick',
             strategy: '-X theirs',
             files: conflictFiles,
             detail: `cherry-pick -X theirs ${commit.slice(0, 12)} failed; aborted. stderr: ${(pick.stderr || '').slice(0, 200)}`,
-          }, cwd);
-          await sendIntegrationMessageToLeader(teamName, worker, `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s cherry-pick ${commit.slice(0, 12)} with -X theirs failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`, cwd);
+            },
+            cwd,
+          );
+          await sendIntegrationMessageToLeader(
+            teamName,
+            worker,
+            `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s cherry-pick ${commit.slice(0, 12)} with -X theirs failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`,
+            cwd,
+          );
           allPicked = false;
           break;
         }
 
         const newLeaderHead = resolveLeaderHead(repoRoot, cwd) ?? leaderHead;
         if (!leaderHeadAdvanced(leaderHead, newLeaderHead)) {
-          await recordIntegrationFailure(teamName, worker, state, {
+          await recordIntegrationFailure(
+            teamName,
+            worker,
+            state,
+            {
             operation: 'cherry-pick',
             sourceCommit: commit,
             leaderHeadBefore: leaderHead,
             leaderHeadAfter: newLeaderHead,
             worktreePath,
             strategy: '-X theirs',
-          }, cwd);
+            },
+            cwd,
+          );
           allPicked = false;
           break;
         }
@@ -1056,15 +1406,26 @@ async function integrateWorkerCommitsIntoLeader(params: {
         state.conflict_commit = undefined;
         state.conflict_files = undefined;
         state.updated_at = new Date().toISOString();
-        await appendIntegrationEvent(teamName, 'worker_cherry_pick_applied', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cherry_pick_applied',
+          worker,
+          {
           worker_name: worker.name,
           commit,
           leader_head_before: leaderHead,
           leader_head_after: newLeaderHead,
           worktree_path: worktreePath,
           summary: `cherry-picked ${commit.slice(0, 12)} from ${worker.name} with -X theirs`,
-        }, cwd);
-        await sendIntegrationMessageToLeader(teamName, worker, `INTEGRATED: cherry-picked ${commit.slice(0, 12)} from ${worker.name} into leader HEAD ${newLeaderHead.slice(0, 12)} (-X theirs).`, cwd);
+          },
+          cwd,
+        );
+        await sendIntegrationMessageToLeader(
+          teamName,
+          worker,
+          `INTEGRATED: cherry-picked ${commit.slice(0, 12)} from ${worker.name} into leader HEAD ${newLeaderHead.slice(0, 12)} (-X theirs).`,
+          cwd,
+        );
         commitHygieneEntries.push({
           recorded_at: new Date().toISOString(),
           operation: 'integration_cherry_pick',
@@ -1076,7 +1437,8 @@ async function integrateWorkerCommitsIntoLeader(params: {
           leader_head_before: leaderHead,
           leader_head_after: newLeaderHead,
           worktree_path: worktreePath,
-          detail: 'Leader created a runtime cherry-pick commit while integrating diverged worker history.',
+          detail:
+            'Leader created a runtime cherry-pick commit while integrating diverged worker history.',
         });
       }
 
@@ -1089,10 +1451,22 @@ async function integrateWorkerCommitsIntoLeader(params: {
   }
 
   // ── Phase C: Cross-worker rebase (idle/done/failed workers onto new leader) ──
-  const newLeaderHead = resolveLeaderHead(resolve(config.workers[0]?.worktree_repo_root ?? cwd), cwd);
-  if (newLeaderHead && leaderHeadAtCycleStart && newLeaderHead !== leaderHeadAtCycleStart) {
+  const newLeaderHead = resolveLeaderHead(
+    resolve(config.workers[0]?.worktree_repo_root ?? cwd),
+    cwd,
+  );
+  if (
+    newLeaderHead &&
+    leaderHeadAtCycleStart &&
+    newLeaderHead !== leaderHeadAtCycleStart
+  ) {
     for (const worker of config.workers) {
-      if (!worker.worktree_repo_root || !worker.worktree_path || !existsSync(worker.worktree_path)) continue;
+      if (
+        !worker.worktree_repo_root ||
+        !worker.worktree_path ||
+        !existsSync(worker.worktree_path)
+      )
+        continue;
       // Note: do NOT skip integratedWorkerNames here — cherry-picked workers need
       // rebase to pick up other workers' changes that landed on leader in the same cycle.
 
@@ -1103,32 +1477,52 @@ async function integrateWorkerCommitsIntoLeader(params: {
       const workerStatus = await readWorkerStatus(teamName, worker.name, cwd);
       const rebaseEligibleStates = new Set(['idle', 'done', 'failed']);
       if (!rebaseEligibleStates.has(workerStatus.state)) {
-        await appendIntegrationEvent(teamName, 'worker_cross_rebase_skipped', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cross_rebase_skipped',
+          worker,
+          {
           worker_name: worker.name,
           worker_state: workerStatus.state,
           leader_head: newLeaderHead,
           worktree_path: worktreePath,
           summary: `skipped cross-rebase for ${worker.name} (state: ${workerStatus.state})`,
-        }, cwd);
+          },
+          cwd,
+        );
         continue;
       }
 
       // Skip if worktree is dirty (will auto-commit next cycle, then rebase)
-      const statusCheck = runGitCommand(repoRoot, ['status', '--porcelain'], worktreePath);
+      const statusCheck = runGitCommand(
+        repoRoot,
+        ['status', '--porcelain'],
+        worktreePath,
+      );
       if (statusCheck.ok && statusCheck.stdout.trim()) {
-        await appendIntegrationEvent(teamName, 'worker_cross_rebase_skipped', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cross_rebase_skipped',
+          worker,
+          {
           worker_name: worker.name,
           reason: 'dirty_worktree',
           leader_head: newLeaderHead,
           worktree_path: worktreePath,
           summary: `skipped cross-rebase for ${worker.name} (dirty worktree)`,
-        }, cwd);
+          },
+          cwd,
+        );
         continue;
       }
 
       // Rebase with -X ours (in rebase context, "ours" = upstream = leader wins)
       const workerHeadBeforeRebase = resolveWorkerHead(worktreePath);
-      const rebase = runGitCommand(repoRoot, ['rebase', '-X', 'ours', newLeaderHead], worktreePath);
+      const rebase = runGitCommand(
+        repoRoot,
+        ['rebase', '-X', 'ours', newLeaderHead],
+        worktreePath,
+      );
       if (rebase.ok) {
         const workerHeadAfterRebase = resolveWorkerHead(worktreePath);
         const state = next[worker.name] ?? {};
@@ -1138,12 +1532,18 @@ async function integrateWorkerCommitsIntoLeader(params: {
         state.conflict_files = undefined;
         state.updated_at = new Date().toISOString();
         next[worker.name] = state;
-        await appendIntegrationEvent(teamName, 'worker_cross_rebase_applied', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cross_rebase_applied',
+          worker,
+          {
           worker_name: worker.name,
           leader_head: newLeaderHead,
           worktree_path: worktreePath,
           summary: `cross-rebased ${worker.name} onto ${newLeaderHead.slice(0, 12)} (-X ours)`,
-        }, cwd);
+          },
+          cwd,
+        );
         commitHygieneEntries.push({
           recorded_at: new Date().toISOString(),
           operation: 'cross_rebase',
@@ -1155,34 +1555,54 @@ async function integrateWorkerCommitsIntoLeader(params: {
           worker_head_before: workerHeadBeforeRebase,
           worker_head_after: workerHeadAfterRebase,
           worktree_path: worktreePath,
-          detail: 'Runtime rebase rewrote worker history onto the updated leader head.',
+          detail:
+            'Runtime rebase rewrote worker history onto the updated leader head.',
         });
       } else {
         // Rebase failed — abort to restore worktree, log for retry next cycle
         const conflictFiles = listConflictFiles(repoRoot, worktreePath);
         runGitCommand(repoRoot, ['rebase', '--abort'], worktreePath);
-        await appendIntegrationEvent(teamName, 'worker_cross_rebase_conflict', worker, {
+        await appendIntegrationEvent(
+          teamName,
+          'worker_cross_rebase_conflict',
+          worker,
+          {
           worker_name: worker.name,
           leader_head: newLeaderHead,
           worktree_path: worktreePath,
           conflict_files: conflictFiles,
           stderr: rebase.stderr || rebase.stdout,
           summary: `cross-rebase conflict for ${worker.name} onto ${newLeaderHead.slice(0, 12)} (aborted, will retry)`,
-        }, cwd);
-        appendIntegrationReport(teamName, {
+          },
+          cwd,
+        );
+        appendIntegrationReport(
+          teamName,
+          {
           workerName: worker.name,
           operation: 'rebase',
           strategy: '-X ours',
           files: conflictFiles,
           detail: `rebase -X ours onto ${newLeaderHead.slice(0, 12)} failed; aborted. Will retry next cycle.`,
-        }, cwd);
-        await sendIntegrationMessageToLeader(teamName, worker, `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s rebase onto ${newLeaderHead.slice(0, 12)} with -X ours failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`, cwd);
+          },
+          cwd,
+        );
+        await sendIntegrationMessageToLeader(
+          teamName,
+          worker,
+          `CONFLICT AUTO-RESOLVED FAILED: ${worker.name}'s rebase onto ${newLeaderHead.slice(0, 12)} with -X ours failed on files: ${conflictFiles.join(', ') || 'unknown'}. Consider steering ${worker.name} to review these areas.`,
+          cwd,
+        );
       }
     }
   }
 
   if (commitHygieneEntries.length > 0) {
-    await appendTeamCommitHygieneEntries(teamName, commitHygieneEntries, artifactCwd)
+    await appendTeamCommitHygieneEntries(
+      teamName,
+      commitHygieneEntries,
+      artifactCwd,
+    );
   }
 
   return next;
@@ -1202,7 +1622,8 @@ function renderWorktreeMergeReport(report: WorkerShutdownMergeReport): string {
     `- leader_head_after: ${report.leaderHeadAfter ?? 'none'}`,
     '',
     '## Summary',
-    report.summaryText ?? 'sparkshell summary unavailable; using raw diff fallback.',
+    report.summaryText ??
+      'sparkshell summary unavailable; using raw diff fallback.',
     '',
     '## Diff',
     report.diffText || '(no diff output)',
@@ -1215,13 +1636,21 @@ async function prepareShutdownMergeReport(
   worker: WorkerInfo,
   leaderCwd: string,
 ): Promise<WorkerShutdownMergeReport | null> {
-  if (!worker.worktree_repo_root || !worker.worktree_path || !existsSync(worker.worktree_path)) {
+  if (
+    !worker.worktree_repo_root ||
+    !worker.worktree_path ||
+    !existsSync(worker.worktree_path)
+  ) {
     return null;
   }
 
   const worktreePath = resolve(worker.worktree_path);
   const repoRoot = resolve(worker.worktree_repo_root);
-  const statusBefore = runGitCommand(repoRoot, ['status', '--porcelain'], worktreePath);
+  const statusBefore = runGitCommand(
+    repoRoot,
+    ['status', '--porcelain'],
+    worktreePath,
+  );
   const hadChanges = statusBefore.ok && statusBefore.stdout.length > 0;
 
   let syntheticCommit: string | null = null;
@@ -1244,11 +1673,20 @@ async function prepareShutdownMergeReport(
     }
     const commitResult = runGitCommand(
       repoRoot,
-      ['commit', '--no-verify', '-m', `omx(team): checkpoint ${worker.name} shutdown changes`],
+      [
+        'commit',
+        '--no-verify',
+        '-m',
+        `omx(team): checkpoint ${worker.name} shutdown changes`,
+      ],
       worktreePath,
     );
     if (commitResult.ok) {
-      const revParse = runGitCommand(repoRoot, ['rev-parse', 'HEAD'], worktreePath);
+      const revParse = runGitCommand(
+        repoRoot,
+        ['rev-parse', 'HEAD'],
+        worktreePath,
+      );
       syntheticCommit = revParse.ok && revParse.stdout ? revParse.stdout : null;
     } else if (!/nothing to commit/i.test(commitResult.stderr)) {
       return {
@@ -1267,8 +1705,15 @@ async function prepareShutdownMergeReport(
     }
   }
 
-  const sourceRefResult = runGitCommand(repoRoot, ['rev-parse', 'HEAD'], worktreePath);
-  const sourceRef = sourceRefResult.ok && sourceRefResult.stdout ? sourceRefResult.stdout : null;
+  const sourceRefResult = runGitCommand(
+    repoRoot,
+    ['rev-parse', 'HEAD'],
+    worktreePath,
+  );
+  const sourceRef =
+    sourceRefResult.ok && sourceRefResult.stdout
+      ? sourceRefResult.stdout
+      : null;
   const diffText = getWorktreeDiffText(worktreePath);
   const summaryText = summarizeWorktreeDiffWithSparkShell(worktreePath);
   const reportPath = join(worktreePath, '.omx', 'diff.md');
@@ -1278,21 +1723,32 @@ async function prepareShutdownMergeReport(
   let mergeDetail = 'worktree merge skipped';
   let leaderHeadAfter = leaderHeadBefore;
   if (sourceRef) {
-    const alreadyMerged = runGitCommand(repoRoot, ['merge-base', '--is-ancestor', sourceRef, 'HEAD'], leaderCwd);
+    const alreadyMerged = runGitCommand(
+      repoRoot,
+      ['merge-base', '--is-ancestor', sourceRef, 'HEAD'],
+      leaderCwd,
+    );
     if (alreadyMerged.ok) {
       mergeOutcome = 'noop';
       mergeDetail = 'source already reachable from leader HEAD';
     } else {
-      const mergeResult = runGitCommand(repoRoot, ['merge', '--no-ff', '--no-edit', sourceRef], leaderCwd);
+      const mergeResult = runGitCommand(
+        repoRoot,
+        ['merge', '--no-ff', '--no-edit', sourceRef],
+        leaderCwd,
+      );
       if (mergeResult.ok) {
         mergeOutcome = 'merged';
         mergeDetail = mergeResult.stdout || 'merged successfully';
-        leaderHeadAfter = resolveLeaderHead(repoRoot, leaderCwd) ?? leaderHeadBefore;
+        leaderHeadAfter =
+          resolveLeaderHead(repoRoot, leaderCwd) ?? leaderHeadBefore;
       } else {
         mergeOutcome = 'conflict';
-        mergeDetail = mergeResult.stderr || mergeResult.stdout || 'merge failed';
+        mergeDetail =
+          mergeResult.stderr || mergeResult.stdout || 'merge failed';
         runGitCommand(repoRoot, ['merge', '--abort'], leaderCwd);
-        leaderHeadAfter = resolveLeaderHead(repoRoot, leaderCwd) ?? leaderHeadBefore;
+        leaderHeadAfter =
+          resolveLeaderHead(repoRoot, leaderCwd) ?? leaderHeadBefore;
       }
     }
   }
@@ -1317,8 +1773,11 @@ async function prepareShutdownMergeReport(
   return report;
 }
 
-async function prepareWorkerWorktreeShutdownReports(config: TeamConfig, leaderCwd: string): Promise<WorkerShutdownMergeReport[]> {
-  const reports: WorkerShutdownMergeReport[] = []
+async function prepareWorkerWorktreeShutdownReports(
+  config: TeamConfig,
+  leaderCwd: string,
+): Promise<WorkerShutdownMergeReport[]> {
+  const reports: WorkerShutdownMergeReport[] = [];
   for (const worker of config.workers) {
     if (!worker.worktree_path || !worker.worktree_repo_root) continue;
     try {
@@ -1336,12 +1795,14 @@ async function prepareWorkerWorktreeShutdownReports(config: TeamConfig, leaderCw
         `- merge_detail: ${String(error)}`,
         '',
       ].join('\n');
-      await mkdir(join(worktreePath, '.omx'), { recursive: true }).catch(() => {});
+      await mkdir(join(worktreePath, '.omx'), { recursive: true }).catch(
+        () => {},
+      );
       await writeFile(reportPath, fallback, 'utf-8').catch(() => {});
       process.stdout.write(`${fallback}\n`);
     }
   }
-  return reports
+  return reports;
 }
 
 export interface StaleTeamSummary {
@@ -1381,10 +1842,19 @@ interface ShutdownClassification {
 function listDirtyShutdownWorkers(config: TeamConfig): string[] {
   const dirtyWorkers: string[] = [];
   for (const worker of config.workers) {
-    if (!worker.worktree_repo_root || !worker.worktree_path || !existsSync(worker.worktree_path)) continue;
+    if (
+      !worker.worktree_repo_root ||
+      !worker.worktree_path ||
+      !existsSync(worker.worktree_path)
+    )
+      continue;
     const worktreePath = resolve(worker.worktree_path);
     const repoRoot = resolve(worker.worktree_repo_root);
-    const status = runGitCommand(repoRoot, ['status', '--porcelain'], worktreePath);
+    const status = runGitCommand(
+      repoRoot,
+      ['status', '--porcelain'],
+      worktreePath,
+    );
     if (!status.ok || status.stdout.trim().length > 0) {
       dirtyWorkers.push(worker.name);
     }
@@ -1412,16 +1882,22 @@ async function classifyShutdown(params: {
   };
 
   const dirtyWorkers = listDirtyShutdownWorkers(config);
-  const hasBlockingBacklog = gate.pending > 0 || gate.blocked > 0 || gate.in_progress > 0;
-  const requiresIssueConfirmation = gate.failed > 0 && dirtyWorkers.length === 0 && !confirmIssues;
-  gate.allowed = governance.cleanup_requires_all_workers_inactive !== true
-    || (!hasBlockingBacklog && !requiresIssueConfirmation);
+  const hasBlockingBacklog =
+    gate.pending > 0 || gate.blocked > 0 || gate.in_progress > 0;
+  const requiresIssueConfirmation =
+    gate.failed > 0 && dirtyWorkers.length === 0 && !confirmIssues;
+  gate.allowed =
+    governance.cleanup_requires_all_workers_inactive !== true ||
+    (!hasBlockingBacklog && !requiresIssueConfirmation);
 
   return {
     gate,
     dirtyWorkers,
     requiresIssueConfirmation,
-    useCleanFastPath: dirtyWorkers.length === 0 && !hasBlockingBacklog && (gate.failed === 0 || confirmIssues),
+    useCleanFastPath:
+      dirtyWorkers.length === 0 &&
+      !hasBlockingBacklog &&
+      (gate.failed === 0 || confirmIssues),
   };
 }
 
@@ -1453,13 +1929,19 @@ function resolveEffectiveTeamWorktreeMode(
   return { enabled: false };
 }
 
-function isExplicitUltragoalLinkedTeam(task: string, approvedExecution: unknown, selectedApprovedExecutionHint: unknown): boolean {
+function isExplicitUltragoalLinkedTeam(
+  task: string,
+  approvedExecution: unknown,
+  selectedApprovedExecutionHint: unknown,
+): boolean {
   const approvedHaystack = [
     JSON.stringify(approvedExecution ?? {}),
     JSON.stringify(selectedApprovedExecutionHint ?? {}),
   ].join('\n');
   if (/(?:ultragoal|\.omx\/ultragoal)/i.test(approvedHaystack)) return true;
-  return /(?:\.omx\/ultragoal|ultragoal\s+(?:goal|plan|checkpoint)|goal\s+G\d{3}|\bG\d{3}[-\w]*\b)/i.test(task);
+  return /(?:\.omx\/ultragoal|ultragoal\s+(?:goal|plan|checkpoint)|goal\s+G\d{3}|\bG\d{3}[-\w]*\b)/i.test(
+    task,
+  );
 }
 
 async function writeTeamPreflightContextPacket(params: {
@@ -1481,7 +1963,12 @@ async function writeTeamPreflightContextPacket(params: {
     warning?: { message?: string } | null;
   };
 }): Promise<string> {
-  const packetPath = join(params.teamStateRoot, 'team', params.teamName, 'preflight-context.json');
+  const packetPath = join(
+    params.teamStateRoot,
+    'team',
+    params.teamName,
+    'preflight-context.json',
+  );
   const packet = {
     schema_version: 1,
     created_at: new Date().toISOString(),
@@ -1505,7 +1992,8 @@ async function writeTeamPreflightContextPacket(params: {
     ultragoal: {
       status: params.ultragoalOutcome.status,
       active_goal_id: params.ultragoalOutcome.context?.activeGoalId ?? null,
-      active_goal_title: params.ultragoalOutcome.context?.activeGoalTitle ?? null,
+      active_goal_title:
+        params.ultragoalOutcome.context?.activeGoalTitle ?? null,
       warning: params.ultragoalOutcome.warning?.message ?? null,
     },
     verification_checklist: [
@@ -1561,12 +2049,20 @@ interface StartupTimingEvent {
 }
 
 interface StartupTimingRecorder {
-  mark: (phase: StartupTimingPhase, details?: Omit<StartupTimingEvent, 'phase' | 'at' | 'elapsed_ms'>) => void;
+  mark: (
+    phase: StartupTimingPhase,
+    details?: Omit<StartupTimingEvent, 'phase' | 'at' | 'elapsed_ms'>,
+  ) => void;
   flush: () => Promise<void>;
 }
 
 export function teamStartupTimingPath(teamName: string, cwd: string): string {
-  return join(resolveCanonicalTeamStateRoot(cwd), 'team', teamName, 'startup-timing.json');
+  return join(
+    resolveCanonicalTeamStateRoot(cwd),
+    'team',
+    teamName,
+    'startup-timing.json',
+  );
 }
 
 export function teamRuntimeTeamsRoot(cwd: string): string {
@@ -1581,7 +2077,58 @@ export function teamRuntimeSessionPath(cwd: string): string {
   return join(resolveCanonicalTeamStateRoot(cwd), 'session.json');
 }
 
-function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimingRecorder {
+function buildTeamWorkerAuthorityTransport(
+  authority: ResolvedStateAuthorityContext,
+): Record<string, string> {
+  return {
+    OMX_STARTUP_CWD: authority.workspace_identity.canonical_path,
+    OMX_STATE_AUTHORITY_PATH: authority.authority_path,
+    OMX_STATE_AUTHORITY_ID: authority.generation.authority_id,
+    OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
+    OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: authority.workspace_identity.digest,
+    OMX_STATE_AUTHORITY_CAPABILITY:
+      stateAuthorityTransportCapabilityForChild(authority),
+  };
+}
+
+async function resolveTeamWorkerAuthorityTransport(
+  leaderCwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<Record<string, string>> {
+  const inherited = await resolveAuthenticatedTransportAuthority(
+    leaderCwd,
+    env,
+  );
+  if (inherited) return buildTeamWorkerAuthorityTransport(inherited);
+
+  const resolution = await resolveStateAuthority({
+    startup_cwd: leaderCwd,
+    observed_cwd: leaderCwd,
+    session_id: env.OMX_SESSION_ID?.trim() || undefined,
+  });
+  if (resolution.context && resolution.can_mutate) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      'a committed leader authority requires complete authenticated transport before team workers can launch',
+    );
+  }
+  const blockingDiagnostic = resolution.diagnostics.find(
+    (diagnostic) =>
+      diagnostic.code !== AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+  );
+  if (blockingDiagnostic) {
+    throw new StateAuthorityError(
+      blockingDiagnostic.code,
+      blockingDiagnostic.message,
+    );
+  }
+  return {};
+}
+
+function createStartupTimingRecorder(
+  teamName: string,
+  cwd: string,
+): StartupTimingRecorder {
   const startedAt = performance.now();
   const events: StartupTimingEvent[] = [];
   return {
@@ -1597,7 +2144,15 @@ function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimi
       const timingPath = teamStartupTimingPath(teamName, cwd);
       await writeAtomic(
         timingPath,
-        JSON.stringify({ schema_version: STARTUP_TIMING_LOG_VERSION, team_name: teamName, events }, null, 2),
+        JSON.stringify(
+          {
+            schema_version: STARTUP_TIMING_LOG_VERSION,
+            team_name: teamName,
+            events,
+          },
+          null,
+          2,
+        ),
       ).catch(() => {});
       for (const event of events) {
         await appendTeamDeliveryLogForCwd(cwd, {
@@ -1618,7 +2173,6 @@ function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimi
   };
 }
 
-
 interface PromptWorkerHandle {
   child: ChildProcessByStdio<Writable, null, null>;
   pid: number;
@@ -1626,7 +2180,10 @@ interface PromptWorkerHandle {
 }
 
 const promptWorkerRegistry = new Map<string, Map<string, PromptWorkerHandle>>();
-const previousModelInstructionsFileByTeam = new Map<string, string | undefined>();
+const previousModelInstructionsFileByTeam = new Map<
+  string,
+  string | undefined
+>();
 const PROMPT_WORKER_SIGTERM_WAIT_MS = 3_000;
 const PROMPT_WORKER_SIGKILL_WAIT_MS = 2_000;
 const PROMPT_WORKER_EXIT_POLL_MS = 100;
@@ -1636,7 +2193,9 @@ const PROMPT_MODE_CODEX_UNSUPPORTED_REASON = 'prompt_mode_codex_requires_tty';
 // Test-only escape hatch for fake prompt workers that intentionally do not require a real TTY.
 const PROMPT_MODE_CODEX_TEST_ALLOW_ENV = 'OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT';
 
-function resolveInstructionStateRoot(worktreePath?: string | null): string | undefined {
+function resolveInstructionStateRoot(
+  worktreePath?: string | null,
+): string | undefined {
   return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
 }
 
@@ -1645,8 +2204,8 @@ function assertPromptModeWorkerCliSupported(
   env: NodeJS.ProcessEnv = process.env,
 ): void {
   if (
-    workerCliPlan.some((workerCli) => workerCli === 'codex')
-    && env[PROMPT_MODE_CODEX_TEST_ALLOW_ENV] !== '1'
+    workerCliPlan.some((workerCli) => workerCli === 'codex') &&
+    env[PROMPT_MODE_CODEX_TEST_ALLOW_ENV] !== '1'
   ) {
     throw new Error(
       `${PROMPT_MODE_CODEX_UNSUPPORTED_REASON}: Codex prompt workers require a terminal; use interactive team mode or set OMX_TEAM_WORKER_CLI=claude/gemini for prompt-mode teammates.`,
@@ -1665,7 +2224,10 @@ function resolveWorkerStartupEvidenceTimeoutMs(
   env: NodeJS.ProcessEnv,
   workerReadyTimeoutMs: number,
 ): number {
-  const raw = Number.parseInt(String(env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS ?? ''), 10);
+  const raw = Number.parseInt(
+    String(env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS ?? ''),
+    10,
+  );
   if (Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
   return Math.max(
     STARTUP_EVIDENCE_TIMEOUT_MS,
@@ -1674,18 +2236,29 @@ function resolveWorkerStartupEvidenceTimeoutMs(
 }
 
 function resolveStartupDispatchRetries(env: NodeJS.ProcessEnv): number {
-  const parsed = Number.parseInt(String(env.OMX_TEAM_STARTUP_DISPATCH_RETRIES ?? ''), 10);
+  const parsed = Number.parseInt(
+    String(env.OMX_TEAM_STARTUP_DISPATCH_RETRIES ?? ''),
+    10,
+  );
   if (!Number.isFinite(parsed)) return STARTUP_DISPATCH_RETRIES;
   return Math.max(1, Math.min(STARTUP_DISPATCH_RETRIES, Math.floor(parsed)));
 }
 
 function resolveStartupDispatchRetryDelayS(env: NodeJS.ProcessEnv): number {
-  const parsed = Number.parseInt(String(env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS ?? ''), 10);
+  const parsed = Number.parseInt(
+    String(env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS ?? ''),
+    10,
+  );
   if (!Number.isFinite(parsed)) return STARTUP_DISPATCH_RETRY_DELAY_S;
-  return Math.max(0, Math.min(STARTUP_DISPATCH_RETRY_DELAY_S, Math.floor(parsed) / 1000));
+  return Math.max(
+    0,
+    Math.min(STARTUP_DISPATCH_RETRY_DELAY_S, Math.floor(parsed) / 1000),
+  );
 }
 
-function parseTeamWorkerContext(raw: string | undefined): { teamName: string; workerName: string } | null {
+function parseTeamWorkerContext(
+  raw: string | undefined,
+): { teamName: string; workerName: string } | null {
   if (typeof raw !== 'string' || raw.trim() === '') return null;
   const [teamName, workerName] = raw.trim().split('/');
   if (!teamName || !workerName) return null;
@@ -1715,11 +2288,16 @@ function resolveGovernancePolicy(
 }
 
 async function assertNestedTeamAllowed(cwd: string): Promise<void> {
-  const workerContext = parseTeamWorkerContext(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER);
+  const workerContext = parseTeamWorkerContext(
+    process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER,
+  );
   if (!workerContext) return;
 
   for (const candidateCwd of resolveManifestLookupCwds(cwd)) {
-    const manifest = await readTeamManifestV2(workerContext.teamName, candidateCwd);
+    const manifest = await readTeamManifestV2(
+      workerContext.teamName,
+      candidateCwd,
+    );
     const governance = resolveGovernancePolicy(manifest?.governance);
     if (governance.nested_teams_allowed) return;
     if (manifest) break;
@@ -1728,13 +2306,20 @@ async function assertNestedTeamAllowed(cwd: string): Promise<void> {
   throw new Error('nested_team_disallowed');
 }
 
-type WorkerStartupEvidence = 'task_claim' | 'worker_progress' | 'leader_ack' | 'ready_prompt' | 'none';
+type WorkerStartupEvidence =
+  | 'task_claim'
+  | 'worker_progress'
+  | 'leader_ack'
+  | 'ready_prompt'
+  | 'none';
 
 function resolveStartupEvidenceStateRoots(cwd: string): string[] {
-  return [...new Set([
+  return [
+    ...new Set([
     resolve(cwd, '.omx', 'state'),
     resolveCanonicalTeamStateRoot(cwd),
-  ])];
+    ]),
+  ];
 }
 
 async function readStartupEvidenceWorkerStatus(
@@ -1760,9 +2345,13 @@ async function readStartupEvidenceTeamCreatedAt(
   teamName: string,
 ): Promise<number | null> {
   try {
-    const raw = await readFile(join(stateRoot, 'team', teamName, 'config.json'), 'utf-8');
+    const raw = await readFile(
+      join(stateRoot, 'team', teamName, 'config.json'),
+      'utf-8',
+    );
     const parsed = JSON.parse(raw) as unknown;
-    const createdAt = parsed && typeof parsed === 'object'
+    const createdAt =
+      parsed && typeof parsed === 'object'
       ? (parsed as { created_at?: unknown }).created_at
       : null;
     if (typeof createdAt !== 'string') return null;
@@ -1787,15 +2376,21 @@ async function hasStartupEvidenceLeaderAck(
     if (!parsed || typeof parsed !== 'object') return false;
     const messages = (parsed as { messages?: unknown }).messages;
     if (!Array.isArray(messages)) return false;
-    const teamCreatedAt = await readStartupEvidenceTeamCreatedAt(stateRoot, teamName);
+    const teamCreatedAt = await readStartupEvidenceTeamCreatedAt(
+      stateRoot,
+      teamName,
+    );
     return messages.some((message) => {
       if (!message || typeof message !== 'object') return false;
-      if ((message as { from_worker?: unknown }).from_worker !== workerName) return false;
+      if ((message as { from_worker?: unknown }).from_worker !== workerName)
+        return false;
       if (teamCreatedAt === null) return true;
       const createdAt = (message as { created_at?: unknown }).created_at;
-      return typeof createdAt === 'string'
-        && Number.isFinite(Date.parse(createdAt))
-        && Date.parse(createdAt) >= teamCreatedAt;
+      return (
+        typeof createdAt === 'string' &&
+        Number.isFinite(Date.parse(createdAt)) &&
+        Date.parse(createdAt) >= teamCreatedAt
+      );
     });
   } catch {
     return false;
@@ -1809,14 +2404,30 @@ async function readWorkerStartupEvidence(
 ): Promise<WorkerStartupEvidence> {
   const stateRoots = resolveStartupEvidenceStateRoots(cwd);
   for (const stateRoot of stateRoots) {
-    const status = await readStartupEvidenceWorkerStatus(stateRoot, teamName, workerName);
-    if (typeof status.current_task_id === 'string' && status.current_task_id.trim() !== '') {
+    const status = await readStartupEvidenceWorkerStatus(
+      stateRoot,
+      teamName,
+      workerName,
+    );
+    if (
+      typeof status.current_task_id === 'string' &&
+      status.current_task_id.trim() !== ''
+    ) {
       return 'task_claim';
     }
   }
   for (const stateRoot of stateRoots) {
-    const status = await readStartupEvidenceWorkerStatus(stateRoot, teamName, workerName);
-    if (status.state === 'working' || status.state === 'blocked' || status.state === 'done' || status.state === 'failed') {
+    const status = await readStartupEvidenceWorkerStatus(
+      stateRoot,
+      teamName,
+      workerName,
+    );
+    if (
+      status.state === 'working' ||
+      status.state === 'blocked' ||
+      status.state === 'done' ||
+      status.state === 'failed'
+    ) {
       return 'worker_progress';
     }
   }
@@ -1845,12 +2456,22 @@ export async function waitForWorkerStartupEvidence(params: {
   timeoutMs?: number;
   pollMs?: number;
 }): Promise<WorkerStartupEvidence> {
-  const timeoutMs = Math.max(0, Math.floor(params.timeoutMs ?? STARTUP_EVIDENCE_TIMEOUT_MS));
-  const pollMs = Math.max(25, Math.floor(params.pollMs ?? STARTUP_EVIDENCE_POLL_MS));
+  const timeoutMs = Math.max(
+    0,
+    Math.floor(params.timeoutMs ?? STARTUP_EVIDENCE_TIMEOUT_MS),
+  );
+  const pollMs = Math.max(
+    25,
+    Math.floor(params.pollMs ?? STARTUP_EVIDENCE_POLL_MS),
+  );
   const deadline = Date.now() + timeoutMs;
 
   while (true) {
-    const evidence = await readWorkerStartupEvidence(params.teamName, params.workerName, params.cwd);
+    const evidence = await readWorkerStartupEvidence(
+      params.teamName,
+      params.workerName,
+      params.cwd,
+    );
     if (doesStartupEvidenceSettle(params.workerCli, evidence)) return evidence;
     if (Date.now() >= deadline) return 'none';
     await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -1873,9 +2494,11 @@ function shouldSkipWorkerReadyWait(env: NodeJS.ProcessEnv): boolean {
 
 function isStartupEvidenceMissingReason(reason: string): boolean {
   const normalized = reason.trim().toLowerCase();
-  return normalized.includes('ready_prompt_timeout')
-    || normalized.includes('no_evidence')
-    || normalized.includes('fallback_attempted_but_unconfirmed');
+  return (
+    normalized.includes('ready_prompt_timeout') ||
+    normalized.includes('no_evidence') ||
+    normalized.includes('fallback_attempted_but_unconfirmed')
+  );
 }
 
 async function recordRecoverableStartupIssue(params: {
@@ -1887,7 +2510,9 @@ async function recordRecoverableStartupIssue(params: {
 }): Promise<void> {
   const { teamName, workerName, taskIds, reason, cwd } = params;
   const updatedAt = new Date().toISOString();
-  const currentTaskId = isStartupEvidenceMissingReason(reason) ? undefined : taskIds[0];
+  const currentTaskId = isStartupEvidenceMissingReason(reason)
+    ? undefined
+    : taskIds[0];
   await writeWorkerStatus(
     teamName,
     workerName,
@@ -1945,9 +2570,15 @@ async function recordPromptStartupWorkerStopped(params: {
   ).catch(() => {});
 }
 
-function setTeamModelInstructionsFile(teamName: string, filePath: string): void {
+function setTeamModelInstructionsFile(
+  teamName: string,
+  filePath: string,
+): void {
   if (!previousModelInstructionsFileByTeam.has(teamName)) {
-    previousModelInstructionsFileByTeam.set(teamName, process.env[MODEL_INSTRUCTIONS_FILE_ENV]);
+    previousModelInstructionsFileByTeam.set(
+      teamName,
+      process.env[MODEL_INSTRUCTIONS_FILE_ENV],
+    );
   }
   process.env[MODEL_INSTRUCTIONS_FILE_ENV] = filePath;
 }
@@ -1975,7 +2606,8 @@ function registerPromptWorkerHandle(
     throw new Error(`failed to spawn prompt worker process for ${workerName}`);
   }
   const processPid = pid as number;
-  const existingTeamHandles = promptWorkerRegistry.get(teamName) ?? new Map<string, PromptWorkerHandle>();
+  const existingTeamHandles =
+    promptWorkerRegistry.get(teamName) ?? new Map<string, PromptWorkerHandle>();
   existingTeamHandles.set(workerName, {
     child,
     pid: processPid,
@@ -1995,7 +2627,10 @@ function registerPromptWorkerHandle(
   });
 }
 
-function getPromptWorkerHandle(teamName: string, workerName: string): PromptWorkerHandle | null {
+function getPromptWorkerHandle(
+  teamName: string,
+  workerName: string,
+): PromptWorkerHandle | null {
   return promptWorkerRegistry.get(teamName)?.get(workerName) ?? null;
 }
 
@@ -2093,14 +2728,21 @@ function collectProcessTreePids(rootPid: number): number[] {
   return ordered.reverse();
 }
 
-async function waitForTrackedPidsExit(pids: readonly number[], timeoutMs: number): Promise<boolean> {
-  const tracked = [...new Set(pids.filter((pid) => Number.isFinite(pid) && pid > 0))];
+async function waitForTrackedPidsExit(
+  pids: readonly number[],
+  timeoutMs: number,
+): Promise<boolean> {
+  const tracked = [
+    ...new Set(pids.filter((pid) => Number.isFinite(pid) && pid > 0)),
+  ];
   if (tracked.length === 0) return true;
 
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() < deadline) {
     if (tracked.every((pid) => !isPidAlive(pid))) return true;
-    await new Promise((resolve) => setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS));
+    await new Promise((resolve) =>
+      setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS),
+    );
   }
 
   return tracked.every((pid) => !isPidAlive(pid));
@@ -2111,7 +2753,11 @@ async function terminateTrackedProcessTree(
   processGroupId: number | null = null,
   graceMs: number = PROMPT_WORKER_SIGTERM_WAIT_MS,
   killWaitMs: number = PROMPT_WORKER_SIGKILL_WAIT_MS,
-): Promise<{ terminated: boolean; forcedKill: boolean; trackedPids: number[] }> {
+): Promise<{
+  terminated: boolean;
+  forcedKill: boolean;
+  trackedPids: number[];
+}> {
   if (processGroupId && process.platform !== 'win32') {
     const trackedPids = collectProcessTreePids(rootPid);
     try {
@@ -2139,7 +2785,9 @@ async function terminateTrackedProcessTree(
       if (!groupAlive && !descendantsAlive) {
         return { terminated: true, forcedKill: false, trackedPids };
       }
-      await new Promise((resolve) => setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS));
+      await new Promise((resolve) =>
+        setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS),
+      );
     }
 
     try {
@@ -2167,11 +2815,15 @@ async function terminateTrackedProcessTree(
       if (!groupAlive && !descendantsAlive) {
         return { terminated: true, forcedKill: true, trackedPids };
       }
-      await new Promise((resolve) => setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS));
+      await new Promise((resolve) =>
+        setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS),
+      );
     }
 
     return {
-      terminated: !isProcessGroupAlive(processGroupId) && trackedPids.every((pid) => !isPidAlive(pid)),
+      terminated:
+        !isProcessGroupAlive(processGroupId) &&
+        trackedPids.every((pid) => !isPidAlive(pid)),
       forcedKill: true,
       trackedPids,
     };
@@ -2228,9 +2880,12 @@ async function teardownPromptWorker(
   const handle = getPromptWorkerHandle(teamName, workerName);
   const handlePid = handle?.pid;
   const processGroupId = handle?.processGroupId ?? null;
-  const pid = (typeof handlePid === 'number' && Number.isFinite(handlePid))
+  const pid =
+    typeof handlePid === 'number' && Number.isFinite(handlePid)
     ? handlePid
-    : (Number.isFinite(fallbackPid) && (fallbackPid ?? 0) > 0 ? (fallbackPid as number) : null);
+      : Number.isFinite(fallbackPid) && (fallbackPid ?? 0) > 0
+        ? (fallbackPid as number)
+        : null;
 
   if (pid === null && processGroupId === null) {
     removePromptWorkerHandle(teamName, workerName);
@@ -2238,7 +2893,9 @@ async function teardownPromptWorker(
   }
 
   const teardown = await terminateTrackedProcessTree(pid ?? 0, processGroupId);
-  const processGone = processGroupId ? !isProcessGroupAlive(processGroupId) : !isPidAlive(pid!);
+  const processGone = processGroupId
+    ? !isProcessGroupAlive(processGroupId)
+    : !isPidAlive(pid!);
   if (teardown.terminated && processGone) {
     removePromptWorkerHandle(teamName, workerName);
     return { terminated: true, forcedKill: teardown.forcedKill, pid };
@@ -2278,8 +2935,10 @@ async function teardownPromptWorker(
 function isPromptWorkerAlive(config: TeamConfig, worker: WorkerInfo): boolean {
   const handle = getPromptWorkerHandle(config.name, worker.name);
   if (handle?.child.exitCode === null && !handle.child.killed) return true;
-  if (handle?.processGroupId && isProcessGroupAlive(handle.processGroupId)) return true;
-  if (process.platform !== 'win32' && isProcessGroupAlive(worker.pid as number)) return true;
+  if (handle?.processGroupId && isProcessGroupAlive(handle.processGroupId))
+    return true;
+  if (process.platform !== 'win32' && isProcessGroupAlive(worker.pid as number))
+    return true;
   return isPidAlive(worker.pid as number);
 }
 
@@ -2308,23 +2967,22 @@ function spawnPromptWorker(
     initialPrompt,
     workerRole,
   );
-  const childEnv = scrubTeamWorkerHudOwnershipEnv({ ...process.env, ...processSpec.env });
+  const childEnv = scrubTeamWorkerHudOwnershipEnv({
+    ...process.env,
+    ...processSpec.env,
+  });
   // Prompt workers are external CLI processes, not in-process runtime code.
   // Keeping c8's NODE_V8_COVERAGE in their environment makes coverage runs
   // track long-lived fake worker descendants and can keep node --test alive
   // after the runtime test itself has completed.
   delete childEnv.NODE_V8_COVERAGE;
 
-  const child = spawn(
-    processSpec.command,
-    processSpec.args,
-    {
+  const child = spawn(processSpec.command, processSpec.args, {
       cwd: workerCwd,
       detached: process.platform !== 'win32',
       env: childEnv,
       stdio: ['pipe', 'ignore', 'ignore'],
-    },
-  );
+  });
   registerPromptWorkerHandle(teamName, workerName, child);
   return child;
 }
@@ -2336,10 +2994,13 @@ export function resolveWorkerLaunchArgsFromEnv(
   preferredReasoning?: TeamReasoningEffort,
   workerCliOverride?: TeamWorkerCli,
 ): string[] {
-  const inheritedFromEnv = typeof env[TEAM_WORKER_INHERITED_MODEL_ENV] === 'string'
+  const inheritedFromEnv =
+    typeof env[TEAM_WORKER_INHERITED_MODEL_ENV] === 'string'
     ? env[TEAM_WORKER_INHERITED_MODEL_ENV]?.trim()
     : undefined;
-  const effectiveInheritedModel = typeof inheritedLeaderModel === 'string' && inheritedLeaderModel.trim() !== ''
+  const effectiveInheritedModel =
+    typeof inheritedLeaderModel === 'string' &&
+    inheritedLeaderModel.trim() !== ''
     ? inheritedLeaderModel.trim()
     : inheritedFromEnv;
   const inheritedArgs = effectiveInheritedModel
@@ -2356,23 +3017,33 @@ export function resolveWorkerLaunchArgsFromEnv(
   });
 
   const resolved = diagnostics.actualLaunchArgs;
-  const resolvedModel = diagnostics.actualModel ?? diagnostics.requestedDefaultModel ?? 'default';
+  const resolvedModel =
+    diagnostics.actualModel ?? diagnostics.requestedDefaultModel ?? 'default';
   const thinkingLevel = diagnostics.actualReasoning ?? 'none';
-  const source = diagnostics.reasoningSource === 'none'
+  const source =
+    diagnostics.reasoningSource === 'none'
     ? 'none/default-none'
     : diagnostics.reasoningSource;
   const modelSource = diagnostics.modelSource;
   const inheritedParentModel = diagnostics.inheritedParentModel ? 'yes' : 'no';
   const requestedRole = diagnostics.requestedAgentType ?? 'unknown';
   const requestedDefaultModel = diagnostics.requestedDefaultModel ?? 'none';
-  const requestedDefaultReasoning = diagnostics.requestedDefaultReasoning ?? 'none';
-  const effectiveWorkerCli = workerCliOverride ?? resolveEffectiveWorkerCliForStartupLog(resolved, env);
+  const requestedDefaultReasoning =
+    diagnostics.requestedDefaultReasoning ?? 'none';
+  const effectiveWorkerCli =
+    workerCliOverride ?? resolveEffectiveWorkerCliForStartupLog(resolved, env);
   if (effectiveWorkerCli === 'claude') {
-    console.log('[omx:team] worker startup resolution: model=claude source=local-settings');
+    console.log(
+      '[omx:team] worker startup resolution: model=claude source=local-settings',
+    );
   } else if (effectiveWorkerCli === 'gemini') {
-    console.log('[omx:team] worker startup resolution: model=gemini source=local-settings');
+    console.log(
+      '[omx:team] worker startup resolution: model=gemini source=local-settings',
+    );
   } else {
-    console.log(`[omx:team] worker startup resolution: requested_role=${requestedRole} requested_default_model=${requestedDefaultModel} requested_default_reasoning=${requestedDefaultReasoning} actual_model=${resolvedModel} thinking_level=${thinkingLevel} model_source=${modelSource} reasoning_source=${source} inherited_parent_model=${inheritedParentModel}`);
+    console.log(
+      `[omx:team] worker startup resolution: requested_role=${requestedRole} requested_default_model=${requestedDefaultModel} requested_default_reasoning=${requestedDefaultReasoning} actual_model=${resolvedModel} thinking_level=${thinkingLevel} model_source=${modelSource} reasoning_source=${source} inherited_parent_model=${inheritedParentModel}`,
+    );
   }
 
   return resolved;
@@ -2393,11 +3064,14 @@ function resolveEffectiveWorkerCliForStartupLog(
         ...env,
         OMX_TEAM_WORKER_CLI: 'auto',
       });
-      const resolvedMap = entries.map((entry): 'codex' | 'claude' | 'gemini' | null => {
+      const resolvedMap = entries.map(
+        (entry): 'codex' | 'claude' | 'gemini' | null => {
         if (entry === 'auto') return autoCli;
-        if (entry === 'codex' || entry === 'claude' || entry === 'gemini') return entry;
+          if (entry === 'codex' || entry === 'claude' || entry === 'gemini')
+            return entry;
         return null;
-      });
+        },
+      );
       if (resolvedMap.every((entry) => entry === 'claude')) return 'claude';
       if (resolvedMap.every((entry) => entry === 'gemini')) return 'gemini';
       if (resolvedMap.some((entry) => entry === 'codex')) return 'codex';
@@ -2432,11 +3106,13 @@ function buildWorkerLaunchPolicyPlan(params: {
       .map((task) => task.role)
       .filter((role): role is string => Boolean(role));
     const uniqueTaskRoles = [...new Set(taskRoles)];
-    const workerRole = taskRoles.length > 0 && uniqueTaskRoles.length === 1
+    const workerRole =
+      taskRoles.length > 0 && uniqueTaskRoles.length === 1
       ? taskRoles[0]!
       : params.agentType;
-    const preferredReasoning = resolveAgentReasoningEffort(workerRole, params.codexHomeOverride)
-      ?? resolveAgentReasoningEffort(params.agentType, params.codexHomeOverride);
+    const preferredReasoning =
+      resolveAgentReasoningEffort(workerRole, params.codexHomeOverride) ??
+      resolveAgentReasoningEffort(params.agentType, params.codexHomeOverride);
     const workerLaunchArgs = resolveWorkerLaunchArgsFromEnv(
       params.launchEnv,
       workerRole,
@@ -2450,19 +3126,20 @@ function buildWorkerLaunchPolicyPlan(params: {
       params.launchEnv,
     );
 
-    plans.push(Object.freeze({
+    plans.push(
+      Object.freeze({
       workerName,
       workerRole,
       taskRoles: Object.freeze(uniqueTaskRoles),
       preferredReasoning,
       workerLaunchArgs: Object.freeze([...workerLaunchArgs]),
       workerCli,
-    }));
+      }),
+    );
   }
 
   return Object.freeze(plans);
 }
-
 
 async function writeDecompositionArtifacts(
   teamName: string,
@@ -2471,7 +3148,11 @@ async function writeDecompositionArtifacts(
 ): Promise<void> {
   const root = join(resolveCanonicalTeamStateRoot(cwd), 'team', teamName);
   await mkdir(root, { recursive: true });
-  await writeFile(join(root, 'decomposition-report.json'), JSON.stringify(metadata, null, 2), 'utf8');
+  await writeFile(
+    join(root, 'decomposition-report.json'),
+    JSON.stringify(metadata, null, 2),
+    'utf8',
+  );
 
   const manifest = await readTeamManifestV2(teamName, cwd);
   if (manifest) {
@@ -2500,13 +3181,18 @@ export interface StartupAttemptDescriptor {
 export async function settleStartupAttemptResults(
   attempts: readonly StartupAttemptDescriptor[],
 ): Promise<StartupAttemptResult[]> {
-  const settled = await Promise.allSettled(attempts.map((attempt) => attempt.attempt));
+  const settled = await Promise.allSettled(
+    attempts.map((attempt) => attempt.attempt),
+  );
   return settled.map((result, index) => {
     if (result.status === 'fulfilled') return result.value;
     const descriptor = attempts[index];
     const workerIndex = descriptor?.workerIndex ?? index + 1;
     const workerName = descriptor?.workerName ?? `worker-${workerIndex}`;
-    const error = result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+    const error =
+      result.reason instanceof Error
+        ? result.reason
+        : new Error(String(result.reason));
     return { ok: false, workerIndex, workerName, error };
   });
 }
@@ -2516,30 +3202,61 @@ export async function startTeam(
   task: string,
   agentType: string,
   workerCount: number,
-  tasks: Array<{ subject: string; description: string; owner?: string; blocked_by?: string[]; depends_on?: string[]; symbolic_depends_on?: string[]; role?: string; delegation?: TeamTask['delegation']; coordination?: TeamTask['coordination']; requires_code_change?: boolean; filePaths?: string[]; domains?: string[]; lane?: string; allocation_reason?: string; symbolic_id?: string }>,
+  tasks: Array<{
+    subject: string;
+    description: string;
+    owner?: string;
+    blocked_by?: string[];
+    depends_on?: string[];
+    symbolic_depends_on?: string[];
+    role?: string;
+    delegation?: TeamTask['delegation'];
+    coordination?: TeamTask['coordination'];
+    requires_code_change?: boolean;
+    filePaths?: string[];
+    domains?: string[];
+    lane?: string;
+    allocation_reason?: string;
+    symbolic_id?: string;
+  }>,
   cwd: string,
   options: TeamStartOptions = {},
 ): Promise<TeamRuntime> {
   const leaderCwd = resolve(cwd);
-  const codexHomeOverride = typeof options.codexHomeOverride === 'string' && options.codexHomeOverride.trim() !== ''
+  const codexHomeOverride =
+    typeof options.codexHomeOverride === 'string' &&
+    options.codexHomeOverride.trim() !== ''
     ? options.codexHomeOverride.trim()
-    : (typeof process.env.CODEX_HOME === 'string' && process.env.CODEX_HOME.trim() !== ''
+      : typeof process.env.CODEX_HOME === 'string' &&
+          process.env.CODEX_HOME.trim() !== ''
         ? process.env.CODEX_HOME.trim()
-        : undefined);
+        : undefined;
   const launchEnv = {
     ...process.env,
     ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
   };
   const workerLaunchMode = resolveTeamWorkerLaunchMode(launchEnv);
+  const workerAuthorityTransport = await resolveTeamWorkerAuthorityTransport(
+    leaderCwd,
+    launchEnv,
+  );
 
   await assertNestedTeamAllowed(leaderCwd);
-  const effectiveWorktreeMode = resolveEffectiveTeamWorktreeMode(leaderCwd, options.worktreeMode);
+  const effectiveWorktreeMode = resolveEffectiveTeamWorktreeMode(
+    leaderCwd,
+    options.worktreeMode,
+  );
   const displayName = sanitizeTeamName(teamName);
-  const displayMode = workerLaunchMode === 'interactive' ? 'split_pane' : 'auto';
+  const displayMode =
+    workerLaunchMode === 'interactive' ? 'split_pane' : 'auto';
   const rawIdentityScope = resolveTeamIdentityScope(launchEnv);
-  const resolvedLeaderSessionId = await resolveLeaderSessionId(leaderCwd, launchEnv);
-  const identityScope = rawIdentityScope.source === 'run-id'
-    ? (resolvedLeaderSessionId
+  const resolvedLeaderSessionId = await resolveLeaderSessionId(
+    leaderCwd,
+    launchEnv,
+  );
+  const identityScope =
+    rawIdentityScope.source === 'run-id'
+      ? resolvedLeaderSessionId
       ? { ...rawIdentityScope, sessionId: resolvedLeaderSessionId, runId: '' }
       : {
         ...rawIdentityScope,
@@ -2547,27 +3264,51 @@ export async function startTeam(
         // random run id would give every start a new leader identity and bypass
         // one-active-team protection, so scope that fallback to the leader cwd.
         runId: `cwd:${leaderCwd}`,
-      })
+          }
     : rawIdentityScope;
   const sanitized = buildInternalTeamName(displayName, identityScope);
-  const leaderSessionId = identityScope.sessionId || identityScope.paneId || identityScope.tmuxTarget || identityScope.runId;
+  const leaderSessionId =
+    identityScope.sessionId ||
+    identityScope.paneId ||
+    identityScope.tmuxTarget ||
+    identityScope.runId;
 
-  await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId);
+  await assertTeamStartupIsNonDestructive(
+    sanitized,
+    leaderCwd,
+    leaderSessionId,
+  );
   if (displayName !== sanitized) {
-    await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId);
+    await assertTeamStartupIsNonDestructive(
+      displayName,
+      leaderCwd,
+      leaderSessionId,
+    );
   }
 
-  const teamStateRoot = resolveCanonicalTeamStateRoot(leaderCwd);
-  const requestedApprovedExecution = normalizeApprovedTeamExecutionBinding(options.approvedExecution);
+  const teamStateRoot = resolveCanonicalTeamStateRoot(leaderCwd, {
+    ...launchEnv,
+    ...workerAuthorityTransport,
+  });
+  const requestedApprovedExecution = normalizeApprovedTeamExecutionBinding(
+    options.approvedExecution,
+  );
   const requestedApprovedExecutionOutcome = requestedApprovedExecution
-    ? readApprovedTeamExecutionHintOutcomeFromBinding(leaderCwd, requestedApprovedExecution)
+    ? readApprovedTeamExecutionHintOutcomeFromBinding(
+        leaderCwd,
+        requestedApprovedExecution,
+      )
     : null;
-  if (requestedApprovedExecution && requestedApprovedExecutionOutcome?.status === 'ambiguous') {
+  if (
+    requestedApprovedExecution &&
+    requestedApprovedExecutionOutcome?.status === 'ambiguous'
+  ) {
     throw new Error(
       `approved_execution_binding_ambiguous:${requestedApprovedExecution.prd_path}:${requestedApprovedExecution.task}`,
     );
   }
-  const selectedApprovedExecutionHint = requestedApprovedExecutionOutcome?.status === 'resolved'
+  const selectedApprovedExecutionHint =
+    requestedApprovedExecutionOutcome?.status === 'resolved'
     ? requestedApprovedExecutionOutcome.approvedHint
     : null;
   if (requestedApprovedExecution && !selectedApprovedExecutionHint) {
@@ -2583,29 +3324,41 @@ export async function startTeam(
     requestedApprovedExecution ?? approvedExecution,
     selectedApprovedExecutionHint,
   );
-  const ultragoalOutcome = await resolveLeaderOwnedUltragoalContextOutcome(leaderCwd);
+  const ultragoalOutcome =
+    await resolveLeaderOwnedUltragoalContextOutcome(leaderCwd);
   if (explicitUltragoalLinkedTeam && ultragoalOutcome.status !== 'valid') {
-    throw new Error(`invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`);
+    throw new Error(
+      `invalid_ultragoal_team_context:${ultragoalOutcome.warning?.message ?? ultragoalOutcome.status}`,
+    );
   }
-  const ultragoalContext = ultragoalOutcome.status === 'valid' ? ultragoalOutcome.context : null;
+  const ultragoalContext =
+    ultragoalOutcome.status === 'valid' ? ultragoalOutcome.context : null;
   const approvedContextSection = joinContextSections(
     buildApprovedTeamHandoffSection(selectedApprovedExecutionHint),
     renderLeaderOwnedUltragoalContextSection(ultragoalContext),
   );
   const activeWorktreeMode: 'detached' | 'named' | null =
     effectiveWorktreeMode.enabled
-      ? (effectiveWorktreeMode.detached ? 'detached' : 'named')
+      ? effectiveWorktreeMode.detached
+        ? 'detached'
+        : 'named'
       : null;
-  const workspaceMode: 'single' | 'worktree' = activeWorktreeMode ? 'worktree' : 'single';
-  const workerWorkspaceByName = new Map<string, {
+  const workspaceMode: 'single' | 'worktree' = activeWorktreeMode
+    ? 'worktree'
+    : 'single';
+  const workerWorkspaceByName = new Map<
+    string,
+    {
     cwd: string;
     worktreeRepoRoot?: string;
     worktreePath?: string;
     worktreeBranch?: string;
     worktreeDetached?: boolean;
     worktreeCreated?: boolean;
-  }>();
-  const provisionedWorktrees: Array<EnsureWorktreeResult | { enabled: false }> = [];
+    }
+  >();
+  const provisionedWorktrees: Array<EnsureWorktreeResult | { enabled: false }> =
+    [];
   for (let i = 1; i <= workerCount; i++) {
     workerWorkspaceByName.set(`worker-${i}`, { cwd: leaderCwd });
   }
@@ -2621,27 +3374,37 @@ export async function startTeam(
     codexHomeOverride,
   });
   for (const workerLaunchPolicy of workerLaunchPolicyPlan) {
-    assertTeamWorkerCliPolicyCompatibility(
-      workerLaunchPolicy.workerCli,
-      [...workerLaunchPolicy.workerLaunchArgs],
-    );
+    assertTeamWorkerCliPolicyCompatibility(workerLaunchPolicy.workerCli, [
+      ...workerLaunchPolicy.workerLaunchArgs,
+    ]);
   }
   if (workerLaunchMode === 'prompt') {
     assertPromptModeWorkerCliSupported(
-      workerLaunchPolicyPlan.map((workerLaunchPolicy) => workerLaunchPolicy.workerCli),
+      workerLaunchPolicyPlan.map(
+        (workerLaunchPolicy) => workerLaunchPolicy.workerCli,
+      ),
       launchEnv,
     );
   }
   if (workerLaunchMode === 'interactive') {
     if (!isTmuxAvailable()) {
-      throw new Error('Team mode requires tmux. Install with: apt install tmux / brew install tmux');
+      throw new Error(
+        'Team mode requires tmux. Install with: apt install tmux / brew install tmux',
+      );
     }
     if (!hasCurrentTmuxClientContext()) {
-      throw new Error('Team mode requires running inside tmux current leader pane');
+      throw new Error(
+        'Team mode requires running inside tmux current leader pane',
+      );
     }
   }
 
-  await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
+  await detectAndCleanStaleTeam(
+    sanitized,
+    leaderCwd,
+    workerCount,
+    options.confirmStaleCleanup,
+  );
 
   if (activeWorktreeMode) {
     for (let i = 1; i <= workerCount; i++) {
@@ -2737,63 +3500,97 @@ export async function startTeam(
     // 4. Create tasks. Repo-aware DAG dependencies are symbolic until the
     // state layer returns concrete task IDs, so create those tasks dependency
     // free and patch runtime dependency fields after ID assignment.
-    const coordinationPlans = synthesizeCoordinationPlans(tasks.map((task) => ({
+    const coordinationPlans = synthesizeCoordinationPlans(
+      tasks.map((task) => ({
       ...task,
-      depends_on: task.depends_on ?? task.blocked_by ?? task.symbolic_depends_on,
-    })));
+        depends_on:
+          task.depends_on ?? task.blocked_by ?? task.symbolic_depends_on,
+      })),
+    );
     const createdTasks: TeamTask[] = [];
     for (const [taskIndex, t] of tasks.entries()) {
       const hasSymbolicDagIdentity = Boolean(t.symbolic_id);
-      const created = await createStateTask(sanitized, {
+      const created = await createStateTask(
+        sanitized,
+        {
         subject: t.subject,
         description: t.description,
         status: 'pending',
         owner: t.owner,
-        blocked_by: hasSymbolicDagIdentity ? undefined : t.blocked_by ?? t.depends_on,
-        depends_on: hasSymbolicDagIdentity ? undefined : t.depends_on ?? t.blocked_by,
+          blocked_by: hasSymbolicDagIdentity
+            ? undefined
+            : (t.blocked_by ?? t.depends_on),
+          depends_on: hasSymbolicDagIdentity
+            ? undefined
+            : (t.depends_on ?? t.blocked_by),
         role: t.role,
         delegation: t.delegation ?? synthesizeDelegationPlan(t),
         coordination: t.coordination
           ? { ...t.coordination, source: 'explicit' }
-          : coordinationPlans[taskIndex] ?? synthesizeCoordinationPlan(t),
+            : (coordinationPlans[taskIndex] ?? synthesizeCoordinationPlan(t)),
         requires_code_change: t.requires_code_change,
         filePaths: t.filePaths,
         domains: t.domains,
         lane: t.lane,
         allocation_reason: t.allocation_reason,
-      }, leaderCwd);
+        },
+        leaderCwd,
+      );
       createdTasks.push(created);
     }
 
     const effectiveDecompositionMetadata = options.decompositionMetadata
-      ? remapRepoAwareDecompositionMetadataToCreatedTasks(options.decompositionMetadata, tasks, createdTasks)
+      ? remapRepoAwareDecompositionMetadataToCreatedTasks(
+          options.decompositionMetadata,
+          tasks,
+          createdTasks,
+        )
       : undefined;
-    const nodeIdToTaskId = effectiveDecompositionMetadata?.node_id_to_task_id ?? {};
+    const nodeIdToTaskId =
+      effectiveDecompositionMetadata?.node_id_to_task_id ?? {};
     for (let index = 0; index < tasks.length; index += 1) {
       const planned = tasks[index];
       if (!planned?.symbolic_id) continue;
       const created = createdTasks[index];
       if (!created) continue;
-      const symbolicDeps = planned.symbolic_depends_on
-        ?? effectiveDecompositionMetadata?.node_dependencies?.[planned.symbolic_id]
-        ?? [];
-      const concreteDeps = symbolicDeps.map((dep) => nodeIdToTaskId[dep]).filter(Boolean);
+      const symbolicDeps =
+        planned.symbolic_depends_on ??
+        effectiveDecompositionMetadata?.node_dependencies?.[
+          planned.symbolic_id
+        ] ??
+        [];
+      const concreteDeps = symbolicDeps
+        .map((dep) => nodeIdToTaskId[dep])
+        .filter(Boolean);
       if (concreteDeps.length === 0) continue;
-      await updateTask(sanitized, created.id, {
+      await updateTask(
+        sanitized,
+        created.id,
+        {
         blocked_by: concreteDeps,
         depends_on: concreteDeps,
-      }, leaderCwd);
+        },
+        leaderCwd,
+      );
     }
 
     // 5. Write team-scoped worker instructions file only for single-workspace mode.
     if (workspaceMode !== 'worktree') {
-      workerInstructionsPath = await writeTeamWorkerInstructionsFile(sanitized, leaderCwd, overlay);
+      workerInstructionsPath = await writeTeamWorkerInstructionsFile(
+        sanitized,
+        leaderCwd,
+        overlay,
+      );
       setTeamModelInstructionsFile(sanitized, workerInstructionsPath);
     }
 
     const allTasks = await listTasks(sanitized, leaderCwd);
     if (effectiveDecompositionMetadata) {
-      await writeDecompositionArtifacts(sanitized, leaderCwd, effectiveDecompositionMetadata);
+      await writeDecompositionArtifacts(
+        sanitized,
+        leaderCwd,
+        effectiveDecompositionMetadata,
+      );
     }
     const workerBootstrapPlans = [] as Array<{
       workerName: string;
@@ -2824,16 +3621,27 @@ export async function startTeam(
         throw new Error(`missing worker launch policy for worker-${i}`);
       }
       const workerName = workerLaunchPolicy.workerName;
-      const workerWorkspace = workerWorkspaceByName.get(workerName) ?? { cwd: leaderCwd };
-      const workerTasks = allTasks.filter(t => t.owner === workerName);
+      const workerWorkspace = workerWorkspaceByName.get(workerName) ?? {
+        cwd: leaderCwd,
+      };
+      const workerTasks = allTasks.filter((t) => t.owner === workerName);
       const runtimeRole = workerLaunchPolicy.workerRole;
-      const rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
-        ?? await loadRolePrompt(runtimeRole, codexPromptsDir());
+      const rawRolePromptContent =
+        (await loadRolePrompt(
+          runtimeRole,
+          join(leaderCwd, '.codex', 'prompts'),
+        )) ?? (await loadRolePrompt(runtimeRole, codexPromptsDir()));
       const workerLaunchArgs = workerLaunchPolicy.workerLaunchArgs;
       const workerCli = workerLaunchPolicy.workerCli;
-      const resolvedWorkerModel = parseTeamWorkerLaunchArgs([...workerLaunchArgs]).modelOverride ?? undefined;
+      const resolvedWorkerModel =
+        parseTeamWorkerLaunchArgs([...workerLaunchArgs]).modelOverride ??
+        undefined;
       const rolePromptContent = rawRolePromptContent
-        ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)
+        ? composeRoleInstructionsForRole(
+            runtimeRole,
+            rawRolePromptContent,
+            resolvedWorkerModel,
+          )
         : null;
       const workerWorktreePath = workerWorkspace.worktreePath ?? undefined;
       const toolContext = resolveWorktreeToolContext({
@@ -2843,22 +3651,35 @@ export async function startTeam(
         worktreeRoot: workerWorkspace.worktreePath ?? workerWorkspace.cwd,
         env: launchEnv,
       });
-      const fallbackInstructionsPath = workerInstructionsPath ?? join(leaderCwd, 'AGENTS.md');
+      const fallbackInstructionsPath =
+        workerInstructionsPath ?? join(leaderCwd, 'AGENTS.md');
       const instructionsFilePath = workerWorktreePath
         ? await writeWorkerWorktreeRootAgentsFile({
           teamName: sanitized,
           workerName,
           workerRole: runtimeRole,
-          rolePromptContent: rolePromptContent ?? "",
+            rolePromptContent: rolePromptContent ?? '',
           teamStateRoot,
           leaderCwd,
           worktreePath: workerWorktreePath,
           toolContext,
         })
         : rolePromptContent
-          ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, fallbackInstructionsPath, runtimeRole, rolePromptContent)
+          ? await writeWorkerRoleInstructionsFile(
+              sanitized,
+              workerName,
+              leaderCwd,
+              fallbackInstructionsPath,
+              runtimeRole,
+              rolePromptContent,
+            )
           : fallbackInstructionsPath;
-      const inbox = generateInitialInbox(workerName, sanitized, agentType, workerTasks, {
+      const inbox = generateInitialInbox(
+        workerName,
+        sanitized,
+        agentType,
+        workerTasks,
+        {
         teamStateRoot,
         leaderCwd,
         workerRole: runtimeRole,
@@ -2869,8 +3690,14 @@ export async function startTeam(
         approvedContextSummary: approvedContextSection
           ? undefined
           : effectiveDecompositionMetadata?.approved_context_summary,
-        workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
-      });
+          workerGoalInstruction: buildTeamWorkerGoalInstruction(
+            sanitized,
+            workerName,
+            workerTasks,
+            { teamStateRoot },
+          ),
+        },
+      );
       const triggerDirective = buildTriggerDirective(
         workerName,
         sanitized,
@@ -2905,6 +3732,7 @@ export async function startTeam(
         [MODEL_INSTRUCTIONS_FILE_ENV]: plan.instructionsFilePath,
         OMX_TEAM_DISPLAY_NAME: displayName,
         ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+        ...workerAuthorityTransport,
         ...worktreeToolContextEnv(plan.toolContext),
       };
       if (plan.workerWorkspace.worktreePath) {
@@ -2914,7 +3742,9 @@ export async function startTeam(
         env.OMX_TEAM_WORKTREE_BRANCH = plan.workerWorkspace.worktreeBranch;
       }
       if (typeof plan.workerWorkspace.worktreeDetached === 'boolean') {
-        env.OMX_TEAM_WORKTREE_DETACHED = plan.workerWorkspace.worktreeDetached ? '1' : '0';
+        env.OMX_TEAM_WORKTREE_DETACHED = plan.workerWorkspace.worktreeDetached
+          ? '1'
+          : '0';
       }
       return {
         cwd: plan.workerWorkspace.cwd,
@@ -2926,13 +3756,20 @@ export async function startTeam(
       };
     });
 
-    const workerPaneIds = Array.from({ length: workerCount }, () => undefined as string | undefined);
+    const workerPaneIds = Array.from(
+      { length: workerCount },
+      () => undefined as string | undefined,
+    );
+    const promptWorkerPids = Array.from(
+      { length: workerCount },
+      () => undefined as number | undefined,
+    );
 
-    const materializeWorkerStartupState = async (
-      bootstrapPlan: typeof workerBootstrapPlans[number],
+    const buildWorkerStartupIdentity = (
+      bootstrapPlan: (typeof workerBootstrapPlans)[number],
       workerIndex: number,
-      paneId: string | undefined,
-    ): Promise<void> => {
+      runtime: { paneId?: string; pid?: number } = {},
+    ): WorkerInfo => {
       const workerWorkspace = bootstrapPlan.workerWorkspace;
       const identity: WorkerInfo = {
         name: bootstrapPlan.workerName,
@@ -2948,34 +3785,169 @@ export async function startTeam(
         worktree_created: workerWorkspace.worktreeCreated,
         team_state_root: teamStateRoot,
       };
-
-      if (workerLaunchMode === 'interactive') {
-        const panePid = getWorkerPanePid(sessionName, workerIndex, paneId);
-        if (panePid) identity.pid = panePid;
-      } else if (config?.workers[workerIndex - 1]?.pid) {
-        identity.pid = config.workers[workerIndex - 1].pid;
-      }
-
-      if (paneId) identity.pane_id = paneId;
-
-      if (config?.workers[workerIndex - 1]) {
-        config.workers[workerIndex - 1].pid = identity.pid;
-        config.workers[workerIndex - 1].pane_id = paneId;
-        config.workers[workerIndex - 1].role = bootstrapPlan.workerRole;
-        config.workers[workerIndex - 1].worker_cli = bootstrapPlan.workerCli;
-        config.workers[workerIndex - 1].assigned_tasks = bootstrapPlan.workerTasks.map((task) => task.id);
-        config.workers[workerIndex - 1].working_dir = workerWorkspace.cwd;
-        config.workers[workerIndex - 1].worktree_repo_root = workerWorkspace.worktreeRepoRoot;
-        config.workers[workerIndex - 1].worktree_path = workerWorkspace.worktreePath;
-        config.workers[workerIndex - 1].worktree_branch = workerWorkspace.worktreeBranch;
-        config.workers[workerIndex - 1].worktree_detached = workerWorkspace.worktreeDetached;
-        config.workers[workerIndex - 1].worktree_created = workerWorkspace.worktreeCreated;
-        config.workers[workerIndex - 1].team_state_root = teamStateRoot;
-      }
-
-      await writeWorkerIdentity(sanitized, bootstrapPlan.workerName, identity, leaderCwd);
-      await writeWorkerInbox(sanitized, bootstrapPlan.workerName, bootstrapPlan.inbox, leaderCwd);
+      const panePid = runtime.paneId
+        ? (getWorkerPanePid(sessionName, workerIndex, runtime.paneId) ??
+          undefined)
+        : undefined;
+      const pid = runtime.pid ?? panePid;
+      if (pid) identity.pid = pid;
+      if (runtime.paneId) identity.pane_id = runtime.paneId;
+      return identity;
     };
+
+    const materializeWorkerStartupState = async (
+      bootstrapPlan: (typeof workerBootstrapPlans)[number],
+      workerIndex: number,
+      runtime: { paneId?: string; pid?: number } = {},
+    ): Promise<void> => {
+      const identity = buildWorkerStartupIdentity(
+        bootstrapPlan,
+        workerIndex,
+        runtime,
+      );
+      const configWorker = config?.workers[workerIndex - 1];
+      if (!configWorker)
+        throw new Error(
+          `missing persisted worker config for ${bootstrapPlan.workerName}`,
+        );
+
+      if (identity.pid !== undefined) configWorker.pid = identity.pid;
+      else delete configWorker.pid;
+      if (identity.pane_id !== undefined)
+        configWorker.pane_id = identity.pane_id;
+      else delete configWorker.pane_id;
+      configWorker.role = bootstrapPlan.workerRole;
+      configWorker.worker_cli = bootstrapPlan.workerCli;
+      configWorker.assigned_tasks = bootstrapPlan.workerTasks.map(
+        (task) => task.id,
+      );
+      configWorker.working_dir = bootstrapPlan.workerWorkspace.cwd;
+      configWorker.worktree_repo_root =
+        bootstrapPlan.workerWorkspace.worktreeRepoRoot;
+      configWorker.worktree_path = bootstrapPlan.workerWorkspace.worktreePath;
+      configWorker.worktree_branch =
+        bootstrapPlan.workerWorkspace.worktreeBranch;
+      configWorker.worktree_detached =
+        bootstrapPlan.workerWorkspace.worktreeDetached;
+      configWorker.worktree_created =
+        bootstrapPlan.workerWorkspace.worktreeCreated;
+      configWorker.team_state_root = teamStateRoot;
+
+      await writeWorkerIdentity(
+        sanitized,
+        bootstrapPlan.workerName,
+        identity,
+        leaderCwd,
+      );
+      await writeWorkerInbox(
+        sanitized,
+        bootstrapPlan.workerName,
+        bootstrapPlan.inbox,
+        leaderCwd,
+      );
+    };
+
+    const verifyPlannedWorkerStartupState = async (): Promise<void> => {
+      const persistedConfig = await readTeamConfig(sanitized, leaderCwd);
+      if (!persistedConfig)
+        throw new Error('planned worker startup config was not persisted');
+      for (let i = 1; i <= workerCount; i++) {
+        const bootstrapPlan = workerBootstrapPlans[i - 1];
+        if (!bootstrapPlan)
+          throw new Error(`missing bootstrap plan for worker-${i}`);
+        const expectedIdentity = buildWorkerStartupIdentity(bootstrapPlan, i);
+        const persistedWorker = persistedConfig.workers[i - 1];
+        if (
+          !persistedWorker ||
+          persistedWorker.name !== expectedIdentity.name ||
+          persistedWorker.index !== expectedIdentity.index ||
+          persistedWorker.role !== expectedIdentity.role ||
+          persistedWorker.worker_cli !== expectedIdentity.worker_cli ||
+          JSON.stringify(persistedWorker.assigned_tasks) !==
+            JSON.stringify(expectedIdentity.assigned_tasks) ||
+          persistedWorker.working_dir !== expectedIdentity.working_dir ||
+          persistedWorker.worktree_repo_root !==
+            expectedIdentity.worktree_repo_root ||
+          persistedWorker.worktree_path !== expectedIdentity.worktree_path ||
+          persistedWorker.worktree_branch !==
+            expectedIdentity.worktree_branch ||
+          persistedWorker.worktree_detached !==
+            expectedIdentity.worktree_detached ||
+          persistedWorker.worktree_created !==
+            expectedIdentity.worktree_created ||
+          persistedWorker.team_state_root !==
+            expectedIdentity.team_state_root ||
+          persistedWorker.pid !== undefined ||
+          persistedWorker.pane_id !== undefined
+        ) {
+          throw new Error(
+            `planned worker config verification failed for ${bootstrapPlan.workerName}`,
+          );
+        }
+
+        const workerDirectory = join(
+          teamStateRoot,
+          'team',
+          sanitized,
+          'workers',
+          bootstrapPlan.workerName,
+        );
+        let persistedIdentity: WorkerInfo;
+        let persistedInbox: string;
+        try {
+          [persistedIdentity, persistedInbox] = await Promise.all([
+            readFile(join(workerDirectory, 'identity.json'), 'utf8').then(
+              (raw) => JSON.parse(raw) as WorkerInfo,
+            ),
+            readFile(join(workerDirectory, 'inbox.md'), 'utf8'),
+          ]);
+        } catch {
+          throw new Error(
+            `planned worker files verification failed for ${bootstrapPlan.workerName}`,
+          );
+        }
+        if (
+          persistedIdentity.name !== expectedIdentity.name ||
+          persistedIdentity.index !== expectedIdentity.index ||
+          persistedIdentity.role !== expectedIdentity.role ||
+          persistedIdentity.worker_cli !== expectedIdentity.worker_cli ||
+          JSON.stringify(persistedIdentity.assigned_tasks) !==
+            JSON.stringify(expectedIdentity.assigned_tasks) ||
+          persistedIdentity.working_dir !== expectedIdentity.working_dir ||
+          persistedIdentity.worktree_repo_root !==
+            expectedIdentity.worktree_repo_root ||
+          persistedIdentity.worktree_path !== expectedIdentity.worktree_path ||
+          persistedIdentity.worktree_branch !==
+            expectedIdentity.worktree_branch ||
+          persistedIdentity.worktree_detached !==
+            expectedIdentity.worktree_detached ||
+          persistedIdentity.worktree_created !==
+            expectedIdentity.worktree_created ||
+          persistedIdentity.team_state_root !==
+            expectedIdentity.team_state_root ||
+          persistedIdentity.pid !== undefined ||
+          persistedIdentity.pane_id !== undefined ||
+          persistedInbox !== bootstrapPlan.inbox
+        ) {
+          throw new Error(
+            `planned worker identity or inbox verification failed for ${bootstrapPlan.workerName}`,
+          );
+        }
+      }
+    };
+
+    const startupTiming = createStartupTimingRecorder(sanitized, leaderCwd);
+    for (let i = 1; i <= workerCount; i++) {
+      const bootstrapPlan = workerBootstrapPlans[i - 1];
+      if (!bootstrapPlan)
+        throw new Error(`missing bootstrap plan for worker-${i}`);
+      await materializeWorkerStartupState(bootstrapPlan, i);
+      startupTiming.mark('identity_inbox_written', {
+        worker: bootstrapPlan.workerName,
+      });
+    }
+    await saveTeamConfig(config, leaderCwd);
+    await verifyPlannedWorkerStartupState();
 
     // 6. Create worker runtime (interactive tmux panes or prompt-mode child processes)
     await writeTeamPreflightContextPacket({
@@ -2993,7 +3965,6 @@ export async function startTeam(
       cleanup: options.cleanupLaunchOrphanedMcpProcesses,
       writeWarning: options.writeCleanupWarning,
     });
-    const startupTiming = createStartupTimingRecorder(sanitized, leaderCwd);
 
     if (workerLaunchMode === 'interactive') {
       const createdSession = createTeamSession(
@@ -3002,15 +3973,25 @@ export async function startTeam(
         leaderCwd,
         Array.from(workerLaunchPolicyPlan[0]?.workerLaunchArgs ?? []),
         workerStartups,
-        { ownerSessionId: leaderSessionId, teamPaneOwnerId: config.tmux_pane_owner_id },
+        {
+          ownerSessionId: leaderSessionId,
+          teamPaneOwnerId: config.tmux_pane_owner_id,
+        },
       );
       sessionName = createdSession.name;
       sessionCreated = true;
       createdWorkerPaneIds.push(...createdSession.workerPaneIds);
       createdLeaderPaneId = createdSession.leaderPaneId;
-      applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
+      applyCreatedInteractiveSessionToConfig(
+        config,
+        createdSession,
+        workerPaneIds,
+      );
       for (const [index, paneId] of createdSession.workerPaneIds.entries()) {
-        startupTiming.mark('split_returned', { worker: `worker-${index + 1}`, pane_id: paneId });
+        startupTiming.mark('split_returned', {
+          worker: `worker-${index + 1}`,
+          pane_id: paneId,
+        });
       }
     } else {
       config.tmux_session = `prompt-${sanitized}`;
@@ -3035,21 +4016,20 @@ export async function startTeam(
           startup.initialPrompt,
           startup.workerRole,
         );
-        if (config.workers[i - 1]) {
-          config.workers[i - 1].pid = child.pid;
-        }
+        promptWorkerPids[i - 1] = child.pid;
       }
     }
 
-    // Materialize durable startup state for every worker before any per-worker
-    // readiness wait or startup-evidence gate can block later workers.
+    // Update the durable planned state with runtime identifiers only after the
+    // corresponding pane or child process has been created.
     for (let i = 1; i <= workerCount; i++) {
       const bootstrapPlan = workerBootstrapPlans[i - 1];
-      if (!bootstrapPlan) {
+      if (!bootstrapPlan)
         throw new Error(`missing bootstrap plan for worker-${i}`);
-      }
-      await materializeWorkerStartupState(bootstrapPlan, i, workerPaneIds[i - 1]);
-      startupTiming.mark('identity_inbox_written', { worker: bootstrapPlan.workerName, pane_id: workerPaneIds[i - 1] });
+      await materializeWorkerStartupState(bootstrapPlan, i, {
+        paneId: workerPaneIds[i - 1],
+        pid: promptWorkerPids[i - 1],
+      });
     }
     await saveTeamConfig(config, leaderCwd);
 
@@ -3058,8 +4038,13 @@ export async function startTeam(
     // ordered; readiness polling and startup dispatch must not let worker-1
     // block later workers from receiving their own startup attempts.
     const manifest = await readTeamManifestV2(sanitized, leaderCwd);
-    const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, workerLaunchMode);
-    const runWorkerStartupAttempt = async (workerIndex: number): Promise<StartupAttemptResult> => {
+    const dispatchPolicy = resolveDispatchPolicy(
+      manifest?.policy,
+      workerLaunchMode,
+    );
+    const runWorkerStartupAttempt = async (
+      workerIndex: number,
+    ): Promise<StartupAttemptResult> => {
       const bootstrapPlan = workerBootstrapPlans[workerIndex - 1];
       if (!bootstrapPlan) {
         return {
@@ -3079,13 +4064,16 @@ export async function startTeam(
       const initialPrompt = bootstrapPlan.initialPrompt;
       const startupStartedAt = performance.now();
 
-      const taskRoles = workerLaunchPolicyPlan[workerIndex - 1]?.taskRoles ?? [];
+      const taskRoles =
+        workerLaunchPolicyPlan[workerIndex - 1]?.taskRoles ?? [];
       if (taskRoles.length > 1) {
-        console.log(`[omx:team] ${workerName}: mixed task roles [${taskRoles.join(', ')}], falling back to ${agentType}`);
+        console.log(
+          `[omx:team] ${workerName}: mixed task roles [${taskRoles.join(', ')}], falling back to ${agentType}`,
+        );
       }
 
-
-      const startupDirectOutcome = workerLaunchMode === 'interactive' && !initialPrompt
+      const startupDirectOutcome =
+        workerLaunchMode === 'interactive' && !initialPrompt
         ? await attemptStartupDirectTrigger({
           teamName: sanitized,
           config: config!,
@@ -3103,12 +4091,33 @@ export async function startTeam(
         : null;
 
       let startupReadyPromptObserved = false;
-      if (workerLaunchMode === 'interactive' && !skipWorkerReadyWait && !initialPrompt && !startupDirectOutcome?.ok) {
-        startupTiming.mark('ready_wait_start', { worker: workerName, pane_id: paneId });
-        const ready = await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId);
-        startupTiming.mark('ready_wait_end', { worker: workerName, pane_id: paneId, ok: ready });
+      if (
+        workerLaunchMode === 'interactive' &&
+        !skipWorkerReadyWait &&
+        !initialPrompt &&
+        !startupDirectOutcome?.ok
+      ) {
+        startupTiming.mark('ready_wait_start', {
+          worker: workerName,
+          pane_id: paneId,
+        });
+        const ready = await waitForWorkerReadyAsync(
+          sessionName,
+          workerIndex,
+          workerReadyTimeoutMs,
+          paneId,
+        );
+        startupTiming.mark('ready_wait_end', {
+          worker: workerName,
+          pane_id: paneId,
+          ok: ready,
+        });
         if (!ready) {
-          const workerAlive = isWorkerPaneOpen(sessionName, workerIndex, paneId);
+          const workerAlive = isWorkerPaneOpen(
+            sessionName,
+            workerIndex,
+            paneId,
+          );
           if (workerAlive) {
             await recordRecoverableStartupIssue({
               teamName: sanitized,
@@ -3122,7 +4131,9 @@ export async function startTeam(
               ok: false,
               workerIndex,
               workerName,
-              error: new Error(`Worker ${workerName} did not become ready in tmux session ${sessionName}`),
+              error: new Error(
+                `Worker ${workerName} did not become ready in tmux session ${sessionName}`,
+              ),
             };
           }
         } else {
@@ -3131,8 +4142,16 @@ export async function startTeam(
       }
 
       let dispatchOutcome: DispatchOutcome = initialPrompt
-        ? { ok: true, transport: 'none', reason: 'startup_prompt_delivered_at_launch' }
-        : (startupDirectOutcome ?? { ok: false, transport: 'none', reason: 'not_attempted' });
+        ? {
+            ok: true,
+            transport: 'none',
+            reason: 'startup_prompt_delivered_at_launch',
+          }
+        : (startupDirectOutcome ?? {
+            ok: false,
+            transport: 'none',
+            reason: 'not_attempted',
+          });
       if (!initialPrompt && !startupDirectOutcome?.ok) {
         for (let attempt = 1; attempt <= startupDispatchRetries; attempt++) {
           dispatchOutcome = await dispatchCriticalInboxInstruction({
@@ -3157,7 +4176,9 @@ export async function startTeam(
             cwd: leaderCwd,
             teamName: sanitized,
             workerName,
-            event: dispatchOutcome.ok ? 'startup_evidence' : 'startup_attempt_failed',
+            event: dispatchOutcome.ok
+              ? 'startup_evidence'
+              : 'startup_attempt_failed',
             paneId,
             elapsedMs: performance.now() - startupStartedAt,
             reason: dispatchOutcome.reason,
@@ -3167,20 +4188,32 @@ export async function startTeam(
           if (dispatchOutcome.ok) break;
           if (attempt < startupDispatchRetries) {
             if (workerLaunchMode === 'interactive') {
-              if (dismissTrustPromptIfPresent(sessionName, workerIndex, paneId)) {
-                await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId);
+              if (
+                dismissTrustPromptIfPresent(sessionName, workerIndex, paneId)
+              ) {
+                await waitForWorkerReadyAsync(
+                  sessionName,
+                  workerIndex,
+                  workerReadyTimeoutMs,
+                  paneId,
+                );
               } else {
-                await new Promise((resolve) => setTimeout(resolve, Math.max(0, startupRetryDelayS * 1000)));
+                await new Promise((resolve) =>
+                  setTimeout(resolve, Math.max(0, startupRetryDelayS * 1000)),
+                );
               }
             } else {
-              await new Promise((resolve) => setTimeout(resolve, Math.max(0, startupRetryDelayS * 1000)));
+              await new Promise((resolve) =>
+                setTimeout(resolve, Math.max(0, startupRetryDelayS * 1000)),
+              );
             }
           }
         }
       }
 
       if (!dispatchOutcome.ok) {
-        const workerAlive = workerLaunchMode === 'prompt'
+        const workerAlive =
+          workerLaunchMode === 'prompt'
           ? isPromptWorkerAlive(config!, config!.workers[workerIndex - 1]!)
           : isWorkerPaneOpen(sessionName, workerIndex, paneId);
         if (workerLaunchMode === 'prompt' && !workerAlive) {
@@ -3197,7 +4230,9 @@ export async function startTeam(
           ok: false,
           workerIndex,
           workerName,
-          error: new Error(`worker_notify_failed:${workerName}:${dispatchOutcome.reason}`),
+          error: new Error(
+            `worker_notify_failed:${workerName}:${dispatchOutcome.reason}`,
+          ),
         };
       }
 
@@ -3217,7 +4252,10 @@ export async function startTeam(
       }),
     );
     const firstStartupError = startupAttemptResults
-      .filter((result): result is Extract<StartupAttemptResult, { ok: false }> => !result.ok)
+      .filter(
+        (result): result is Extract<StartupAttemptResult, { ok: false }> =>
+          !result.ok,
+      )
       .sort((a, b) => a.workerIndex - b.workerIndex)[0];
     if (firstStartupError) {
       throw firstStartupError.error;
@@ -3238,7 +4276,10 @@ export async function startTeam(
     if (sessionCreated) {
       if (config?.resize_hook_name && config.resize_hook_target) {
         try {
-          const unregistered = unregisterResizeHook(config.resize_hook_target, config.resize_hook_name);
+          const unregistered = unregisterResizeHook(
+            config.resize_hook_target,
+            config.resize_hook_name,
+          );
           if (!unregistered) {
             rollbackErrors.push('unregisterResizeHook: returned false');
           }
@@ -3253,7 +4294,9 @@ export async function startTeam(
         try {
           await saveTeamConfig(config, leaderCwd);
         } catch (cleanupError) {
-          rollbackErrors.push(`saveTeamConfig(clear resize hook): ${String(cleanupError)}`);
+          rollbackErrors.push(
+            `saveTeamConfig(clear resize hook): ${String(cleanupError)}`,
+          );
         }
       }
 
@@ -3272,7 +4315,10 @@ export async function startTeam(
         }
         if (config?.hud_pane_id) {
           try {
-            await killWorkerByPaneIdAsync(config.hud_pane_id, createdLeaderPaneId);
+            await killWorkerByPaneIdAsync(
+              config.hud_pane_id,
+              createdLeaderPaneId,
+            );
           } catch (err) {
             process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
           }
@@ -3296,11 +4342,15 @@ export async function startTeam(
           'startup_rollback',
         );
         if (!teardown.terminated) {
-          promptTeardownFailures.push(`${worker.name}:${teardown.error || 'unknown_error'}`);
+          promptTeardownFailures.push(
+            `${worker.name}:${teardown.error || 'unknown_error'}`,
+          );
         }
       }
       if (promptTeardownFailures.length > 0) {
-        rollbackErrors.push(`promptTeardown:${promptTeardownFailures.join(',')}`);
+        rollbackErrors.push(
+          `promptTeardown:${promptTeardownFailures.join(',')}`,
+        );
       }
     }
 
@@ -3315,7 +4365,9 @@ export async function startTeam(
             worker.worktree_path,
           );
         } catch (cleanupError) {
-          rollbackErrors.push(`removeWorkerWorktreeRootAgentsFile(${worker.name}): ${String(cleanupError)}`);
+          rollbackErrors.push(
+            `removeWorkerWorktreeRootAgentsFile(${worker.name}): ${String(cleanupError)}`,
+          );
         }
       }
     }
@@ -3323,7 +4375,9 @@ export async function startTeam(
       try {
         await removeTeamWorkerInstructionsFile(sanitized, leaderCwd);
       } catch (cleanupError) {
-        rollbackErrors.push(`removeTeamWorkerInstructionsFile: ${String(cleanupError)}`);
+        rollbackErrors.push(
+          `removeTeamWorkerInstructionsFile: ${String(cleanupError)}`,
+        );
       }
     }
     restoreTeamModelInstructionsFile(sanitized);
@@ -3339,13 +4393,17 @@ export async function startTeam(
           skipBranchDeletion: false,
         });
       } catch (cleanupError) {
-        rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+        rollbackErrors.push(
+          `rollbackProvisionedWorktrees: ${String(cleanupError)}`,
+        );
       }
     }
 
     if (rollbackErrors.length > 0) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message}; rollback encountered errors: ${rollbackErrors.join(' | ')}`);
+      throw new Error(
+        `${message}; rollback encountered errors: ${rollbackErrors.join(' | ')}`,
+      );
     }
 
     throw error;
@@ -3355,13 +4413,19 @@ export async function startTeam(
 /**
  * Monitor team state by polling files. Returns a snapshot.
  */
-export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSnapshot | null> {
+export async function monitorTeam(
+  teamName: string,
+  cwd: string,
+): Promise<TeamSnapshot | null> {
   const monitorStartMs = performance.now();
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   const manifest = await readTeamManifestV2(sanitized, cwd);
-  const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
+  const dispatchPolicy = resolveDispatchPolicy(
+    manifest?.policy,
+    config.worker_launch_mode,
+  );
   const previousSnapshot = await readMonitorSnapshot(sanitized, cwd);
 
   const sessionName = config.tmux_session;
@@ -3376,7 +4440,8 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
     const reclaimed = await reclaimExpiredTaskClaim(sanitized, task.id, cwd);
     if (reclaimed.ok && reclaimed.reclaimed) reclaimedTaskIds.push(task.id);
   }
-  let taskView = reclaimedTaskIds.length > 0 ? await listTasks(sanitized, cwd) : allTasks;
+  let taskView =
+    reclaimedTaskIds.length > 0 ? await listTasks(sanitized, cwd) : allTasks;
   const taskById = new Map(taskView.map((task) => [task.id, task] as const));
   const inProgressByOwner = new Map<string, TeamTask[]>();
   for (const task of taskView) {
@@ -3394,7 +4459,8 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
   const workerScanStartMs = performance.now();
   const workerSignals = await Promise.all(
     config.workers.map(async (worker) => {
-      const alive = config.worker_launch_mode === 'prompt'
+      const alive =
+        config.worker_launch_mode === 'prompt'
         ? isPromptWorkerAlive(config, worker)
         : isWorkerAlive(sessionName, worker.index, worker.pane_id);
       const [status, heartbeat] = await Promise.all([
@@ -3402,13 +4468,17 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
         readWorkerHeartbeat(sanitized, worker.name, cwd),
       ]);
       return { worker, alive, status, heartbeat };
-    })
+    }),
   );
   const workerScanMs = performance.now() - workerScanStartMs;
 
   for (const { worker: w, alive, status, heartbeat } of workerSignals) {
-    const currentTask = status.current_task_id ? taskById.get(status.current_task_id) ?? null : null;
-    const previousTurns = previousSnapshot ? (previousSnapshot.workerTurnCountByName[w.name] ?? 0) : null;
+    const currentTask = status.current_task_id
+      ? (taskById.get(status.current_task_id) ?? null)
+      : null;
+    const previousTurns = previousSnapshot
+      ? (previousSnapshot.workerTurnCountByName[w.name] ?? 0)
+      : null;
     const previousTaskId = previousSnapshot?.workerTaskIdByName[w.name] ?? '';
     const currentTaskId = status.current_task_id ?? '';
     const turnsWithoutProgress =
@@ -3416,7 +4486,8 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
       previousTurns !== null &&
       status.state === 'working' &&
       currentTask &&
-      (currentTask.status === 'pending' || currentTask.status === 'in_progress') &&
+      (currentTask.status === 'pending' ||
+        currentTask.status === 'in_progress') &&
       currentTaskId !== '' &&
       previousTaskId === currentTaskId
         ? Math.max(0, heartbeat.turn_count - previousTurns)
@@ -3465,11 +4536,15 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
     if (decision.type === 'assign' && decision.taskId && decision.workerName) {
       try {
         await assignTask(sanitized, decision.workerName, decision.taskId, cwd);
-        recommendations.push(`Assigned task-${decision.taskId} to ${decision.workerName}: ${decision.reason}`);
+        recommendations.push(
+          `Assigned task-${decision.taskId} to ${decision.workerName}: ${decision.reason}`,
+        );
         assignedDuringMonitor = true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        recommendations.push(`Unable to assign task-${decision.taskId} to ${decision.workerName}: ${message}`);
+        recommendations.push(
+          `Unable to assign task-${decision.taskId} to ${decision.workerName}: ${message}`,
+        );
       }
     } else {
       recommendations.push(decision.reason);
@@ -3483,30 +4558,36 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
   // Count tasks
   const taskCounts = {
     total: taskView.length,
-    pending: taskView.filter(t => t.status === 'pending').length,
-    blocked: taskView.filter(t => t.status === 'blocked').length,
-    in_progress: taskView.filter(t => t.status === 'in_progress').length,
-    completed: taskView.filter(t => t.status === 'completed').length,
-    failed: taskView.filter(t => t.status === 'failed').length,
+    pending: taskView.filter((t) => t.status === 'pending').length,
+    blocked: taskView.filter((t) => t.status === 'blocked').length,
+    in_progress: taskView.filter((t) => t.status === 'in_progress').length,
+    completed: taskView.filter((t) => t.status === 'completed').length,
+    failed: taskView.filter((t) => t.status === 'failed').length,
   };
 
   const verificationPendingTasks = taskView.filter(
-    (task) => task.status === 'completed'
-      && task.requires_code_change === true
-      && !hasStructuredVerificationEvidence(task.result),
+    (task) =>
+      task.status === 'completed' &&
+      task.requires_code_change === true &&
+      !hasStructuredVerificationEvidence(task.result),
   );
   if (verificationPendingTasks.length > 0) {
     for (const task of verificationPendingTasks) {
-      recommendations.push(`Verification evidence missing for task-${task.id}; require structured PASS/FAIL evidence before terminal success`);
+      recommendations.push(
+        `Verification evidence missing for task-${task.id}; require structured PASS/FAIL evidence before terminal success`,
+      );
     }
   }
 
-  const allTasksTerminal = taskCounts.pending === 0 && taskCounts.blocked === 0 && taskCounts.in_progress === 0;
+  const allTasksTerminal =
+    taskCounts.pending === 0 &&
+    taskCounts.blocked === 0 &&
+    taskCounts.in_progress === 0;
   const deadWorkerStall =
-    config.worker_launch_mode === 'prompt'
-    && config.workers.length > 0
-    && deadWorkers.length >= config.workers.length
-    && !allTasksTerminal;
+    config.worker_launch_mode === 'prompt' &&
+    config.workers.length > 0 &&
+    deadWorkers.length >= config.workers.length &&
+    !allTasksTerminal;
 
   const persistedPhase = await readTeamPhaseState(sanitized, cwd);
   const targetPhase = deadWorkerStall
@@ -3514,16 +4595,28 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
     : inferPhaseTargetFromTaskCounts(taskCounts, {
       verificationPending: verificationPendingTasks.length > 0,
     });
-  const phaseState: TeamPhaseState = reconcilePhaseStateForMonitor(persistedPhase, targetPhase);
+  const phaseState: TeamPhaseState = reconcilePhaseStateForMonitor(
+    persistedPhase,
+    targetPhase,
+  );
   await writeTeamPhaseState(sanitized, phaseState, cwd);
   const phase: TeamPhase | TerminalPhase = phaseState.current_phase;
   await syncRootTeamModeStateOnTerminalPhase(sanitized, phase, cwd);
 
   if (deadWorkerStall) {
-    recommendations.push('All workers are dead while work remains; mark the team failed or restart with fresh workers.');
+    recommendations.push(
+      'All workers are dead while work remains; mark the team failed or restart with fresh workers.',
+    );
   }
 
-  await emitMonitorDerivedEvents(sanitized, taskView, workers, previousSnapshot, config.worker_launch_mode, cwd);
+  await emitMonitorDerivedEvents(
+    sanitized,
+    taskView,
+    workers,
+    previousSnapshot,
+    config.worker_launch_mode,
+    cwd,
+  );
   const integrationByWorker = await integrateWorkerCommitsIntoLeader({
     teamName: sanitized,
     config,
@@ -3537,19 +4630,28 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
     workers,
     previousSnapshot?.mailboxNotifiedByMessageId ?? {},
     dispatchPolicy,
-    cwd
+    cwd,
   );
   const mailboxDeliveryMs = performance.now() - mailboxDeliveryStartMs;
 
   // Prune ephemeral status messages from leader mailbox (TTL: 60s)
   try {
-    const leaderMailbox = await listMailboxMessages(sanitized, 'leader-fixed', cwd);
+    const leaderMailbox = await listMailboxMessages(
+      sanitized,
+      'leader-fixed',
+      cwd,
+    );
     const now = Date.now();
     for (const msg of leaderMailbox) {
       if (msg.from_worker === 'system' && msg.created_at) {
         const age = now - new Date(msg.created_at).getTime();
         if (age > 60_000) {
-          await markMessageDelivered(sanitized, 'leader-fixed', msg.message_id, cwd);
+          await markMessageDelivered(
+            sanitized,
+            'leader-fixed',
+            msg.message_id,
+            cwd,
+          );
         }
       }
     }
@@ -3563,10 +4665,18 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
     sanitized,
       {
         taskStatusById: Object.fromEntries(taskView.map((t) => [t.id, t.status])),
-        workerAliveByName: Object.fromEntries(workers.map((w) => [w.name, w.alive])),
-        workerStateByName: Object.fromEntries(workers.map((w) => [w.name, w.status.state])),
-        workerTurnCountByName: Object.fromEntries(workers.map((w) => [w.name, w.heartbeat?.turn_count ?? 0])),
-        workerTaskIdByName: Object.fromEntries(workers.map((w) => [w.name, w.status.current_task_id ?? ''])),
+      workerAliveByName: Object.fromEntries(
+        workers.map((w) => [w.name, w.alive]),
+      ),
+      workerStateByName: Object.fromEntries(
+        workers.map((w) => [w.name, w.status.state]),
+      ),
+      workerTurnCountByName: Object.fromEntries(
+        workers.map((w) => [w.name, w.heartbeat?.turn_count ?? 0]),
+      ),
+      workerTaskIdByName: Object.fromEntries(
+        workers.map((w) => [w.name, w.status.current_task_id ?? '']),
+      ),
         mailboxNotifiedByMessageId,
         completedEventTaskIds: previousSnapshot?.completedEventTaskIds ?? {},
         integrationByWorker,
@@ -3578,7 +4688,7 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
           updated_at: updatedAt,
         },
       },
-      cwd
+    cwd,
   );
 
   return {
@@ -3630,29 +4740,43 @@ export async function assignTask(
   }
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) throw new Error(`Team ${sanitized} not found`);
-  const workerInfo = config.workers.find(w => w.name === workerName);
+  const workerInfo = config.workers.find((w) => w.name === workerName);
   if (!workerInfo) throw new Error(`Worker ${workerName} not found in team`);
-  const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
+  const dispatchPolicy = resolveDispatchPolicy(
+    manifest?.policy,
+    config.worker_launch_mode,
+  );
 
-  const claim = await claimTask(sanitized, taskId, workerName, task.version ?? 1, cwd);
+  const claim = await claimTask(
+    sanitized,
+    taskId,
+    workerName,
+    task.version ?? 1,
+    cwd,
+  );
   if (!claim.ok) {
     if (claim.error === 'blocked_dependency') {
-      throw new Error(`blocked_dependency:${(claim.dependencies ?? []).join(',')}`);
+      throw new Error(
+        `blocked_dependency:${(claim.dependencies ?? []).join(',')}`,
+      );
     }
     throw new Error(claim.error);
   }
 
   try {
     // Retry dispatch up to 2 times to handle trust prompts during assignment (fixes #393).
-    const approvedExecutionState = await resolvePersistedApprovedTeamExecutionContinuityState(
+    const approvedExecutionState =
+      await resolvePersistedApprovedTeamExecutionContinuityState(
       sanitized,
       config.leader_cwd ?? cwd,
-      config.team_state_root ?? resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
+        config.team_state_root ??
+          resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
     );
     const persistedUltragoalContext = await readPersistedTeamUltragoalContext(
       sanitized,
       config.leader_cwd ?? cwd,
-      config.team_state_root ?? resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
+      config.team_state_root ??
+        resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
     );
     const approvedContextSection = joinContextSections(
       approvedExecutionState.status === 'valid'
@@ -3661,20 +4785,43 @@ export async function assignTask(
       renderLeaderOwnedUltragoalContextSection(persistedUltragoalContext),
     );
     const currentTasks = await listTasks(sanitized, cwd);
-    const currentCoordinationPlan = currentTasks.length > 0
-      ? synthesizeCoordinationPlans(currentTasks).find((_, index) => currentTasks[index]?.id === task.id) ?? synthesizeCoordinationPlan(task)
+    const currentCoordinationPlan =
+      currentTasks.length > 0
+        ? (synthesizeCoordinationPlans(currentTasks).find(
+            (_, index) => currentTasks[index]?.id === task.id,
+          ) ?? synthesizeCoordinationPlan(task))
       : synthesizeCoordinationPlan(task);
-    const hasCurrentCoordination = task.coordination?.source === 'explicit' || coordinationPlansEqual(task.coordination, currentCoordinationPlan);
-    const taskForInbox = task.delegation && hasCurrentCoordination
+    const hasCurrentCoordination =
+      task.coordination?.source === 'explicit' ||
+      coordinationPlansEqual(task.coordination, currentCoordinationPlan);
+    const taskForInbox =
+      task.delegation && hasCurrentCoordination
       ? task
-      : (await updateTask(sanitized, taskId, {
+        : ((await updateTask(
+            sanitized,
+            taskId,
+            {
           delegation: task.delegation ?? synthesizeDelegationPlan(task),
-          coordination: task.coordination?.source === 'explicit' ? task.coordination : currentCoordinationPlan,
-        }, cwd)) ?? task;
-    const inbox = generateTaskAssignmentInbox(workerName, sanitized, taskForInbox, { approvedContextSection });
+              coordination:
+                task.coordination?.source === 'explicit'
+                  ? task.coordination
+                  : currentCoordinationPlan,
+            },
+            cwd,
+          )) ?? task);
+    const inbox = generateTaskAssignmentInbox(
+      workerName,
+      sanitized,
+      taskForInbox,
+      { approvedContextSection },
+    );
     const maxAssignRetries = 2;
     const assignRetryDelayS = 2;
-    let outcome: DispatchOutcome = { ok: false, transport: 'none', reason: 'not_attempted' };
+    let outcome: DispatchOutcome = {
+      ok: false,
+      transport: 'none',
+      reason: 'not_attempted',
+    };
     const triggerDirective = buildTriggerDirective(
       workerName,
       sanitized,
@@ -3695,8 +4842,18 @@ export async function assignTask(
         inboxCorrelationKey: `assign:${taskId}:${workerName}`,
       });
       if (outcome.ok) break;
-      if (attempt < maxAssignRetries && config.worker_launch_mode === 'interactive' && config.tmux_session) {
-        if (dismissTrustPromptIfPresent(config.tmux_session, workerInfo.index, workerInfo.pane_id)) {
+      if (
+        attempt < maxAssignRetries &&
+        config.worker_launch_mode === 'interactive' &&
+        config.tmux_session
+      ) {
+        if (
+          dismissTrustPromptIfPresent(
+            config.tmux_session,
+            workerInfo.index,
+            workerInfo.pane_id,
+          )
+        ) {
           waitForWorkerReady(
             config.tmux_session,
             workerInfo.index,
@@ -3704,7 +4861,9 @@ export async function assignTask(
             workerInfo.pane_id,
           );
         } else {
-          await new Promise<void>(r => setTimeout(r, assignRetryDelayS * 1000));
+          await new Promise<void>((r) =>
+            setTimeout(r, assignRetryDelayS * 1000),
+          );
         }
       }
     }
@@ -3713,9 +4872,16 @@ export async function assignTask(
     }
   } catch (error) {
     // Roll back claim to avoid stuck in_progress tasks on any post-claim dispatch failure.
-    const released = await releaseTaskClaim(sanitized, taskId, claim.claimToken, workerName, cwd);
+    const released = await releaseTaskClaim(
+      sanitized,
+      taskId,
+      claim.claimToken,
+      workerName,
+      cwd,
+    );
 
-    const reason = error instanceof Error && error.message.trim() !== ''
+    const reason =
+      error instanceof Error && error.message.trim() !== ''
       ? error.message
       : 'worker_assignment_failed';
 
@@ -3735,7 +4901,8 @@ export async function assignTask(
       throw new Error(`${reason}:${released.error}`);
     }
 
-    if (reason === 'worker_notify_failed') throw new Error('worker_notify_failed');
+    if (reason === 'worker_notify_failed')
+      throw new Error('worker_notify_failed');
     throw new Error(`worker_assignment_failed:${reason}`);
   }
 }
@@ -3753,9 +4920,16 @@ export async function reassignTask(
   await assignTask(teamName, toWorker, taskId, cwd);
 }
 
-function resolveCommitHygieneArtifactTeamNames(config: TeamConfig, internalTeamName: string): string[] {
+function resolveCommitHygieneArtifactTeamNames(
+  config: TeamConfig,
+  internalTeamName: string,
+): string[] {
   const names: string[] = [];
-  for (const value of [config.requested_name, config.display_name, internalTeamName]) {
+  for (const value of [
+    config.requested_name,
+    config.display_name,
+    internalTeamName,
+  ]) {
     if (typeof value !== 'string' || value.trim() === '') continue;
     try {
       const sanitized = sanitizeTeamName(value);
@@ -3772,7 +4946,11 @@ function resolveCommitHygieneArtifactTeamNames(config: TeamConfig, internalTeamN
 /**
  * Graceful shutdown: send shutdown inbox to all workers, wait, force kill, cleanup.
  */
-export async function shutdownTeam(teamName: string, cwd: string, options: ShutdownOptions = {}): Promise<TeamShutdownSummary> {
+export async function shutdownTeam(
+  teamName: string,
+  cwd: string,
+  options: ShutdownOptions = {},
+): Promise<TeamShutdownSummary> {
   const force = options.force === true;
   const confirmIssues = options.confirmIssues === true;
   let skipWorkerAcks = false;
@@ -3791,7 +4969,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     return { commitHygieneArtifacts: null };
   }
   const manifest = await readTeamManifestV2(sanitized, cwd);
-  const leaderSessionId = typeof manifest?.leader?.session_id === 'string'
+  const leaderSessionId =
+    typeof manifest?.leader?.session_id === 'string'
     ? manifest.leader.session_id.trim()
     : '';
   const governance = resolveGovernancePolicy(
@@ -3807,7 +4986,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       governance,
       confirmIssues,
     });
-    const { gate, dirtyWorkers, requiresIssueConfirmation, useCleanFastPath } = classification;
+    const { gate, dirtyWorkers, requiresIssueConfirmation, useCleanFastPath } =
+      classification;
 
     await appendTeamEvent(
       sanitized,
@@ -3834,11 +5014,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   if (force) {
-    await appendTeamEvent(sanitized, {
+    await appendTeamEvent(
+      sanitized,
+      {
       type: 'shutdown_gate_forced',
       worker: 'leader-fixed',
       reason: 'force_bypass',
-    }, cwd).catch(() => {});
+      },
+      cwd,
+    ).catch(() => {});
 
     // Explicit force means teardown now. Do not spend the graceful ack window
     // waiting for interactive panes or prompt workers that will be killed below.
@@ -3846,7 +5030,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   const sessionName = config.tmux_session;
-  const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
+  const dispatchPolicy = resolveDispatchPolicy(
+    manifest?.policy,
+    config.worker_launch_mode,
+  );
   const shutdownRequestTimes = new Map<string, string>();
 
   if (!skipWorkerAcks) {
@@ -3885,41 +5072,56 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     const ackedWorkers = new Set<string>();
     while (Date.now() < deadline) {
       for (const w of config.workers) {
-        const ack = await readShutdownAck(sanitized, w.name, cwd, shutdownRequestTimes.get(w.name));
+        const ack = await readShutdownAck(
+          sanitized,
+          w.name,
+          cwd,
+          shutdownRequestTimes.get(w.name),
+        );
         if (ack && !ackedWorkers.has(w.name)) {
           ackedWorkers.add(w.name);
-          await appendTeamEvent(sanitized, {
+          await appendTeamEvent(
+            sanitized,
+            {
             type: 'shutdown_ack',
             worker: w.name,
-            reason: ack.status === 'reject' ? `reject:${ack.reason || 'no_reason'}` : 'accept',
-          }, cwd);
+              reason:
+                ack.status === 'reject'
+                  ? `reject:${ack.reason || 'no_reason'}`
+                  : 'accept',
+            },
+            cwd,
+          );
         }
         if (ack?.status === 'reject') {
           if (!rejected.some((r) => r.worker === w.name)) {
-            rejected.push({ worker: w.name, reason: ack.reason || 'no_reason' });
+            rejected.push({
+              worker: w.name,
+              reason: ack.reason || 'no_reason',
+            });
           }
         }
       }
       if (rejected.length > 0 && !force) {
-        const detail = rejected.map(r => `${r.worker}:${r.reason}`).join(',');
+        const detail = rejected.map((r) => `${r.worker}:${r.reason}`).join(',');
         throw new Error(`shutdown_rejected:${detail}`);
       }
 
-      const anyAlive = config.workers.some((w) => (
+      const anyAlive = config.workers.some((w) =>
         config.worker_launch_mode === 'prompt'
           ? isPromptWorkerAlive(config, w)
-          : isWorkerAlive(sessionName, w.index, w.pane_id)
-      ));
+          : isWorkerAlive(sessionName, w.index, w.pane_id),
+      );
       if (!anyAlive) break;
       // Sleep 2s
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 
-    const anyAliveAfterWait = config.workers.some((w) => (
+    const anyAliveAfterWait = config.workers.some((w) =>
       config.worker_launch_mode === 'prompt'
         ? isPromptWorkerAlive(config, w)
-        : isWorkerAlive(sessionName, w.index, w.pane_id)
-    ));
+        : isWorkerAlive(sessionName, w.index, w.pane_id),
+    );
     if (anyAliveAfterWait && !force) {
       // Workers may have accepted shutdown but not exited (Codex TUI requires explicit exit).
       // In this case, proceed to force kill panes (next step) rather than failing and leaving state around.
@@ -3931,37 +5133,59 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const hudPaneId = config.hud_pane_id;
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
-      ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
+      ? resolveSharedSessionShutdownTopology(
+          sessionName,
+          leaderPaneId,
+          sanitized,
+        )
       : null;
-    const effectiveLeaderPaneId = sharedSessionTopology ? sharedSessionTopology.leaderPaneId : leaderPaneId;
-    const tmuxPaneOwnerId = typeof config.tmux_pane_owner_id === 'string' ? config.tmux_pane_owner_id.trim() : '';
+    const effectiveLeaderPaneId = sharedSessionTopology
+      ? sharedSessionTopology.leaderPaneId
+      : leaderPaneId;
+    const tmuxPaneOwnerId =
+      typeof config.tmux_pane_owner_id === 'string'
+        ? config.tmux_pane_owner_id.trim()
+        : '';
     const legacyPersistedWorkerPaneIds = new Set(
       config.workers
-        .map((worker) => (typeof worker.pane_id === 'string' ? worker.pane_id.trim() : ''))
+        .map((worker) =>
+          typeof worker.pane_id === 'string' ? worker.pane_id.trim() : '',
+        )
         .filter((paneId) => paneId.startsWith('%')),
     );
     const ownerReadWarnings = new Set<string>();
-    const warnOwnerReadError = (kind: string, paneId: string, error: string): void => {
+    const warnOwnerReadError = (
+      kind: string,
+      paneId: string,
+      error: string,
+    ): void => {
       const key = `${kind}:${paneId}:${error}`;
       if (ownerReadWarnings.has(key)) return;
       ownerReadWarnings.add(key);
-      console.warn(`[team shutdown] ${sanitized}: skipped shared-session ${kind} ${paneId} because team owner tag could not be read: ${error}`);
+      console.warn(
+        `[team shutdown] ${sanitized}: skipped shared-session ${kind} ${paneId} because team owner tag could not be read: ${error}`,
+      );
     };
     const trustedHudRestoreLeaderPaneId = sharedSessionTopology
-      ? (isTrustedSharedSessionLeaderPaneForHudRestore({
+      ? isTrustedSharedSessionLeaderPaneForHudRestore({
         paneId: effectiveLeaderPaneId,
         teamPaneOwnerId: tmuxPaneOwnerId,
         legacyInstanceId: leaderSessionId,
-      }) ? effectiveLeaderPaneId : null)
+        })
+        ? effectiveLeaderPaneId
+        : null
       : effectiveLeaderPaneId;
     const effectiveHudPaneId = sharedSessionTopology
-      ? (sharedSessionTopology.hudPaneIds.find((paneId) => isSharedSessionHudPaneReclaimable({
+      ? (sharedSessionTopology.hudPaneIds.find((paneId) =>
+          isSharedSessionHudPaneReclaimable({
         paneId,
         persistedHudPaneId: hudPaneId,
         leaderOwnedHudPaneIds: sharedSessionTopology.leaderOwnedHudPaneIds,
         teamPaneOwnerId: tmuxPaneOwnerId,
-        onOwnerReadError: (hudPaneId, error) => warnOwnerReadError('HUD pane', hudPaneId, error),
-      })) ?? null)
+            onOwnerReadError: (hudPaneId, error) =>
+              warnOwnerReadError('HUD pane', hudPaneId, error),
+          }),
+        ) ?? null)
       : hudPaneId;
     const shutdownCandidatePaneIds = sharedSessionTopology
       ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
@@ -3981,7 +5205,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     if (shouldPrekillInteractiveShutdownProcessTrees(sessionName)) {
       const workerPanePids = shutdownPaneIds
         .map((paneId) => getWorkerPanePid(sessionName, 1, paneId))
-        .filter((pid): pid is number => typeof pid === 'number' && Number.isFinite(pid) && pid > 0);
+        .filter(
+          (pid): pid is number =>
+            typeof pid === 'number' && Number.isFinite(pid) && pid > 0,
+        );
       for (const panePid of workerPanePids) {
         await terminateTrackedProcessTree(panePid);
       }
@@ -3990,7 +5217,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     let resizeHookWarning: string | null = null;
     if (config.resize_hook_name && config.resize_hook_target) {
       const resizeHookName = config.resize_hook_name;
-      const unregistered = unregisterResizeHook(config.resize_hook_target, resizeHookName);
+      const unregistered = unregisterResizeHook(
+        config.resize_hook_target,
+        resizeHookName,
+      );
       if (!unregistered && isTmuxAvailable()) {
         const baseSession = sessionName.split(':')[0];
         const sessionStillActive = listTeamSessions().includes(baseSession);
@@ -4003,15 +5233,24 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     config.resize_hook_target = null;
     await saveTeamConfig(config, cwd);
     if (resizeHookWarning) {
-      console.warn(`[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`);
+      console.warn(
+        `[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`,
+      );
     }
     let restoredHudPaneId: string | null = null;
     if (effectiveHudPaneId) {
-      await killWorkerByPaneIdAsync(effectiveHudPaneId, effectiveLeaderPaneId ?? undefined);
+      await killWorkerByPaneIdAsync(
+        effectiveHudPaneId,
+        effectiveLeaderPaneId ?? undefined,
+      );
       if (sessionName.includes(':')) {
-        restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
+        restoredHudPaneId = restoreStandaloneHudPane(
+          trustedHudRestoreLeaderPaneId,
+          cwd,
+          {
           sessionId: leaderSessionId,
-        });
+          },
+        );
         if (!restoredHudPaneId) {
           const reason = trustedHudRestoreLeaderPaneId
             ? 'failed to restore standalone HUD pane'
@@ -4024,7 +5263,11 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       config,
       candidatePaneIds: sessionName.includes(':')
         ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
-          resolveSharedSessionShutdownTopology(sessionName, effectiveLeaderPaneId, sanitized).teamWorkerPaneIds,
+            resolveSharedSessionShutdownTopology(
+              sessionName,
+              effectiveLeaderPaneId,
+              sanitized,
+            ).teamWorkerPaneIds,
           tmuxPaneOwnerId,
           legacyPersistedWorkerPaneIds,
           (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
@@ -4059,19 +5302,28 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         'shutdown',
       );
       if (!teardown.terminated) {
-        promptTeardownFailures.push(`${w.name}:${teardown.error || 'unknown_error'}`);
+        promptTeardownFailures.push(
+          `${w.name}:${teardown.error || 'unknown_error'}`,
+        );
       }
     }
     if (promptTeardownFailures.length > 0) {
-      throw new Error(`shutdown_prompt_teardown_failed:${promptTeardownFailures.join(',')}`);
+      throw new Error(
+        `shutdown_prompt_teardown_failed:${promptTeardownFailures.join(',')}`,
+      );
     }
   }
 
-  const shutdownReports = await prepareWorkerWorktreeShutdownReports(config, cwd);
+  const shutdownReports = await prepareWorkerWorktreeShutdownReports(
+    config,
+    cwd,
+  );
 
   const commitHygieneEntries: TeamOperationalCommitEntry[] = [];
   for (const report of shutdownReports) {
-    const worker = config.workers.find((entry) => entry.name === report.workerName);
+    const worker = config.workers.find(
+      (entry) => entry.name === report.workerName,
+    );
     if (report.syntheticCommit) {
       commitHygieneEntries.push({
         recorded_at: new Date().toISOString(),
@@ -4083,7 +5335,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         source_commit: report.sourceRef,
         worktree_path: report.worktreePath,
         report_path: report.reportPath,
-        detail: 'Runtime created a shutdown checkpoint commit to preserve worker worktree changes.',
+        detail:
+          'Runtime created a shutdown checkpoint commit to preserve worker worktree changes.',
       });
     }
 
@@ -4093,8 +5346,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         operation: 'shutdown_merge',
         worker_name: report.workerName,
         task_id: worker?.assigned_tasks[0],
-        status: report.mergeOutcome === 'merged' ? 'applied' : report.mergeOutcome,
-        operational_commit: report.mergeOutcome === 'merged' ? report.leaderHeadAfter : null,
+        status:
+          report.mergeOutcome === 'merged' ? 'applied' : report.mergeOutcome,
+        operational_commit:
+          report.mergeOutcome === 'merged' ? report.leaderHeadAfter : null,
         source_commit: report.sourceRef,
         leader_head_before: report.leaderHeadBefore,
         leader_head_after: report.leaderHeadAfter,
@@ -4106,21 +5361,37 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   const artifactCwd = resolveTeamCommitHygieneArtifactCwd(config, cwd);
-  const taskView = await listTasks(sanitized, cwd).catch(() => [])
-  const internalLedger = await appendTeamCommitHygieneEntries(sanitized, commitHygieneEntries, artifactCwd)
-  const commitHygieneArtifactTeamNames = resolveCommitHygieneArtifactTeamNames(config, sanitized);
+  const taskView = await listTasks(sanitized, cwd).catch(() => []);
+  const internalLedger = await appendTeamCommitHygieneEntries(
+    sanitized,
+    commitHygieneEntries,
+    artifactCwd,
+  );
+  const commitHygieneArtifactTeamNames = resolveCommitHygieneArtifactTeamNames(
+    config,
+    sanitized,
+  );
   let commitHygieneArtifacts: TeamCommitHygieneArtifactPaths | null = null;
   for (const artifactTeamName of commitHygieneArtifactTeamNames) {
-    const ledger = artifactTeamName === sanitized
+    const ledger =
+      artifactTeamName === sanitized
       ? internalLedger
-      : await appendTeamCommitHygieneEntries(artifactTeamName, internalLedger.entries, artifactCwd)
+        : await appendTeamCommitHygieneEntries(
+            artifactTeamName,
+            internalLedger.entries,
+            artifactCwd,
+          );
     const commitHygieneContext = buildTeamCommitHygieneContext({
       teamName: artifactTeamName,
       tasks: taskView,
       ledger,
-    })
-    const writtenArtifacts = await writeTeamCommitHygieneContext(artifactTeamName, commitHygieneContext, artifactCwd)
-    commitHygieneArtifacts ??= writtenArtifacts
+    });
+    const writtenArtifacts = await writeTeamCommitHygieneContext(
+      artifactTeamName,
+      commitHygieneContext,
+      artifactCwd,
+    );
+    commitHygieneArtifacts ??= writtenArtifacts;
   }
 
   // 5. Remove worker worktree-root instructions and team-scoped fallback instructions.
@@ -4172,19 +5443,23 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     throw new Error(cleanupErrors.join(' | '));
   }
 
-  return { commitHygieneArtifacts }
+  return { commitHygieneArtifacts };
 }
 
 /**
  * Resume monitoring an existing team.
  */
-export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRuntime | null> {
+export async function resumeTeam(
+  teamName: string,
+  cwd: string,
+): Promise<TeamRuntime | null> {
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   config.lifecycle_profile = 'default';
   const leaderCwd = config.leader_cwd ?? cwd;
-  const approvedExecutionState = await resolvePersistedApprovedTeamExecutionContinuityState(
+  const approvedExecutionState =
+    await resolvePersistedApprovedTeamExecutionContinuityState(
     sanitized,
     leaderCwd,
     config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
@@ -4204,17 +5479,22 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
   }
   if (config.worker_launch_mode === 'prompt') {
     const handleTeamConfig = { ...config, name: sanitized };
-    const hasLivePromptWorker = config.workers.some((worker) => isPromptWorkerAlive(handleTeamConfig, worker));
+    const hasLivePromptWorker = config.workers.some((worker) =>
+      isPromptWorkerAlive(handleTeamConfig, worker),
+    );
     if (!hasLivePromptWorker) return null;
 
     const missingHandles = config.workers
       .filter((worker) => {
-        if (!Number.isFinite(worker.pid) || (worker.pid ?? 0) <= 0) return false;
+        if (!Number.isFinite(worker.pid) || (worker.pid ?? 0) <= 0)
+          return false;
         return isPidAlive(worker.pid as number);
       })
       .filter((worker) => !getPromptWorkerHandle(sanitized, worker.name));
     if (missingHandles.length > 0) {
-      const detail = missingHandles.map((worker) => `${worker.name}:${worker.pid ?? 'unknown'}`).join(',');
+      const detail = missingHandles
+        .map((worker) => `${worker.name}:${worker.pid ?? 'unknown'}`)
+        .join(',');
       await appendTeamEvent(
         sanitized,
         {
@@ -4242,7 +5522,10 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
   };
 }
 
-async function findActiveTeams(cwd: string, leaderSessionId: string): Promise<string[]> {
+async function findActiveTeams(
+  cwd: string,
+  leaderSessionId: string,
+): Promise<string[]> {
   const root = teamRuntimeTeamsRoot(cwd);
   if (!existsSync(root)) return [];
   const sessions = new Set(listTeamSessions());
@@ -4255,16 +5538,23 @@ async function findActiveTeams(cwd: string, leaderSessionId: string): Promise<st
     const manifest = await readTeamManifestV2(teamName, cwd);
     const governance = resolveGovernancePolicy(manifest?.governance);
     if (governance.one_team_per_leader_session === false) continue;
-    const workerLaunchMode = cfg?.worker_launch_mode
-      ?? manifest?.policy?.worker_launch_mode
-      ?? 'interactive';
-    const tmuxSession = (manifest?.tmux_session || cfg?.tmux_session || `omx-team-${teamName}`).split(':')[0];
+    const workerLaunchMode =
+      cfg?.worker_launch_mode ??
+      manifest?.policy?.worker_launch_mode ??
+      'interactive';
+    const tmuxSession = (
+      manifest?.tmux_session ||
+      cfg?.tmux_session ||
+      `omx-team-${teamName}`
+    ).split(':')[0];
     if (leaderSessionId) {
       const ownerSessionId = manifest?.leader?.session_id?.trim() ?? '';
       if (ownerSessionId && ownerSessionId !== leaderSessionId) continue;
     }
     if (workerLaunchMode === 'prompt') {
-      if ((cfg?.workers ?? []).some((worker) => isPromptWorkerAlive(cfg!, worker))) {
+      if (
+        (cfg?.workers ?? []).some((worker) => isPromptWorkerAlive(cfg!, worker))
+      ) {
         active.push(teamName);
       }
       continue;
@@ -4287,14 +5577,23 @@ async function detectAndCleanStaleTeam(
   if (sessions.has(`omx-team-${teamName}`)) return;
 
   const repoRootResult = spawnSync('git', ['rev-parse', '--show-toplevel'], {
-    cwd: leaderCwd, encoding: 'utf-8', windowsHide: true,
+    cwd: leaderCwd,
+    encoding: 'utf-8',
+    windowsHide: true,
   });
   if (repoRootResult.status !== 0) return;
   const repoRoot = repoRootResult.stdout.trim();
 
   const worktreePaths: string[] = [];
   for (let i = 1; i <= workerCount; i++) {
-    const wtPath = join(repoRoot, '.omx', 'team', teamName, 'worktrees', `worker-${i}`);
+    const wtPath = join(
+      repoRoot,
+      '.omx',
+      'team',
+      teamName,
+      'worktrees',
+      `worker-${i}`,
+    );
     if (existsSync(wtPath)) worktreePaths.push(wtPath);
   }
 
@@ -4304,10 +5603,19 @@ async function detectAndCleanStaleTeam(
   }
 
   const hasDirtyWorktrees = worktreePaths.some((p) => {
-    try { return isWorktreeDirty(p); } catch { return false; }
+    try {
+      return isWorktreeDirty(p);
+    } catch {
+      return false;
+    }
   });
 
-  const summary: StaleTeamSummary = { teamName, worktreePaths, statePath: stateDir, hasDirtyWorktrees };
+  const summary: StaleTeamSummary = {
+    teamName,
+    worktreePaths,
+    statePath: stateDir,
+    hasDirtyWorktrees,
+  };
 
   if (!confirmFn) {
     throw new Error(
@@ -4330,7 +5638,10 @@ async function detectAndCleanStaleTeam(
   await cleanupTeamState(teamName, leaderCwd);
 }
 
-async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+async function resolveLeaderSessionId(
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
   const fromEnv = env.OMX_SESSION_ID || env.CODEX_SESSION_ID || env.SESSION_ID;
   if (fromEnv && fromEnv.trim() !== '') return fromEnv.trim();
 
@@ -4339,7 +5650,11 @@ async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv = proc
   try {
     const raw = await readFile(p, 'utf-8');
     const parsed = JSON.parse(raw) as { session_id?: unknown };
-    if (typeof parsed.session_id === 'string' && parsed.session_id.trim() !== '') return parsed.session_id.trim();
+    if (
+      typeof parsed.session_id === 'string' &&
+      parsed.session_id.trim() !== ''
+    )
+      return parsed.session_id.trim();
   } catch (err) {
     process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
     return '';
@@ -4347,7 +5662,11 @@ async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv = proc
   return '';
 }
 
-async function isTaskApprovedForExecution(teamName: string, taskId: string, cwd: string): Promise<boolean> {
+async function isTaskApprovedForExecution(
+  teamName: string,
+  taskId: string,
+  cwd: string,
+): Promise<boolean> {
   const record = await readTaskApproval(teamName, taskId, cwd);
   return record?.status === 'approved';
 }
@@ -4362,7 +5681,11 @@ async function emitMonitorDerivedEvents(
 ): Promise<void> {
   for (const task of tasks) {
     const prevStatus = previous?.taskStatusById[task.id];
-    if (prevStatus && prevStatus !== 'completed' && task.status === 'completed') {
+    if (
+      prevStatus &&
+      prevStatus !== 'completed' &&
+      task.status === 'completed'
+    ) {
       // Skip if a task_completed event was already emitted by transitionTaskStatus (issue #161).
       if (previous?.completedEventTaskIds?.[task.id]) continue;
       await appendTeamEvent(
@@ -4374,15 +5697,19 @@ async function emitMonitorDerivedEvents(
           message_id: null,
           reason: undefined,
         },
-        cwd
+        cwd,
       );
     }
   }
 
   for (const worker of workers) {
     const prevAlive = previous?.workerAliveByName[worker.name];
-    const shouldEmitInitialPromptWorkerStop = workerLaunchMode === 'prompt' && prevAlive === undefined;
-    if ((prevAlive === true || shouldEmitInitialPromptWorkerStop) && worker.alive === false) {
+    const shouldEmitInitialPromptWorkerStop =
+      workerLaunchMode === 'prompt' && prevAlive === undefined;
+    if (
+      (prevAlive === true || shouldEmitInitialPromptWorkerStop) &&
+      worker.alive === false
+    ) {
       await appendTeamEvent(
         teamName,
         {
@@ -4392,7 +5719,7 @@ async function emitMonitorDerivedEvents(
           message_id: null,
           reason: worker.status.reason,
         },
-        cwd
+        cwd,
       );
        await emitCanonicalWorkerEvent(cwd, 'worker.stalled', {
         worker: worker.name,
@@ -4415,13 +5742,20 @@ async function emitMonitorDerivedEvents(
           state: worker.status.state,
           prev_state: prevState,
         },
-        cwd
+        cwd,
       );
-       if (worker.status.state === 'working' && (prevState === 'blocked' || prevState === 'failed' || prevState === 'unknown')) {
+      if (
+        worker.status.state === 'working' &&
+        (prevState === 'blocked' ||
+          prevState === 'failed' ||
+          prevState === 'unknown')
+      ) {
         await emitCanonicalWorkerEvent(cwd, 'worker.recovered', {
           worker: worker.name,
           task_id: worker.status.current_task_id,
-          reason: worker.status.reason || `state_transition:${prevState}->${worker.status.state}`,
+          reason:
+            worker.status.reason ||
+            `state_transition:${prevState}->${worker.status.state}`,
           recovery: 'state_transition',
           status: 'worker.recovered',
         });
@@ -4441,22 +5775,39 @@ async function emitMonitorDerivedEvents(
           state: 'idle',
           source_type: 'worker_idle',
         },
-        cwd
+        cwd,
       );
     }
   }
 }
 
-async function notifyWorkerOutcome(config: TeamConfig, workerIndex: number, message: string, workerPaneId?: string): Promise<DispatchOutcome> {
-  const worker = config.workers.find((candidate) => candidate.index === workerIndex);
-  if (!worker) return { ok: false, transport: 'none', reason: 'worker_not_found' };
+async function notifyWorkerOutcome(
+  config: TeamConfig,
+  workerIndex: number,
+  message: string,
+  workerPaneId?: string,
+): Promise<DispatchOutcome> {
+  const worker = config.workers.find(
+    (candidate) => candidate.index === workerIndex,
+  );
+  if (!worker)
+    return { ok: false, transport: 'none', reason: 'worker_not_found' };
 
   if (config.worker_launch_mode === 'prompt') {
     const handle = getPromptWorkerHandle(config.name, worker.name);
-    if (!handle) return { ok: false, transport: 'prompt_stdin', reason: 'prompt_worker_handle_missing' };
+    if (!handle)
+      return {
+        ok: false,
+        transport: 'prompt_stdin',
+        reason: 'prompt_worker_handle_missing',
+      };
     try {
       sendToWorkerStdin(handle.child.stdin, message);
-      return { ok: true, transport: 'prompt_stdin', reason: 'prompt_stdin_sent' };
+      return {
+        ok: true,
+        transport: 'prompt_stdin',
+        reason: 'prompt_stdin_sent',
+      };
     } catch (error) {
       return {
         ok: false,
@@ -4467,11 +5818,25 @@ async function notifyWorkerOutcome(config: TeamConfig, workerIndex: number, mess
   }
 
   if (!config.tmux_session || !isTmuxAvailable()) {
-    return { ok: false, transport: 'tmux_send_keys', reason: 'tmux_unavailable' };
+    return {
+      ok: false,
+      transport: 'tmux_send_keys',
+      reason: 'tmux_unavailable',
+    };
   }
   try {
-    await sendToWorker(config.tmux_session, workerIndex, message, workerPaneId, worker.worker_cli);
-    return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
+    await sendToWorker(
+      config.tmux_session,
+      workerIndex,
+      message,
+      workerPaneId,
+      worker.worker_cli,
+    );
+    return {
+      ok: true,
+      transport: 'tmux_send_keys',
+      reason: 'tmux_send_keys_sent',
+    };
   } catch (error) {
     return {
       ok: false,
@@ -4486,7 +5851,8 @@ function resolveDispatchPolicy(
   workerLaunchMode: TeamConfig['worker_launch_mode'],
 ): TeamPolicy {
   return normalizeTeamPolicy(manifestPolicy, {
-    display_mode: manifestPolicy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
+    display_mode:
+      manifestPolicy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
     worker_launch_mode: workerLaunchMode,
   });
 }
@@ -4497,10 +5863,12 @@ function isLeaderPaneMissingMailboxPersistedOutcome(params: {
   outcome: DispatchOutcome;
 }): boolean {
   const { workerName, paneId, outcome } = params;
-  return workerName === 'leader-fixed'
-    && !paneId
-    && outcome.ok
-    && outcome.reason === 'leader_pane_missing_mailbox_persisted';
+  return (
+    workerName === 'leader-fixed' &&
+    !paneId &&
+    outcome.ok &&
+    outcome.reason === 'leader_pane_missing_mailbox_persisted'
+  );
 }
 
 async function markDispatchRequestLeaderPaneMissingDeferred(params: {
@@ -4526,7 +5894,6 @@ async function markDispatchRequestLeaderPaneMissingDeferred(params: {
     cwd,
   ).catch(() => {});
 }
-
 
 async function attemptStartupDirectTrigger(params: {
   teamName: string;
@@ -4557,7 +5924,12 @@ async function attemptStartupDirectTrigger(params: {
     timing,
   } = params;
 
-  const safety = await evaluateStartupDirectTriggerSafety(config.tmux_session, workerIndex, paneId, workerCli);
+  const safety = await evaluateStartupDirectTriggerSafety(
+    config.tmux_session,
+    workerIndex,
+    paneId,
+    workerCli,
+  );
   if (!safety.safe) {
     timing.mark('startup_direct_bypass', {
       worker: workerName,
@@ -4580,7 +5952,8 @@ async function attemptStartupDirectTrigger(params: {
     transportPreference: 'transport_direct',
     fallbackAllowed: false,
     inboxCorrelationKey: `startup-direct:${workerName}`,
-    notify: (_target, message) => notifyWorkerOutcome(config, workerIndex, message, paneId),
+    notify: (_target, message) =>
+      notifyWorkerOutcome(config, workerIndex, message, paneId),
   });
   timing.mark('dispatch_queued', {
     worker: workerName,
@@ -4594,7 +5967,9 @@ async function attemptStartupDirectTrigger(params: {
     worker: workerName,
     pane_id: paneId,
     ok: queued.ok,
-    reason: queued.ok ? `startup_direct_trigger_sent:${safety.reason}` : queued.reason,
+    reason: queued.ok
+      ? `startup_direct_trigger_sent:${safety.reason}`
+      : queued.reason,
     transport: queued.transport,
     request_id: queued.request_id,
   });
@@ -4618,10 +5993,14 @@ async function attemptStartupDirectTrigger(params: {
     request_id: queued.request_id,
   });
 
-  const reason = workerStartupEvidence === 'none'
+  const reason =
+    workerStartupEvidence === 'none'
     ? `${effectiveWorkerCli}_startup_direct_no_evidence:${safety.reason}`
     : `startup_direct_trigger_sent:${safety.reason}`;
-  if ((effectiveWorkerCli === 'codex' || effectiveWorkerCli === 'claude') && workerStartupEvidence === 'none') {
+  if (
+    (effectiveWorkerCli === 'codex' || effectiveWorkerCli === 'claude') &&
+    workerStartupEvidence === 'none'
+  ) {
     await recordRecoverableStartupIssue({
       teamName,
       workerName,
@@ -4678,8 +6057,15 @@ async function dispatchCriticalInboxInstruction(params: {
     startupReadyPromptObserved = false,
     startupTiming,
   } = params;
-  const noteTiming = (phase: StartupTimingPhase, details?: Omit<StartupTimingEvent, 'phase' | 'at' | 'elapsed_ms'>) => {
-    startupTiming?.mark(phase, { worker: workerName, pane_id: paneId, ...details });
+  const noteTiming = (
+    phase: StartupTimingPhase,
+    details?: Omit<StartupTimingEvent, 'phase' | 'at' | 'elapsed_ms'>,
+  ) => {
+    startupTiming?.mark(phase, {
+      worker: workerName,
+      pane_id: paneId,
+      ...details,
+    });
   };
 
   if (config.worker_launch_mode === 'prompt') {
@@ -4695,7 +6081,8 @@ async function dispatchCriticalInboxInstruction(params: {
       transportPreference: 'prompt_stdin',
       fallbackAllowed: false,
       inboxCorrelationKey,
-      notify: (_target, message) => notifyWorkerOutcome(config, workerIndex, message, paneId),
+      notify: (_target, message) =>
+        notifyWorkerOutcome(config, workerIndex, message, paneId),
     });
   }
 
@@ -4712,7 +6099,8 @@ async function dispatchCriticalInboxInstruction(params: {
       transportPreference: 'transport_direct',
       fallbackAllowed: false,
       inboxCorrelationKey,
-      notify: (_target, message) => notifyWorkerOutcome(config, workerIndex, message, paneId),
+      notify: (_target, message) =>
+        notifyWorkerOutcome(config, workerIndex, message, paneId),
     });
   }
 
@@ -4728,7 +6116,11 @@ async function dispatchCriticalInboxInstruction(params: {
     transportPreference: 'hook_preferred_with_fallback',
     fallbackAllowed: true,
     inboxCorrelationKey,
-    notify: () => ({ ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' }),
+    notify: () => ({
+      ok: true,
+      transport: 'hook',
+      reason: 'queued_for_hook_dispatch',
+    }),
   });
   noteTiming('dispatch_queued', {
     ok: queued.ok,
@@ -4737,12 +6129,18 @@ async function dispatchCriticalInboxInstruction(params: {
     request_id: queued.request_id,
   });
 
-  if (!queued.request_id) return { ...queued, ok: false, reason: 'dispatch_request_missing_id' };
+  if (!queued.request_id)
+    return { ...queued, ok: false, reason: 'dispatch_request_missing_id' };
 
-  const receipt = await waitForDispatchReceipt(teamName, queued.request_id, cwd, {
+  const receipt = await waitForDispatchReceipt(
+    teamName,
+    queued.request_id,
+    cwd,
+    {
     timeoutMs: dispatchPolicy.dispatch_ack_timeout_ms,
     pollMs: 50,
-  });
+    },
+  );
   if (receipt) {
     noteTiming('hook_receipt', {
       ok: receipt.status === 'delivered' || receipt.status === 'notified',
@@ -4752,14 +6150,25 @@ async function dispatchCriticalInboxInstruction(params: {
     });
   }
   if (receipt?.status === 'delivered') {
-    return { ok: true, transport: 'hook', reason: 'hook_receipt_delivered', request_id: queued.request_id };
+    return {
+      ok: true,
+      transport: 'hook',
+      reason: 'hook_receipt_delivered',
+      request_id: queued.request_id,
+    };
   }
-  const requiresObservedStartupEvidence = requireWorkerStartupEvidence === true
-    && (workerCli === 'claude' || workerCli === 'codex');
+  const requiresObservedStartupEvidence =
+    requireWorkerStartupEvidence === true &&
+    (workerCli === 'claude' || workerCli === 'codex');
   let startupEvidence: WorkerStartupEvidence = 'none';
   if (receipt?.status === 'notified') {
     if (!requiresObservedStartupEvidence) {
-      return { ok: true, transport: 'hook', reason: 'hook_receipt_notified', request_id: queued.request_id };
+      return {
+        ok: true,
+        transport: 'hook',
+        reason: 'hook_receipt_notified',
+        request_id: queued.request_id,
+      };
     }
     if (startupReadyPromptObserved) {
       return {
@@ -4792,7 +6201,12 @@ async function dispatchCriticalInboxInstruction(params: {
     }
   }
   if (receipt?.status === 'failed') {
-    const fallback = await notifyWorkerOutcome(config, workerIndex, triggerMessage, paneId);
+    const fallback = await notifyWorkerOutcome(
+      config,
+      workerIndex,
+      triggerMessage,
+      paneId,
+    );
     if (fallback.ok) {
       const fallbackStartupEvidence = startupReadyPromptObserved
         ? 'ready_prompt'
@@ -4810,13 +6224,18 @@ async function dispatchCriticalInboxInstruction(params: {
         transport: fallback.transport,
         request_id: queued.request_id,
       });
-      if (requiresObservedStartupEvidence && fallbackStartupEvidence === 'none') {
+      if (
+        requiresObservedStartupEvidence &&
+        fallbackStartupEvidence === 'none'
+      ) {
         await transitionDispatchRequest(
           teamName,
           queued.request_id,
           'failed',
           'failed',
-          { last_reason: `${workerCli}_startup_no_evidence_after_fallback:${fallback.reason}` },
+          {
+            last_reason: `${workerCli}_startup_no_evidence_after_fallback:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => {});
         return {
@@ -4826,14 +6245,20 @@ async function dispatchCriticalInboxInstruction(params: {
           request_id: queued.request_id,
         };
       }
-      const current = await readDispatchRequest(teamName, queued.request_id, cwd);
+      const current = await readDispatchRequest(
+        teamName,
+        queued.request_id,
+        cwd,
+      );
       if (current) {
         await transitionDispatchRequest(
           teamName,
           queued.request_id,
           current.status,
           'failed',
-          { last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` },
+          {
+            last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => {});
       }
@@ -4860,14 +6285,20 @@ async function dispatchCriticalInboxInstruction(params: {
     };
   }
 
-  const fallback = await notifyWorkerOutcome(config, workerIndex, triggerMessage, paneId);
+  const fallback = await notifyWorkerOutcome(
+    config,
+    workerIndex,
+    triggerMessage,
+    paneId,
+  );
   noteTiming('direct_fallback', {
     ok: fallback.ok,
     reason: fallback.reason,
     transport: fallback.transport,
     request_id: queued.request_id,
   });
-  const startupFallbackLabel = receipt?.status === 'notified' && requiresObservedStartupEvidence
+  const startupFallbackLabel =
+    receipt?.status === 'notified' && requiresObservedStartupEvidence
     ? `${workerCli}_startup_no_evidence`
     : null;
   const fallbackFailureReason = startupFallbackLabel
@@ -4891,14 +6322,20 @@ async function dispatchCriticalInboxInstruction(params: {
       request_id: queued.request_id,
     });
     if (requiresObservedStartupEvidence && fallbackStartupEvidence === 'none') {
-      const current = await readDispatchRequest(teamName, queued.request_id, cwd);
+      const current = await readDispatchRequest(
+        teamName,
+        queued.request_id,
+        cwd,
+      );
       if (current && current.status !== 'failed') {
         await transitionDispatchRequest(
           teamName,
           queued.request_id,
           current.status,
           'failed',
-          { last_reason: `${workerCli}_startup_no_evidence_after_fallback:${fallback.reason}` },
+          {
+            last_reason: `${workerCli}_startup_no_evidence_after_fallback:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => {});
       }
@@ -4916,14 +6353,20 @@ async function dispatchCriticalInboxInstruction(params: {
       cwd,
     );
     if (!marked) {
-      const current = await readDispatchRequest(teamName, queued.request_id, cwd);
+      const current = await readDispatchRequest(
+        teamName,
+        queued.request_id,
+        cwd,
+      );
       if (current) {
         await transitionDispatchRequest(
           teamName,
           queued.request_id,
           current.status,
           'failed',
-          { last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` },
+          {
+            last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => {});
       }
@@ -4973,8 +6416,9 @@ async function waitForRequiredStartupEvidenceAfterDirectFallback(params: {
     cwd,
     timeoutMs,
   } = params;
-  const requiresObservedStartupEvidence = requireWorkerStartupEvidence === true
-    && (workerCli === 'claude' || workerCli === 'codex');
+  const requiresObservedStartupEvidence =
+    requireWorkerStartupEvidence === true &&
+    (workerCli === 'claude' || workerCli === 'codex');
   if (!requiresObservedStartupEvidence || !workerCli) {
     return 'none';
   }
@@ -5019,21 +6463,42 @@ async function finalizeHookPreferredMailboxDispatch(params: {
     timeoutMs: dispatchPolicy.dispatch_ack_timeout_ms,
     pollMs: 50,
   });
-  if (receipt && (receipt.status === 'notified' || receipt.status === 'delivered')) {
-    await markMessageNotified(teamName, workerName, messageId, cwd).catch(() => false);
-    const outcome = { ok: true, transport: 'hook', reason: `hook_receipt_${receipt.status}`, request_id: requestId, message_id: messageId } as const;
-    await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+  if (
+    receipt &&
+    (receipt.status === 'notified' || receipt.status === 'delivered')
+  ) {
+    await markMessageNotified(teamName, workerName, messageId, cwd).catch(
+      () => false,
+    );
+    const outcome = {
+      ok: true,
+      transport: 'hook',
+      reason: `hook_receipt_${receipt.status}`,
+      request_id: requestId,
+      message_id: messageId,
+    } as const;
+    await logRuntimeDispatchOutcome({
+      cwd,
+      teamName,
+      workerName,
+      requestId,
+      messageId,
+      intent,
+      outcome,
+    });
     return outcome;
   }
 
   const fallback: DispatchOutcome = fallbackNotify
     ? await fallbackNotify()
-    : (typeof workerIndex === 'number'
+    : typeof workerIndex === 'number'
       ? await notifyWorkerOutcome(config, workerIndex, triggerMessage, paneId)
-      : { ok: false, transport: 'none', reason: 'missing_worker_index' });
+      : { ok: false, transport: 'none', reason: 'missing_worker_index' };
   if (receipt?.status === 'failed') {
     if (fallback.ok) {
-      await markMessageNotified(teamName, workerName, messageId, cwd).catch(() => false);
+      await markMessageNotified(teamName, workerName, messageId, cwd).catch(
+        () => false,
+      );
       const current = await readDispatchRequest(teamName, requestId, cwd);
       if (current) {
         await transitionDispatchRequest(
@@ -5041,7 +6506,10 @@ async function finalizeHookPreferredMailboxDispatch(params: {
           requestId,
           current.status,
           'failed',
-          { message_id: messageId, last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` },
+          {
+            message_id: messageId,
+            last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => null);
       }
@@ -5052,7 +6520,15 @@ async function finalizeHookPreferredMailboxDispatch(params: {
         request_id: requestId,
         message_id: messageId,
       } as const;
-      await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+      await logRuntimeDispatchOutcome({
+        cwd,
+        teamName,
+        workerName,
+        requestId,
+        messageId,
+        intent,
+        outcome,
+      });
       return outcome;
     }
     await transitionDispatchRequest(
@@ -5060,7 +6536,10 @@ async function finalizeHookPreferredMailboxDispatch(params: {
       requestId,
       'failed',
       'failed',
-      { message_id: messageId, last_reason: `fallback_attempted_but_unconfirmed:${fallback.reason}` },
+      {
+        message_id: messageId,
+        last_reason: `fallback_attempted_but_unconfirmed:${fallback.reason}`,
+      },
       cwd,
     ).catch(() => {});
     const outcome = {
@@ -5070,12 +6549,26 @@ async function finalizeHookPreferredMailboxDispatch(params: {
       request_id: requestId,
       message_id: messageId,
     } as const;
-    await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+    await logRuntimeDispatchOutcome({
+      cwd,
+      teamName,
+      workerName,
+      requestId,
+      messageId,
+      intent,
+      outcome,
+    });
     return outcome;
   }
 
   if (fallback.ok) {
-    if (isLeaderPaneMissingMailboxPersistedOutcome({ workerName, paneId, outcome: fallback })) {
+    if (
+      isLeaderPaneMissingMailboxPersistedOutcome({
+        workerName,
+        paneId,
+        outcome: fallback,
+      })
+    ) {
       await markDispatchRequestLeaderPaneMissingDeferred({
         teamName,
         requestId,
@@ -5089,15 +6582,28 @@ async function finalizeHookPreferredMailboxDispatch(params: {
         request_id: requestId,
         message_id: messageId,
       } as const;
-      await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+      await logRuntimeDispatchOutcome({
+        cwd,
+        teamName,
+        workerName,
+        requestId,
+        messageId,
+        intent,
+        outcome,
+      });
       return outcome;
     }
 
-    await markMessageNotified(teamName, workerName, messageId, cwd).catch(() => false);
+    await markMessageNotified(teamName, workerName, messageId, cwd).catch(
+      () => false,
+    );
     const marked = await markDispatchRequestNotified(
       teamName,
       requestId,
-      { message_id: messageId, last_reason: `fallback_confirmed:${fallback.reason}` },
+      {
+        message_id: messageId,
+        last_reason: `fallback_confirmed:${fallback.reason}`,
+      },
       cwd,
     );
     if (!marked) {
@@ -5108,7 +6614,10 @@ async function finalizeHookPreferredMailboxDispatch(params: {
           requestId,
           current.status,
           'failed',
-          { message_id: messageId, last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` },
+          {
+            message_id: messageId,
+            last_reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}`,
+          },
           cwd,
         ).catch(() => {});
       }
@@ -5120,7 +6629,15 @@ async function finalizeHookPreferredMailboxDispatch(params: {
       request_id: requestId,
       message_id: messageId,
     } as const;
-    await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+    await logRuntimeDispatchOutcome({
+      cwd,
+      teamName,
+      workerName,
+      requestId,
+      messageId,
+      intent,
+      outcome,
+    });
     return outcome;
   }
 
@@ -5131,7 +6648,10 @@ async function finalizeHookPreferredMailboxDispatch(params: {
       requestId,
       current.status,
       'failed',
-      { message_id: messageId, last_reason: `fallback_attempted_but_unconfirmed:${fallback.reason}` },
+      {
+        message_id: messageId,
+        last_reason: `fallback_attempted_but_unconfirmed:${fallback.reason}`,
+      },
       cwd,
     ).catch(() => {});
   }
@@ -5142,21 +6662,46 @@ async function finalizeHookPreferredMailboxDispatch(params: {
     request_id: requestId,
     message_id: messageId,
   } as const;
-  await logRuntimeDispatchOutcome({ cwd, teamName, workerName, requestId, messageId, intent, outcome });
+  await logRuntimeDispatchOutcome({
+    cwd,
+    teamName,
+    workerName,
+    requestId,
+    messageId,
+    intent,
+    outcome,
+  });
   return outcome;
 }
 
-async function notifyLeaderAsync(config: TeamConfig, message: string, cwd: string): Promise<DispatchOutcome> {
+async function notifyLeaderAsync(
+  config: TeamConfig,
+  message: string,
+  cwd: string,
+): Promise<DispatchOutcome> {
   // Canonical leader delivery is durable mailbox persistence plus HUD-owned
   // authority processing. Team runtime must not directly inject into the
   // leader pane from this fallback path.
   const { notifyLeaderMailboxAsync } = await import('./tmux-session.js');
-  const persisted = await notifyLeaderMailboxAsync(config.name, 'system', message, cwd);
+  const persisted = await notifyLeaderMailboxAsync(
+    config.name,
+    'system',
+    message,
+    cwd,
+  );
   if (!persisted) {
-    return { ok: false, transport: 'mailbox', reason: 'leader_mailbox_notify_failed' };
+    return {
+      ok: false,
+      transport: 'mailbox',
+      reason: 'leader_mailbox_notify_failed',
+    };
   }
   if (!config.leader_pane_id) {
-    return { ok: true, transport: 'mailbox', reason: 'leader_pane_missing_mailbox_persisted' };
+    return {
+      ok: true,
+      transport: 'mailbox',
+      reason: 'leader_pane_missing_mailbox_persisted',
+    };
   }
   return { ok: true, transport: 'mailbox', reason: 'leader_mailbox_notified' };
 }
@@ -5184,7 +6729,8 @@ async function deliverPendingMailboxMessages(
 
     // Preserve already-tracked notification timestamps in the next snapshot.
     for (const msg of pending) {
-      nextNotifications[msg.message_id] = msg.notified_at || previousNotifications[msg.message_id] || '';
+      nextNotifications[msg.message_id] =
+        msg.notified_at || previousNotifications[msg.message_id] || '';
     }
 
     // Only notify for messages that have never been successfully notified.
@@ -5222,7 +6768,10 @@ async function deliverPendingMailboxMessages(
   return pruned;
 }
 
-type RuntimeMailboxTransportPreference = 'prompt_stdin' | 'transport_direct' | 'hook_preferred_with_fallback';
+type RuntimeMailboxTransportPreference =
+  | 'prompt_stdin'
+  | 'transport_direct'
+  | 'hook_preferred_with_fallback';
 
 function resolveWorkerMailboxTransportPreference(
   config: TeamConfig,
@@ -5230,16 +6779,22 @@ function resolveWorkerMailboxTransportPreference(
 ): RuntimeMailboxTransportPreference {
   return config.worker_launch_mode === 'prompt'
     ? 'prompt_stdin'
-    : (dispatchPolicy.dispatch_mode === 'transport_direct' ? 'transport_direct' : 'hook_preferred_with_fallback');
+    : dispatchPolicy.dispatch_mode === 'transport_direct'
+      ? 'transport_direct'
+      : 'hook_preferred_with_fallback';
 }
 
 function resolveLeaderMailboxTransportPreference(
   dispatchPolicy: TeamPolicy,
 ): Exclude<RuntimeMailboxTransportPreference, 'prompt_stdin'> {
-  return dispatchPolicy.dispatch_mode === 'transport_direct' ? 'transport_direct' : 'hook_preferred_with_fallback';
+  return dispatchPolicy.dispatch_mode === 'transport_direct'
+    ? 'transport_direct'
+    : 'hook_preferred_with_fallback';
 }
 
-function isExistingMailboxNotificationOutcome(outcome: DispatchOutcome): boolean {
+function isExistingMailboxNotificationOutcome(
+  outcome: DispatchOutcome,
+): boolean {
   return outcome.ok && outcome.reason === 'existing_message_already_notified';
 }
 
@@ -5252,14 +6807,25 @@ async function dispatchPendingMailboxMessage(params: {
   dispatchPolicy: TeamPolicy;
   cwd: string;
 }): Promise<DispatchOutcome> {
-  const { teamName, workerName, workerInfo, messageId, config, dispatchPolicy, cwd } = params;
+  const {
+    teamName,
+    workerName,
+    workerInfo,
+    messageId,
+    config,
+    dispatchPolicy,
+    cwd,
+  } = params;
   const triggerDirective = buildMailboxTriggerDirective(
     workerName,
     teamName,
     1,
     resolveInstructionStateRoot(workerInfo.worktree_path),
   );
-  const transportPreference = resolveWorkerMailboxTransportPreference(config, dispatchPolicy);
+  const transportPreference = resolveWorkerMailboxTransportPreference(
+    config,
+    dispatchPolicy,
+  );
   const queued = await enqueueDispatchRequest(
     teamName,
     {
@@ -5299,10 +6865,21 @@ async function dispatchPendingMailboxMessage(params: {
     });
   }
 
-  const direct = await notifyWorkerOutcome(config, workerInfo.index, triggerDirective.text, workerInfo.pane_id);
-  const outcome: DispatchOutcome = { ...direct, request_id: queued.request.request_id, message_id: messageId };
+  const direct = await notifyWorkerOutcome(
+    config,
+    workerInfo.index,
+    triggerDirective.text,
+    workerInfo.pane_id,
+  );
+  const outcome: DispatchOutcome = {
+    ...direct,
+    request_id: queued.request.request_id,
+    message_id: messageId,
+  };
   if (outcome.ok) {
-    await markMessageNotified(teamName, workerName, messageId, cwd).catch(() => false);
+    await markMessageNotified(teamName, workerName, messageId, cwd).catch(
+      () => false,
+    );
     await markDispatchRequestNotified(
       teamName,
       queued.request.request_id,
@@ -5359,7 +6936,11 @@ async function finalizeQueuedMailboxDispatch(params: {
     return queuedOutcome;
   }
   if (!queuedOutcome.request_id || !messageId) {
-    return { ...queuedOutcome, ok: false, reason: 'dispatch_request_missing_id' };
+    return {
+      ...queuedOutcome,
+      ok: false,
+      reason: 'dispatch_request_missing_id',
+    };
   }
 
   return await finalizeHookPreferredMailboxDispatch({
@@ -5392,7 +6973,8 @@ async function sendLeaderMailboxMessage(params: {
     fromWorker,
     config.team_state_root || undefined,
   );
-  const transportPreference = resolveLeaderMailboxTransportPreference(dispatchPolicy);
+  const transportPreference =
+    resolveLeaderMailboxTransportPreference(dispatchPolicy);
   const queuedOutcome = await queueDirectMailboxMessage({
     teamName,
     fromWorker,
@@ -5406,19 +6988,27 @@ async function sendLeaderMailboxMessage(params: {
     fallbackAllowed: transportPreference === 'hook_preferred_with_fallback',
     notify: async (_target, message) => {
       if (transportPreference === 'hook_preferred_with_fallback') {
-        return { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' };
+        return {
+          ok: true,
+          transport: 'hook',
+          reason: 'queued_for_hook_dispatch',
+        };
       }
       if (!config.leader_pane_id) {
-        return { ok: false, transport: 'mailbox', reason: 'leader_pane_missing_transport_direct_failed' };
+        return {
+          ok: false,
+          transport: 'mailbox',
+          reason: 'leader_pane_missing_transport_direct_failed',
+        };
       }
       return await notifyLeaderAsync(config, message, cwd);
     },
   });
 
   if (
-    !isExistingMailboxNotificationOutcome(queuedOutcome)
-    && transportPreference === 'hook_preferred_with_fallback'
-    && !config.leader_pane_id
+    !isExistingMailboxNotificationOutcome(queuedOutcome) &&
+    transportPreference === 'hook_preferred_with_fallback' &&
+    !config.leader_pane_id
   ) {
     if (queuedOutcome.request_id) {
       await markDispatchRequestLeaderPaneMissingDeferred({
@@ -5447,9 +7037,9 @@ async function sendLeaderMailboxMessage(params: {
   }
 
   if (
-    !isExistingMailboxNotificationOutcome(queuedOutcome)
-    && transportPreference === 'transport_direct'
-    && !config.leader_pane_id
+    !isExistingMailboxNotificationOutcome(queuedOutcome) &&
+    transportPreference === 'transport_direct' &&
+    !config.leader_pane_id
   ) {
     const failedOutcome: DispatchOutcome = {
       ...queuedOutcome,
@@ -5469,10 +7059,13 @@ async function sendLeaderMailboxMessage(params: {
     return failedOutcome;
   }
 
-  const canLeaderFallbackDirectly = Boolean(config.leader_pane_id) && isTmuxAvailable();
+  const canLeaderFallbackDirectly =
+    Boolean(config.leader_pane_id) && isTmuxAvailable();
   return await finalizeQueuedMailboxDispatch({
     queuedOutcome,
-    transportPreference: canLeaderFallbackDirectly ? transportPreference : 'transport_direct',
+    transportPreference: canLeaderFallbackDirectly
+      ? transportPreference
+      : 'transport_direct',
     teamName,
     workerName: 'leader-fixed',
     paneId: config.leader_pane_id ?? undefined,
@@ -5482,7 +7075,8 @@ async function sendLeaderMailboxMessage(params: {
     config,
     dispatchPolicy,
     cwd,
-    fallbackNotify: async () => await notifyLeaderAsync(config, triggerDirective.text, cwd),
+    fallbackNotify: async () =>
+      await notifyLeaderAsync(config, triggerDirective.text, cwd),
   });
 }
 
@@ -5495,7 +7089,8 @@ async function sendRecipientMailboxMessage(params: {
   dispatchPolicy: TeamPolicy;
   cwd: string;
 }): Promise<DispatchOutcome> {
-  const { teamName, fromWorker, toWorker, body, config, dispatchPolicy, cwd } = params;
+  const { teamName, fromWorker, toWorker, body, config, dispatchPolicy, cwd } =
+    params;
   const recipient = config.workers.find((worker) => worker.name === toWorker);
   if (!recipient) throw new Error(`Worker ${toWorker} not found in team`);
 
@@ -5505,7 +7100,10 @@ async function sendRecipientMailboxMessage(params: {
     1,
     resolveInstructionStateRoot(recipient.worktree_path),
   );
-  const transportPreference = resolveWorkerMailboxTransportPreference(config, dispatchPolicy);
+  const transportPreference = resolveWorkerMailboxTransportPreference(
+    config,
+    dispatchPolicy,
+  );
   const queuedOutcome = await queueDirectMailboxMessage({
     teamName,
     fromWorker,
@@ -5518,10 +7116,14 @@ async function sendRecipientMailboxMessage(params: {
     cwd,
     transportPreference,
     fallbackAllowed: transportPreference === 'hook_preferred_with_fallback',
-    notify: async (_target, message) => (
+    notify: async (_target, message) =>
       transportPreference === 'hook_preferred_with_fallback'
         ? { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' }
-        : await notifyWorkerOutcome(config, recipient.index, message, recipient.pane_id)
+        : await notifyWorkerOutcome(
+            config,
+            recipient.index,
+            message,
+            recipient.pane_id,
     ),
   });
 
@@ -5549,7 +7151,14 @@ async function finalizeBroadcastMailboxOutcomes(params: {
   dispatchPolicy: TeamPolicy;
   cwd: string;
 }): Promise<DispatchOutcome[]> {
-  const { teamName, outcomes, transportPreference, config, dispatchPolicy, cwd } = params;
+  const {
+    teamName,
+    outcomes,
+    transportPreference,
+    config,
+    dispatchPolicy,
+    cwd,
+  } = params;
   if (transportPreference !== 'hook_preferred_with_fallback') {
     return outcomes;
   }
@@ -5557,10 +7166,15 @@ async function finalizeBroadcastMailboxOutcomes(params: {
   const finalizedOutcomes: DispatchOutcome[] = [];
   for (const outcome of outcomes) {
     const target = outcome.to_worker
-      ? (config.workers.find((worker) => worker.name === outcome.to_worker) ?? null)
+      ? (config.workers.find((worker) => worker.name === outcome.to_worker) ??
+        null)
       : null;
     if (!target) {
-      finalizedOutcomes.push({ ...outcome, ok: false, reason: 'missing_worker_index' });
+      finalizedOutcomes.push({
+        ...outcome,
+        ok: false,
+        reason: 'missing_worker_index',
+      });
       continue;
     }
     const triggerDirective = buildMailboxTriggerDirective(
@@ -5569,7 +7183,8 @@ async function finalizeBroadcastMailboxOutcomes(params: {
       1,
       resolveInstructionStateRoot(target.worktree_path),
     );
-    finalizedOutcomes.push(await finalizeQueuedMailboxDispatch({
+    finalizedOutcomes.push(
+      await finalizeQueuedMailboxDispatch({
       queuedOutcome: outcome,
       transportPreference,
       teamName,
@@ -5582,7 +7197,8 @@ async function finalizeBroadcastMailboxOutcomes(params: {
       config,
       dispatchPolicy,
       cwd,
-    }));
+      }),
+    );
   }
 
   return finalizedOutcomes;
@@ -5599,7 +7215,10 @@ export async function sendWorkerMessage(
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) throw new Error(`Team ${sanitized} not found`);
   const manifest = await readTeamManifestV2(sanitized, cwd);
-  const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
+  const dispatchPolicy = resolveDispatchPolicy(
+    manifest?.policy,
+    config.worker_launch_mode,
+  );
 
   if (toWorker === 'leader-fixed') {
     const finalOutcome = await sendLeaderMailboxMessage({
@@ -5610,7 +7229,8 @@ export async function sendWorkerMessage(
       dispatchPolicy,
       cwd,
     });
-    if (!finalOutcome.ok) throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
+    if (!finalOutcome.ok)
+      throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
     return finalOutcome;
   }
 
@@ -5623,7 +7243,8 @@ export async function sendWorkerMessage(
     dispatchPolicy,
     cwd,
   });
-  if (!finalOutcome.ok) throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
+  if (!finalOutcome.ok)
+    throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
   return finalOutcome;
 }
 
@@ -5637,20 +7258,34 @@ export async function broadcastWorkerMessage(
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) throw new Error(`Team ${sanitized} not found`);
   const manifest = await readTeamManifestV2(sanitized, cwd);
-  const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
-  const transportPreference = resolveWorkerMailboxTransportPreference(config, dispatchPolicy);
+  const dispatchPolicy = resolveDispatchPolicy(
+    manifest?.policy,
+    config.worker_launch_mode,
+  );
+  const transportPreference = resolveWorkerMailboxTransportPreference(
+    config,
+    dispatchPolicy,
+  );
 
   const outcomes = await queueBroadcastMailboxMessage({
     teamName: sanitized,
     fromWorker,
-    recipients: config.workers.map((w) => ({ workerName: w.name, workerIndex: w.index, paneId: w.pane_id })),
+    recipients: config.workers.map((w) => ({
+      workerName: w.name,
+      workerIndex: w.index,
+      paneId: w.pane_id,
+    })),
     body,
     cwd,
-    triggerFor: (workerName) => buildMailboxTriggerDirective(
+    triggerFor: (workerName) =>
+      buildMailboxTriggerDirective(
       workerName,
       sanitized,
       1,
-      resolveInstructionStateRoot(config.workers.find((worker) => worker.name === workerName)?.worktree_path),
+        resolveInstructionStateRoot(
+          config.workers.find((worker) => worker.name === workerName)
+            ?.worktree_path,
+        ),
     ).text,
     intentFor: () => 'pending-mailbox-review',
     transportPreference,
@@ -5658,9 +7293,14 @@ export async function broadcastWorkerMessage(
     notify: async (target, message) =>
       transportPreference === 'hook_preferred_with_fallback'
         ? { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' }
-        : (typeof target.workerIndex === 'number'
-        ? await notifyWorkerOutcome(config, target.workerIndex, message, target.paneId)
-        : { ok: false, transport: 'none', reason: 'missing_worker_index' }),
+        : typeof target.workerIndex === 'number'
+          ? await notifyWorkerOutcome(
+              config,
+              target.workerIndex,
+              message,
+              target.paneId,
+            )
+          : { ok: false, transport: 'none', reason: 'missing_worker_index' },
   });
   const results = await finalizeBroadcastMailboxOutcomes({
     teamName: sanitized,
@@ -5672,6 +7312,8 @@ export async function broadcastWorkerMessage(
   });
   if (results.some((result) => !result.ok)) {
     const firstFailure = results.find((result) => !result.ok);
-    throw new Error(`mailbox_notify_failed:${firstFailure?.reason ?? 'unknown'}`);
+    throw new Error(
+      `mailbox_notify_failed:${firstFailure?.reason ?? 'unknown'}`,
+    );
   }
 }

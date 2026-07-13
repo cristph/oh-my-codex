@@ -1,35 +1,41 @@
 /**
- * Session lifecycle management.
+ * Session Lifecycle Manager for oh-my-codex
  *
- * The selected state root owns one canonical session pointer. Pointer writes are
- * serialized by an adjacent lock directory and become visible only after an
- * atomic rename of a transaction-owned temporary file.
+ * Tracks session start/end, detects stale sessions from crashed launches,
+ * and provides structured logging for session events.
  */
+
+import { constants, existsSync, readFileSync, readdirSync } from 'fs';
+import { lstat, open, readFile, stat, unlink } from 'fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import {
-  appendFile,
-  mkdir as nodeMkdir,
-  open,
-  readFile as nodeReadFile,
-  readdir as nodeReaddir,
-  rename as nodeRename,
-  rmdir as nodeRmdir,
-  rm,
-  unlink as nodeUnlink,
-  writeFile as nodeWriteFile,
-} from 'fs/promises';
-import { readFileSync } from 'fs';
-import { createHash, randomUUID } from 'crypto';
-import { dirname, join } from 'path';
-import { omxRoot, omxLogsDir, sameFilePath } from '../utils/paths.js';
-import {
-  getBaseStateDirWithSource,
-  resolveWorkingDirectoryForState,
-  type StateRootSource,
-} from '../mcp/state-paths.js';
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  appendStateAuthorityEvidence,
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  ensureAuthorityDirectory,
+  initializeStateAuthority,
+  isObservedCwdCompatibleWithStateAuthority,
+  readWorkspaceAuthorityAnchor,
+  resolveOrdinaryStateRoot,
+  resolveStateAuthorityForGuard,
+  resolveWorkspaceIdentity,
+  sameRootFilesystemIdentity,
+  stateAuthorityFilesystemPrimitiveForPlatform,
+  validateStateAuthorityTransportCapability,
+  withStateAuthorityTransaction,
+  type ResolvedStateAuthorityContext,
+  type RootFilesystemIdentity,
+  type SessionAliasSet,
+} from '../state/authority.js';
 
 export interface SessionState {
   session_id: string;
   native_session_id?: string;
+  // Native session replacement metadata used when Codex /new swaps the native
+  // session while the original OMX launch wrapper is still responsible for
+  // archiving/cleanup.
   previous_native_session_id?: string;
   native_session_switched_at?: string;
   owner_omx_session_id?: string;
@@ -44,219 +50,900 @@ export interface SessionState {
   tmux_pane_id?: string;
 }
 
-export interface SessionPointerContext {
-  cwd: string;
-  baseStateDir: string;
-  rootSource: StateRootSource;
-  sessionPath: string;
-  lockPath: string;
-}
-
-export type SessionPointerStatus =
-  | 'absent'
-  | 'usable'
-  | 'stale-dead'
-  | 'identity-indeterminate'
-  | 'malformed'
-  | 'foreign-cwd';
-
-export interface SessionPointerReadResult {
-  status: SessionPointerStatus;
-  state?: SessionState;
-  raw?: string;
-}
-
-export type SessionPointerTransactionOperation =
-  | 'pointer-context-resolve'
-  | 'state-dir-create'
-  | 'lock-acquire'
-  | 'lock-owner-publish'
-  | 'pointer-read'
-  | 'pointer-classify'
-  | 'pointer-temp-write'
-  | 'pointer-fsync'
-  | 'pointer-rename'
-  | 'owner-conflict'
-  | 'precommit-cleanup'
-  | 'lock-release';
-
-type AttemptedStateRootSource = StateRootSource | 'unresolved';
-type UnusableSessionPointerStatus = 'malformed' | 'foreign-cwd' | 'identity-indeterminate';
-
-export type SessionPointerCleanupPhase =
-  | 'remove-owner-temp'
-  | 'inspect-unpublished-lock'
-  | 'remove-unpublished-lock'
-  | 'remove-pointer-temp'
-  | 'token-check'
-  | 'rename'
-  | 'remove-release-dir';
-
-export interface SessionPointerSecondaryFailure {
-  operation: 'precommit-cleanup' | 'lock-release';
-  phase: SessionPointerCleanupPhase;
-  ownership: 'held' | 'released' | 'uncertain';
-  message: string;
-  cause?: unknown;
-  evidencePath?: string;
-}
-
-export interface SessionPointerAbortBase extends Error {
-  name: 'SessionPointerLaunchAbort';
-  committed: false;
-  cwd: string;
-  candidateSessionId?: string;
-  canonicalSessionId?: string;
-  reason: string;
-  cause?: unknown;
-}
-
-export interface SessionPointerContextAbort extends SessionPointerAbortBase {
-  code: 'session_pointer_context_failure';
-  operation: 'pointer-context-resolve';
-  attemptedRootSource: AttemptedStateRootSource;
-  pointerPath?: never;
-  lockPath?: never;
-  rootSource?: never;
-}
-
-export interface ResolvedSessionPointerAbort extends SessionPointerAbortBase {
-  code:
-    | 'session_pointer_lock_timeout'
-    | 'session_pointer_lock_recovery_required'
-    | 'session_pointer_unusable'
-    | 'session_pointer_owner_conflict'
-    | 'session_pointer_io_failure';
-  operation: Exclude<SessionPointerTransactionOperation, 'pointer-context-resolve'>;
-  pointerPath: string;
-  lockPath?: string;
-  rootSource: StateRootSource;
-  pointerStatus?: UnusableSessionPointerStatus;
-  lockOwnerStatus?: 'live' | 'dead' | 'reused' | 'identity-indeterminate' | 'missing' | 'malformed';
-  primaryOperation?: Exclude<
-    SessionPointerTransactionOperation,
-    'pointer-context-resolve' | 'precommit-cleanup' | 'lock-release'
-  >;
-  secondaryFailures?: readonly SessionPointerSecondaryFailure[];
-}
-
-export type SessionPointerLaunchAbort =
-  | SessionPointerContextAbort
-  | ResolvedSessionPointerAbort;
-
 const SESSION_FILE = 'session.json';
 const HISTORY_FILE = 'session-history.jsonl';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-const SESSION_POINTER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
-const SHA256_PATTERN = /^[a-f0-9]{64}$/;
-const LOCK_RETRY_DELAYS_MS = [25, 50, 100] as const;
-const DEFAULT_POINTER_TIMEOUT_MS = 5_000;
-const NATIVE_POINTER_TIMEOUT_MS = 2_000;
 
-/**
- * Convert arbitrary input into a valid session ID without exposing validator
- * exceptions to lifecycle or hook inputs.
- */
 export function normalizeSessionId(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return SESSION_ID_PATTERN.test(trimmed) ? trimmed : undefined;
 }
+// No age-based threshold: staleness is determined by PID liveness/identity.
+// Long-running sessions (>2h) are legitimate and should not be reaped.
 
-/** Resolve the one exact pointer path used by an operation. */
-export function resolveSessionPointerContext(cwd: string): SessionPointerContext {
-  const normalizedCwd = resolveWorkingDirectoryForState(cwd);
-  const { baseStateDir, rootSource } = getBaseStateDirWithSource(normalizedCwd);
-  const pointerPath = join(baseStateDir, SESSION_FILE);
+const SESSION_IO_SEGMENT_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+type SessionIoFileHandle = Awaited<ReturnType<typeof open>>;
+
+interface OpenedSessionIoDirectory {
+  /** Present only when Linux descriptor-relative mutation is available. */
+  handle?: SessionIoFileHandle;
+  /** Descriptor-relative on Linux; canonical path elsewhere. */
+  operationPath: string;
+  path: string;
+  device: number;
+  inode: number;
+}
+
+/**
+ * Session lifecycle I/O follows the authoritative state-root platform model:
+ * Linux uses descriptor-relative no-follow paths, while macOS and Windows
+ * use canonical paths with identity revalidation.
+ */
+export const sessionLifecycleFilesystemPrimitiveForPlatform = stateAuthorityFilesystemPrimitiveForPlatform;
+
+/** Windows requires open target handles to be closed before rename or unlink. */
+export function sessionLifecycleFileHandleMustCloseBeforeEffect(
+  effect: 'rename' | 'unlink',
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  switch (effect) {
+    case 'rename':
+    case 'unlink':
+      return platform === 'win32';
+    default:
+      return false;
+  }
+}
+
+interface SessionIoScope {
+  root: OpenedSessionIoDirectory;
+  parent: OpenedSessionIoDirectory;
+  rootPath: string;
+  rootIdentity: RootFilesystemIdentity;
+}
+
+/** Test-only lifecycle-I/O fault boundaries. They are never persisted. */
+export interface SessionFilesystemTestHooks {
+  beforeCaptureParentOmxIdentity?: (omxRoot: string) => void | Promise<void>;
+  beforeAtomicWriteRename?: (targetPath: string, temporaryPath: string) => void | Promise<void>;
+  beforeDelete?: (targetPath: string) => void | Promise<void>;
+}
+
+let sessionFilesystemTestHooks: SessionFilesystemTestHooks | undefined;
+
+export function setSessionFilesystemTestHooksForTests(hooks?: SessionFilesystemTestHooks): void {
+  sessionFilesystemTestHooks = hooks;
+}
+
+function sessionIoError(code: typeof AUTHORITY_DIAGNOSTIC_CODES[keyof typeof AUTHORITY_DIAGNOSTIC_CODES], message: string): never {
+  throw new StateAuthorityError(code, message);
+}
+
+function sameSessionIoStat(
+  left: { dev: number; ino: number },
+  right: { dev: number; ino: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertSessionIoTargetWithinRoot(root: string, target: string): void {
+  const relativeTarget = relative(root, target);
+  if (
+    relativeTarget === ''
+    || relativeTarget === '..'
+    || relativeTarget.startsWith('../')
+    || relativeTarget.startsWith('..\\')
+    || isAbsolute(relativeTarget)
+  ) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      `session lifecycle target escapes its committed authority root: ${target}`,
+    );
+  }
+}
+
+function noFollowSessionIoDirectoryFlags(): number {
+  const flags = sessionLifecycleFilesystemPrimitiveForPlatform().directory_open_flags;
+  if (flags === null) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'the Linux runtime does not expose no-follow directory opens for descriptor-relative session lifecycle I/O',
+    );
+  }
+  return flags;
+}
+
+function noFollowSessionIoFileFlags(): number {
+  const primitive = sessionLifecycleFilesystemPrimitiveForPlatform();
+  if (primitive.file_open_flags !== null) return primitive.file_open_flags;
+  if (primitive.descriptor_relative) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'the Linux runtime does not expose no-follow final-file opens for session lifecycle I/O',
+    );
+  }
+  return 0;
+}
+
+async function descriptorRelativeSessionIoDirectoryPath(handle: SessionIoFileHandle): Promise<string | null> {
+  if (!sessionLifecycleFilesystemPrimitiveForPlatform().descriptor_relative) return null;
+  const held = await handle.stat();
+  for (const candidate of [`/proc/self/fd/${handle.fd}`, `/dev/fd/${handle.fd}`]) {
+    try {
+      const details = await stat(candidate);
+      if (details.isDirectory() && sameSessionIoStat(details, held)) return candidate;
+    } catch {
+      // Try the next Linux descriptor namespace.
+    }
+  }
+  return null;
+}
+
+async function openSessionIoDirectory(
+  path: string,
+  label: string,
+  expected?: { dev: number; ino: number },
+): Promise<OpenedSessionIoDirectory> {
+  const primitive = sessionLifecycleFilesystemPrimitiveForPlatform();
+  const initial = await lstat(path);
+  if (initial.isSymbolicLink()) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} must not be a symbolic link: ${path}`);
+  }
+  if (!initial.isDirectory()) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} must be a directory: ${path}`);
+  }
+  if (expected && !sameSessionIoStat(initial, expected)) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `${label} changed before opening`);
+  }
+  if (!primitive.descriptor_relative) {
+    const current = await lstat(path);
+    if (
+      current.isSymbolicLink()
+      || !current.isDirectory()
+      || !sameSessionIoStat(initial, current)
+      || (expected !== undefined && !sameSessionIoStat(current, expected))
+    ) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `${label} changed while opening`);
+    }
+    return {
+      operationPath: path,
+      path,
+      device: current.dev,
+      inode: current.ino,
+    };
+  }
+
+  let handle: SessionIoFileHandle | undefined;
+  try {
+    handle = await open(path, noFollowSessionIoDirectoryFlags());
+    const held = await handle.stat();
+    const current = await lstat(path);
+    if (
+      current.isSymbolicLink()
+      || !current.isDirectory()
+      || !sameSessionIoStat(initial, held)
+      || !sameSessionIoStat(current, held)
+      || (expected !== undefined && !sameSessionIoStat(held, expected))
+    ) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `${label} changed while opening`);
+    }
+    const operationPath = await descriptorRelativeSessionIoDirectoryPath(handle);
+    if (!operationPath) {
+      sessionIoError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+        'the Linux runtime cannot address an opened session lifecycle directory descriptor',
+      );
+    }
+    return {
+      handle,
+      operationPath,
+      path,
+      device: held.dev,
+      inode: held.ino,
+    };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function assertOpenedSessionIoDirectoryCurrent(
+  directory: OpenedSessionIoDirectory,
+  label: string,
+): Promise<void> {
+  const current = await lstat(directory.path);
+  const expected = { dev: directory.device, ino: directory.inode };
+  const held = directory.handle ? await directory.handle.stat() : undefined;
+  if (
+    current.isSymbolicLink()
+    || !current.isDirectory()
+    || !sameSessionIoStat(current, expected)
+    || (held !== undefined && !sameSessionIoStat(held, expected))
+  ) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `${label} was replaced during session lifecycle I/O`);
+  }
+}
+
+async function assertSessionIoScopeCurrent(scope: SessionIoScope): Promise<void> {
+  await assertOpenedSessionIoDirectoryCurrent(scope.root, 'session lifecycle authority root');
+  const actualRootIdentity = await captureRootFilesystemIdentity(scope.rootPath);
+  if (!sameRootFilesystemIdentity(scope.rootIdentity, actualRootIdentity)) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'session lifecycle authority root fingerprint changed');
+  }
+  if (scope.parent !== scope.root) {
+    await assertOpenedSessionIoDirectoryCurrent(scope.parent, 'session lifecycle parent directory');
+  }
+}
+
+async function openSessionIoScope(
+  root: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  target: string,
+  ensureParent: boolean,
+): Promise<SessionIoScope> {
+  const rootPath = resolve(root);
+  const targetPath = resolve(target);
+  assertSessionIoTargetWithinRoot(rootPath, targetPath);
+  const parentPath = dirname(targetPath);
+  if (ensureParent) await ensureAuthorityDirectory(rootPath, parentPath);
+  const actualRootIdentity = await captureRootFilesystemIdentity(rootPath);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'session lifecycle authority root does not match its committed filesystem identity');
+  }
+
+  let openedRoot: OpenedSessionIoDirectory | undefined;
+  let current: OpenedSessionIoDirectory | undefined;
+  try {
+    openedRoot = await openSessionIoDirectory(rootPath, 'session lifecycle authority root', {
+      dev: Number(expectedRootIdentity.device),
+      ino: Number(expectedRootIdentity.inode),
+    });
+    current = openedRoot;
+    const relativeParent = relative(rootPath, parentPath);
+    const segments = relativeParent === '' ? [] : relativeParent.split(/[\\/]+/);
+    let canonicalCurrentPath = rootPath;
+    for (const segment of segments) {
+      if (!SESSION_IO_SEGMENT_PATTERN.test(segment)) {
+        sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `unsafe session lifecycle parent segment: ${segment}`);
+      }
+      const childPath = join(current.operationPath, segment);
+      canonicalCurrentPath = join(canonicalCurrentPath, segment);
+      const child = await openSessionIoDirectory(childPath, 'session lifecycle parent directory');
+      child.path = canonicalCurrentPath;
+      if (current !== openedRoot) await current.handle?.close();
+      current = child;
+    }
+    const scope = {
+      root: openedRoot,
+      parent: current,
+      rootPath,
+      rootIdentity: expectedRootIdentity,
+    };
+    await assertSessionIoScopeCurrent(scope);
+    return scope;
+  } catch (error) {
+    await current?.handle?.close().catch(() => undefined);
+    if (openedRoot && openedRoot !== current) await openedRoot.handle?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function closeSessionIoScope(scope: SessionIoScope): Promise<void> {
+  if (scope.parent !== scope.root) await scope.parent.handle?.close();
+  await scope.root.handle?.close();
+}
+
+async function readSessionIoFile(
+  root: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  target: string,
+): Promise<string | null> {
+  const scope = await openSessionIoScope(root, expectedRootIdentity, target, true);
+  const targetPath = join(scope.parent.operationPath, basename(target));
+  let handle: SessionIoFileHandle | undefined;
+  try {
+    await assertSessionIoScopeCurrent(scope);
+    let initial: Awaited<ReturnType<typeof lstat>>;
+    try {
+      initial = await lstat(targetPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    if (initial.isSymbolicLink()) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `session lifecycle file must not be a symbolic link: ${target}`);
+    }
+    if (!initial.isFile()) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `session lifecycle file must be regular: ${target}`);
+    }
+    try {
+      handle = await open(targetPath, constants.O_RDONLY | noFollowSessionIoFileFlags());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `session lifecycle file must not be a symbolic link: ${target}`);
+      }
+      throw error;
+    }
+    const held = await handle.stat();
+    const afterOpen = await lstat(targetPath);
+    if (
+      afterOpen.isSymbolicLink()
+      || !afterOpen.isFile()
+      || !sameSessionIoStat(initial, held)
+      || !sameSessionIoStat(afterOpen, held)
+    ) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `session lifecycle file changed while opening: ${target}`);
+    }
+    await assertSessionIoScopeCurrent(scope);
+    const content = await handle.readFile('utf-8');
+    const afterRead = await lstat(targetPath);
+    if (afterRead.isSymbolicLink() || !afterRead.isFile() || !sameSessionIoStat(afterRead, held)) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `session lifecycle file changed while reading: ${target}`);
+    }
+    await assertSessionIoScopeCurrent(scope);
+    return content;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await closeSessionIoScope(scope).catch(() => undefined);
+  }
+}
+
+async function writeSessionIoFile(
+  root: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  target: string,
+  content: string,
+): Promise<void> {
+  const scope = await openSessionIoScope(root, expectedRootIdentity, target, true);
+  await closeSessionIoScope(scope);
+  await atomicWriteAuthorityFile(target, content, {
+    authority_root: root,
+    expected_root_identity: expectedRootIdentity,
+    test_only_before_rename: async (temporaryPath) => {
+      await sessionFilesystemTestHooks?.beforeAtomicWriteRename?.(target, temporaryPath);
+    },
+  });
+}
+
+async function appendSessionIoFile(
+  root: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  target: string,
+  content: string,
+): Promise<void> {
+  const existing = await readSessionIoFile(root, expectedRootIdentity, target);
+  await writeSessionIoFile(root, expectedRootIdentity, target, `${existing ?? ''}${content}`);
+}
+
+async function deleteSessionIoFile(
+  root: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  target: string,
+): Promise<boolean> {
+  const actualRootIdentity = await captureRootFilesystemIdentity(resolve(root));
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'session lifecycle authority root does not match its committed filesystem identity');
+  }
+  let scope: SessionIoScope;
+  try {
+    scope = await openSessionIoScope(root, expectedRootIdentity, target, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const targetPath = join(scope.parent.operationPath, basename(target));
+  let handle: SessionIoFileHandle | undefined;
+  try {
+    await assertSessionIoScopeCurrent(scope);
+    let initial: Awaited<ReturnType<typeof lstat>>;
+    try {
+      initial = await lstat(targetPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (initial.isSymbolicLink()) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `session lifecycle delete target must not be a symbolic link: ${target}`);
+    }
+    if (!initial.isFile()) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `session lifecycle delete target must be regular: ${target}`);
+    }
+    try {
+      handle = await open(targetPath, constants.O_RDONLY | noFollowSessionIoFileFlags());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `session lifecycle delete target must not be a symbolic link: ${target}`);
+      }
+      throw error;
+    }
+    const held = await handle.stat();
+    const afterOpen = await lstat(targetPath);
+    if (
+      afterOpen.isSymbolicLink()
+      || !afterOpen.isFile()
+      || !sameSessionIoStat(initial, held)
+      || !sameSessionIoStat(afterOpen, held)
+    ) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `session lifecycle delete target changed while opening: ${target}`);
+    }
+    await assertSessionIoScopeCurrent(scope);
+    if (sessionLifecycleFileHandleMustCloseBeforeEffect('unlink')) {
+      await handle.close();
+      handle = undefined;
+    }
+    await sessionFilesystemTestHooks?.beforeDelete?.(target);
+    await assertSessionIoScopeCurrent(scope);
+    const beforeDelete = await lstat(targetPath);
+    if (
+      beforeDelete.isSymbolicLink()
+      || !beforeDelete.isFile()
+      || !sameSessionIoStat(beforeDelete, held)
+    ) {
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `session lifecycle delete target changed before deletion: ${target}`);
+    }
+    await assertSessionIoScopeCurrent(scope);
+    await unlink(targetPath);
+    try {
+      await lstat(targetPath);
+      sessionIoError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `session lifecycle delete target was recreated during deletion: ${target}`);
+    } catch (error) {
+      if (error instanceof StateAuthorityError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await scope.parent.handle?.sync();
+    await assertSessionIoScopeCurrent(scope);
+    return true;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await closeSessionIoScope(scope).catch(() => undefined);
+  }
+}
+
+function inheritedAuthorityTransport(env: NodeJS.ProcessEnv): {
+  authorityPath: string;
+  authorityId: string;
+  generationId: string;
+  workspaceDigest: string;
+  capability: string;
+  present: boolean;
+} {
+  const authorityPath = env.OMX_STATE_AUTHORITY_PATH?.trim() ?? '';
+  const authorityId = env.OMX_STATE_AUTHORITY_ID?.trim() ?? '';
+  const generationId = env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim() ?? '';
+  const workspaceDigest = env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim() ?? '';
+  const capability = env.OMX_STATE_AUTHORITY_CAPABILITY?.trim() ?? '';
   return {
-    cwd: normalizedCwd,
-    baseStateDir,
-    rootSource,
-    sessionPath: pointerPath,
-    lockPath: `${pointerPath}.lock`,
+    authorityPath,
+    authorityId,
+    generationId,
+    workspaceDigest,
+    capability,
+    present: Boolean(authorityPath || authorityId || generationId || workspaceDigest || capability),
   };
 }
 
-function attemptedStateRootSource(): AttemptedStateRootSource {
+function deriveWorkspaceFromAuthorityLocator(locator: string): string | null {
+  const authorityPath = resolve(locator);
+  if (basename(authorityPath) !== 'state-authority.json') return null;
+  const generationDirectory = dirname(authorityPath);
+  const generationsDirectory = dirname(generationDirectory);
+  const authorityDirectory = dirname(generationsDirectory);
+  const stateRoot = dirname(authorityDirectory);
+  const omxRoot = dirname(stateRoot);
+  if (
+    basename(generationsDirectory) !== 'generations'
+    || basename(authorityDirectory) !== 'authority'
+    || basename(stateRoot) !== 'state'
+    || basename(omxRoot) !== '.omx'
+  ) return null;
+  return dirname(omxRoot);
+}
+
+function inheritedAuthoritySessionId(env: NodeJS.ProcessEnv): string | undefined {
+  const sessionId = env.OMX_SESSION_ID?.trim() || env.CODEX_SESSION_ID?.trim();
+  return sessionId || undefined;
+}
+
+async function assertActiveAuthorityTransport(
+  authority: ResolvedStateAuthorityContext,
+  transport: ReturnType<typeof inheritedAuthorityTransport>,
+): Promise<void> {
+  const binding = authority.session_binding;
+  const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
+  const expectedBindingPath = binding
+    ? join(
+      authority.canonical_state_root,
+      'authority',
+      'generations',
+      authority.generation.generation_id,
+      'bindings',
+      `${binding.binding_id}.json`,
+    )
+    : '';
+  if (
+    !anchor
+    || !binding
+    || binding.lifecycle !== 'active'
+    || resolve(transport.authorityPath) !== resolve(authority.authority_path)
+    || authority.generation.authority_id !== transport.authorityId
+    || authority.generation.generation_id !== transport.generationId
+    || authority.workspace_identity.digest !== transport.workspaceDigest
+    || anchor.active_generation_id !== authority.generation.generation_id
+    || !anchor.active_generation_locator
+    || resolve(anchor.active_generation_locator) !== resolve(authority.authority_path)
+    || !anchor.active_binding_locator
+    || resolve(anchor.active_binding_locator) !== resolve(expectedBindingPath)
+    || !anchor.active_lease
+    || anchor.active_lease.generation_id !== authority.generation.generation_id
+    || anchor.active_lease.binding_id !== binding.binding_id
+    || anchor.active_lease.fencing_token !== anchor.fencing_token
+    || authority.generation.creation_fence > anchor.fencing_token
+    || binding.authority_id !== authority.generation.authority_id
+    || binding.generation_id !== authority.generation.generation_id
+    || binding.creation_fence !== authority.generation.creation_fence
+  ) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      'inherited state-authority transport does not match the active anchor, generation, binding, fence, and filesystem-validated authority context',
+    );
+  }
+}
+
+/**
+ * Resolves only a complete inherited authority transport against the currently
+ * active workspace anchor. A locator is evidence, not a root selector: any
+ * incomplete, stale, or unauthenticated locator is fatal to the caller.
+ */
+export async function resolveAuthenticatedTransportAuthority(
+  observedCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ResolvedStateAuthorityContext | null> {
+  const transport = inheritedAuthorityTransport(env);
+  if (!transport.present) return null;
+  if (!transport.authorityPath || !transport.authorityId || !transport.generationId || !transport.workspaceDigest || !transport.capability) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      'inherited state-authority transport is incomplete',
+    );
+  }
+  // A locator is not an authority selector. It is used only to find the
+  // persisted anchor whose opaque bearer is validated below.
+  const startupCwd = env.OMX_STARTUP_CWD?.trim() || deriveWorkspaceFromAuthorityLocator(transport.authorityPath);
+  if (!startupCwd) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      'inherited state-authority locator does not identify a workspace root',
+    );
+  }
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: startupCwd,
+    observed_cwd: observedCwd,
+    session_id: inheritedAuthoritySessionId(env),
+  });
+  await assertActiveAuthorityTransport(authority, transport);
+  await validateStateAuthorityTransportCapability(authority, transport.capability);
+  if (!isObservedCwdCompatibleWithStateAuthority(authority, observedCwd)) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.observedCwdOutsideWorkspace,
+      'inherited state-authority transport cannot be used from an unrelated workspace cwd',
+    );
+  }
+  return authority;
+}
+
+/**
+ * A transported startup workspace is usable only after the inherited locator
+ * authenticates the active anchor. Without authority evidence, startup cwd is
+ * retained only within the same workspace for legacy bootstrap compatibility.
+ */
+export async function resolveAuthenticatedStateAuthorityStartupCwd(
+  observedCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const authority = await resolveAuthenticatedTransportAuthority(observedCwd, env);
+  if (authority) return authority.workspace_identity.canonical_path;
+  const startupCwd = env.OMX_STARTUP_CWD?.trim();
+  if (!startupCwd) return observedCwd;
   try {
-    if (process.env.OMX_TEAM_STATE_ROOT?.trim()) return 'team-env';
-    if (process.env.OMX_ROOT?.trim()) return 'omx-root-env';
-    if (process.env.OMX_STATE_ROOT?.trim()) return 'omx-state-root-env';
-    return 'cwd-default';
+    return resolveWorkspaceIdentity(startupCwd).digest === resolveWorkspaceIdentity(observedCwd).digest
+      ? startupCwd
+      : observedCwd;
   } catch {
-    return 'unresolved';
+    return observedCwd;
   }
 }
 
-function contextAbort(cwd: string, candidateSessionId: string | undefined, cause: unknown): SessionPointerContextAbort {
-  return new SessionPointerLaunchAbortError({
-    code: 'session_pointer_context_failure',
-    operation: 'pointer-context-resolve',
-    cwd,
-    ...(candidateSessionId ? { candidateSessionId } : {}),
-    attemptedRootSource: attemptedStateRootSource(),
-    reason: `Unable to resolve the selected session pointer root: ${errorMessage(cause)}`,
-    cause,
-  }) as SessionPointerContextAbort;
+async function stateAuthorityStartupCwd(observedCwd: string): Promise<string> {
+  return resolveAuthenticatedStateAuthorityStartupCwd(observedCwd);
 }
 
-function resolvedAbort(
-  context: SessionPointerContext,
-  input: Omit<ResolvedSessionPointerAbort, 'name' | 'committed' | 'cwd' | 'pointerPath' | 'rootSource' | 'message'>,
-): ResolvedSessionPointerAbort {
-  return new SessionPointerLaunchAbortError({
-    ...input,
-    cwd: context.cwd,
-    pointerPath: context.sessionPath,
-    rootSource: context.rootSource,
-  }) as ResolvedSessionPointerAbort;
+async function resolveSessionAuthorityForGuard(cwd: string): Promise<ResolvedStateAuthorityContext> {
+  const transported = await resolveAuthenticatedTransportAuthority(cwd);
+  if (transported) return transported;
+  return resolveStateAuthorityForGuard({
+    startup_cwd: await stateAuthorityStartupCwd(cwd),
+    observed_cwd: cwd,
+  });
 }
 
-class SessionPointerLaunchAbortError extends Error {
-  readonly name = 'SessionPointerLaunchAbort' as const;
-  readonly committed = false as const;
+function sessionPath(stateDir: string): string {
+  return join(stateDir, SESSION_FILE);
+}
 
-  constructor(fields: Record<string, unknown> & { reason: string; cause?: unknown }) {
-    super(fields.reason);
-    Object.assign(this, fields);
+function historyPath(omxRoot: string): string {
+  return join(omxRoot, 'logs', HISTORY_FILE);
+}
+
+async function hasLegacyStateArtifacts(cwd: string): Promise<boolean> {
+  const stateRoot = resolveOrdinaryStateRoot(resolveWorkspaceIdentity(await stateAuthorityStartupCwd(cwd)));
+  if (!existsSync(stateRoot)) return false;
+  try {
+    return readdirSync(stateRoot).length > 0;
+  } catch {
+    return true;
   }
 }
 
-export function isSessionPointerLaunchAbort(error: unknown): error is SessionPointerLaunchAbort {
-  if (!(error instanceof Error) || error.name !== 'SessionPointerLaunchAbort') return false;
-  const candidate = error as Partial<SessionPointerLaunchAbort>;
-  if (candidate.committed !== false || typeof candidate.cwd !== 'string' || typeof candidate.operation !== 'string') {
-    return false;
+async function resolveExistingSessionAuthority(cwd: string): Promise<ResolvedStateAuthorityContext | null> {
+  try {
+    return await resolveSessionAuthorityForGuard(cwd);
+  } catch (error) {
+    if (
+      error instanceof StateAuthorityError
+      && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing
+      && !await hasLegacyStateArtifacts(cwd)
+    ) {
+      return null;
+    }
+    throw error;
   }
-  return candidate.code === 'session_pointer_context_failure'
-    || candidate.code === 'session_pointer_lock_timeout'
-    || candidate.code === 'session_pointer_lock_recovery_required'
-    || candidate.code === 'session_pointer_unusable'
-    || candidate.code === 'session_pointer_owner_conflict'
-    || candidate.code === 'session_pointer_io_failure';
+}
+async function legacySessionStateRoots(cwd: string): Promise<string[]> {
+  const roots: string[] = [];
+  const teamStateRoot = process.env.OMX_TEAM_STATE_ROOT?.trim();
+  if (teamStateRoot) roots.push(resolve(cwd, teamStateRoot));
+  const omxRoot = process.env.OMX_ROOT?.trim();
+  if (omxRoot) roots.push(join(resolve(cwd, omxRoot), '.omx', 'state'));
+  const omxStateRoot = process.env.OMX_STATE_ROOT?.trim();
+  if (omxStateRoot) roots.push(join(resolve(cwd, omxStateRoot), '.omx', 'state'));
+  roots.push(resolveOrdinaryStateRoot(resolveWorkspaceIdentity(await stateAuthorityStartupCwd(cwd))));
+  return [...new Set(roots)];
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+async function readLegacySessionState(cwd: string): Promise<SessionState | null> {
+  const workspace = resolveWorkspaceIdentity(await stateAuthorityStartupCwd(cwd));
+  const candidates: SessionState[] = [];
+  for (const stateRoot of await legacySessionStateRoots(cwd)) {
+    const state = await readSessionStateAt(stateRoot);
+    if (!state || !SESSION_ID_PATTERN.test(state.session_id)) continue;
+    if (typeof state.cwd !== 'string' || !state.cwd.trim()) {
+      candidates.push(state);
+      continue;
+    }
+    try {
+      const recordedWorkspace = resolveWorkspaceIdentity(state.cwd);
+      if (recordedWorkspace.canonical_path === workspace.canonical_path) candidates.push(state);
+    } catch {
+      // Invalid legacy cwd evidence is not a candidate.
+    }
+  }
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== 'object') return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === 'string' ? code : undefined;
+function sessionAliases(
+  options: Pick<SessionStartOptions, 'nativeSessionId' | 'previousNativeSessionId' | 'ownerOmxSessionId'>,
+): Partial<SessionAliasSet> {
+  const native = options.nativeSessionId?.trim();
+  const previous = options.previousNativeSessionId?.trim();
+  const owner = options.ownerOmxSessionId?.trim();
+  return {
+    ...(native ? { native_session_id: native, current_session_aliases: [native] } : {}),
+    ...(previous ? { previous_session_aliases: [previous] } : {}),
+    ...(owner ? { owner_session_aliases: [owner] } : {}),
+  };
+}
+function sessionIdMatchesAuthority(state: SessionState, authority: ResolvedStateAuthorityContext): boolean {
+  const binding = authority.session_binding;
+  if (!binding) return false;
+  const accepted = new Set([
+    binding.canonical_session_id,
+    binding.aliases.native_session_id,
+    ...binding.aliases.current_session_aliases,
+    ...binding.aliases.previous_session_aliases,
+    ...binding.aliases.owner_session_aliases,
+  ].filter((value): value is string => typeof value === 'string' && value.trim() !== ''));
+  return accepted.has(state.session_id)
+    || (typeof state.native_session_id === 'string' && accepted.has(state.native_session_id))
+    || (typeof state.owner_omx_session_id === 'string' && accepted.has(state.owner_omx_session_id));
 }
 
-function isNotFound(error: unknown): boolean {
-  return errorCode(error) === 'ENOENT';
+
+async function readSessionStateAt(
+  stateDir: string,
+  rootIdentity?: RootFilesystemIdentity,
+): Promise<SessionState | null> {
+  const path = sessionPath(stateDir);
+  const content = rootIdentity
+    ? await readSessionIoFile(stateDir, rootIdentity, path)
+    : existsSync(path)
+      ? await readFile(path, 'utf-8').catch(() => null)
+      : null;
+  if (content === null) return null;
+  try {
+    return JSON.parse(content) as SessionState;
+  } catch {
+    return null;
+  }
 }
 
-function isAlreadyExists(error: unknown): boolean {
-  return errorCode(error) === 'EEXIST';
+async function assertCommittedSessionStateRoot(
+  stateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+): Promise<void> {
+  const actualRootIdentity = await captureRootFilesystemIdentity(stateDir);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'session lifecycle state root does not match its committed filesystem identity',
+    );
+  }
 }
 
-function hashCmdline(cmdline: string | null | undefined): string | undefined {
-  const normalized = normalizeCmdline(cmdline);
-  return normalized ? createHash('sha256').update(normalized).digest('hex') : undefined;
+/**
+ * The OMX parent is not persisted authority. Pin it only while the committed
+ * state child remains in place on both sides of the parent identity capture.
+ */
+async function capturePinnedParentOmxRootIdentity(
+  context: Pick<ResolvedStateAuthorityContext, 'canonical_state_root' | 'generation'>,
+): Promise<RootFilesystemIdentity> {
+  await assertCommittedSessionStateRoot(context.canonical_state_root, context.generation.root_identity);
+  await sessionFilesystemTestHooks?.beforeCaptureParentOmxIdentity?.(context.generation.canonical_omx_root);
+  const omxRootIdentity = await captureRootFilesystemIdentity(context.generation.canonical_omx_root);
+  await assertCommittedSessionStateRoot(context.canonical_state_root, context.generation.root_identity);
+  return omxRootIdentity;
+}
+
+async function appendToLogAt(
+  omxRoot: string,
+  omxRootIdentity: RootFilesystemIdentity,
+  entry: Record<string, unknown>,
+): Promise<void> {
+  const date = new Date().toISOString().slice(0, 10);
+  const logFile = join(omxRoot, 'logs', `omx-${date}.jsonl`);
+  const line = JSON.stringify({ ...entry, _ts: new Date().toISOString() }) + '\n';
+  await appendSessionIoFile(omxRoot, omxRootIdentity, logFile, line);
+}
+
+async function removeDeadSessionHudState(
+  baseStateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+  sessionIds: Array<string | undefined>,
+  removeRootHudState: boolean,
+): Promise<void> {
+  const uniqueSessionIds = [...new Set(
+    sessionIds
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value) => value.trim()),
+  )];
+  const candidatePaths = [
+    ...(removeRootHudState ? [join(baseStateDir, 'hud-state.json')] : []),
+    ...uniqueSessionIds.map((sessionId) => join(baseStateDir, 'sessions', sessionId, 'hud-state.json')),
+  ];
+  await Promise.all(candidatePaths.map(async (path) => {
+    await deleteSessionIoFile(baseStateDir, rootIdentity, path);
+  }));
+}
+async function initializeSessionAuthority(
+  cwd: string,
+  canonicalSessionId: string,
+  aliases?: Partial<SessionAliasSet>,
+): Promise<ResolvedStateAuthorityContext> {
+  let existing: ResolvedStateAuthorityContext | null = null;
+  try {
+    existing = await resolveExistingSessionAuthority(cwd);
+  } catch (error) {
+    if (!(error instanceof StateAuthorityError) || error.code !== AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) {
+      throw error;
+    }
+  }
+  const authority = await initializeStateAuthority({
+    startup_cwd: existing?.workspace_identity.canonical_path ?? cwd,
+    observed_cwd: cwd,
+    launch_id: `session-${canonicalSessionId}`,
+    session_binding: {
+      canonical_session_id: canonicalSessionId,
+      ...(aliases ? { aliases } : {}),
+    },
+  });
+  return authority;
+}
+
+/**
+ * Reset session-scoped HUD/metrics files at launch so stale values do not leak
+ * into a new Codex session.
+ */
+export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
+  const requestedSessionId = sessionId?.trim();
+  const canonicalSessionId = requestedSessionId || 'session-metrics';
+  if (!SESSION_ID_PATTERN.test(canonicalSessionId)) {
+    throw new Error('sessionId must match ^[A-Za-z0-9_-]{1,64}$');
+  }
+  const authority = await initializeSessionAuthority(cwd, canonicalSessionId);
+  await withStateAuthorityTransaction(authority, async (context) => {
+    const omxDir = context.generation.canonical_omx_root;
+    const stateDir = context.canonical_state_root;
+    const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
+    const now = new Date().toISOString();
+    await writeSessionIoFile(omxDir, omxRootIdentity, join(omxDir, 'metrics.json'), JSON.stringify({
+      total_turns: 0,
+      session_turns: 0,
+      last_activity: now,
+      session_input_tokens: 0,
+      session_output_tokens: 0,
+      session_total_tokens: 0,
+      five_hour_limit_pct: 0,
+      weekly_limit_pct: 0,
+    }, null, 2));
+
+    const hudStatePath = requestedSessionId
+      ? join(stateDir, 'sessions', canonicalSessionId, 'hud-state.json')
+      : join(stateDir, 'hud-state.json');
+    await writeSessionIoFile(stateDir, context.generation.root_identity, hudStatePath, JSON.stringify({
+      last_turn_at: now,
+      last_progress_at: now,
+      turn_count: 0,
+      last_agent_output: '',
+    }, null, 2));
+  });
+}
+
+/**
+ * Read current session state. Returns null if no authority or session file exists.
+ */
+export async function readSessionState(cwd: string): Promise<SessionState | null> {
+  try {
+    const authority = await resolveExistingSessionAuthority(cwd);
+    if (!authority) return null;
+    const state = await readSessionStateAt(authority.canonical_state_root, authority.generation.root_identity);
+    return state && sessionIdMatchesAuthority(state, authority) ? state : null;
+  } catch (error) {
+    if (error instanceof StateAuthorityError && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) {
+      return await readLegacySessionState(cwd);
+    }
+    throw error;
+  }
+}
+
+export function isSessionStateAuthoritativeForCwd(state: SessionState, _cwd: string): boolean {
+  return SESSION_ID_PATTERN.test(state.session_id);
+}
+
+export function isSessionStateUsable(
+  state: SessionState,
+  cwd: string,
+  options: SessionStaleCheckOptions = {},
+): boolean {
+  if (!isSessionStateAuthoritativeForCwd(state, cwd)) return false;
+
+  const hasPidMetadata = Number.isInteger(state.pid) && state.pid > 0;
+  const hasLinuxIdentityMetadata = typeof state.pid_start_ticks === 'number'
+    || typeof state.pid_cmdline === 'string';
+  if (hasPidMetadata || hasLinuxIdentityMetadata) {
+    return !isSessionStale(state, options);
+  }
+
+  return true;
+}
+
+export async function readUsableSessionState(
+  cwd: string,
+  options: SessionStaleCheckOptions = {},
+): Promise<SessionState | null> {
+  const state = await readSessionState(cwd);
+  if (!state) return null;
+  return isSessionStateUsable(state, cwd, options) ? state : null;
 }
 
 interface LinuxProcessIdentity {
@@ -264,184 +951,21 @@ interface LinuxProcessIdentity {
   cmdline: string | null;
 }
 
-export interface SessionStaleCheckOptions {
+interface SessionStaleCheckOptions {
   platform?: NodeJS.Platform;
   isPidAlive?: (pid: number) => boolean;
   readLinuxIdentity?: (pid: number) => LinuxProcessIdentity | null;
 }
 
-export interface SessionStartOptions {
+interface SessionStartOptions {
   pid?: number;
   platform?: NodeJS.Platform;
   nativeSessionId?: string;
   previousNativeSessionId?: string;
   nativeSessionSwitchedAt?: string;
-  /**
-   * Compatibility-only metadata. Alias candidacy always comes from
-   * process.env.OMX_SESSION_ID, never from this option.
-   */
   ownerOmxSessionId?: string;
-  /** The caller proved the env candidate with actual tmux pane/session tags. */
-  ownerAliasVerified?: boolean;
   tmuxSessionName?: string;
   tmuxPaneId?: string;
-  context?: SessionPointerContext;
-}
-
-/** @internal Test-only deterministic transaction seam; do not use outside session tests. */
-export type PidProbeResult = 'alive' | 'dead' | 'indeterminate';
-
-/** @internal Test-only deterministic transaction seam; do not use outside session tests. */
-export interface SessionPointerFsDependencies {
-  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
-  readdir(path: string): Promise<string[]>;
-  readFile(path: string, encoding: 'utf8'): Promise<string>;
-  writeFile(path: string, data: string, options?: { mode?: number; flag?: string }): Promise<void>;
-  openAndSync(path: string): Promise<void>;
-  rename(from: string, to: string): Promise<void>;
-  unlink(path: string): Promise<void>;
-  rmdir(path: string): Promise<void>;
-}
-
-/** @internal Test-only deterministic transaction seam; do not use outside session tests. */
-export interface SessionPointerTransactionDependencies {
-  fs: SessionPointerFsDependencies;
-  nowMs(): number;
-  sleep(ms: number): Promise<void>;
-  token(): string;
-  probePid(pid: number): PidProbeResult;
-  readProcessIdentity(pid: number, platform: NodeJS.Platform): {
-    status: 'matching' | 'reused' | 'indeterminate';
-    startTicks?: number;
-    cmdlineHash?: string;
-  };
-}
-
-const defaultFsDependencies: SessionPointerFsDependencies = {
-  mkdir: async (path, options) => {
-    await nodeMkdir(path, options);
-  },
-  readdir: async (path) => await nodeReaddir(path),
-  readFile: async (path, encoding) => await nodeReadFile(path, encoding),
-  writeFile: async (path, data, options) => {
-    await nodeWriteFile(path, data, options);
-  },
-  openAndSync: async (path) => {
-    const handle = await open(path, 'r');
-    try {
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-  },
-  rename: async (from, to) => {
-    await nodeRename(from, to);
-  },
-  unlink: async (path) => {
-    await nodeUnlink(path);
-  },
-  rmdir: async (path) => {
-    await nodeRmdir(path);
-  },
-};
-
-/** @internal Exposed only so source-module tests can verify default ESRCH handling. */
-export function __createDefaultPidProbeForTests(
-  killZero: (pid: number) => void,
-): (pid: number) => PidProbeResult {
-  return (pid: number): PidProbeResult => {
-    try {
-      killZero(pid);
-      return 'alive';
-    } catch (error) {
-      return errorCode(error) === 'ESRCH' ? 'dead' : 'indeterminate';
-    }
-  };
-}
-
-function defaultProbePid(pid: number): PidProbeResult {
-  return __createDefaultPidProbeForTests((targetPid) => {
-    process.kill(targetPid, 0);
-  })(pid);
-}
-
-function defaultReadProcessIdentity(pid: number, platform: NodeJS.Platform): {
-  status: 'matching' | 'reused' | 'indeterminate';
-  startTicks?: number;
-  cmdlineHash?: string;
-} {
-  if (platform !== 'linux') return { status: 'indeterminate' };
-  const identity = readLinuxProcessIdentity(pid);
-  if (!identity) return { status: 'indeterminate' };
-  const cmdlineHash = hashCmdline(identity.cmdline);
-  return {
-    status: 'matching',
-    startTicks: identity.startTicks,
-    ...(cmdlineHash ? { cmdlineHash } : {}),
-  };
-}
-
-const defaultTransactionDependencies: SessionPointerTransactionDependencies = {
-  fs: defaultFsDependencies,
-  nowMs: () => Date.now(),
-  sleep: async (ms) => await new Promise<void>((resolve) => setTimeout(resolve, ms)),
-  token: () => randomUUID(),
-  probePid: defaultProbePid,
-  readProcessIdentity: defaultReadProcessIdentity,
-};
-
-let transactionDependencies: SessionPointerTransactionDependencies = defaultTransactionDependencies;
-
-/** @internal Source-module test harness. Always reset after a test. */
-export function __setSessionPointerTransactionDependenciesForTests(
-  overrides: Omit<Partial<SessionPointerTransactionDependencies>, 'fs'> & {
-    fs?: Partial<SessionPointerFsDependencies>;
-  },
-): void {
-  transactionDependencies = {
-    ...defaultTransactionDependencies,
-    ...overrides,
-    fs: {
-      ...defaultFsDependencies,
-      ...overrides.fs,
-    },
-  };
-}
-
-/** @internal Source-module test harness. */
-export function __resetSessionPointerTransactionDependenciesForTests(): void {
-  transactionDependencies = defaultTransactionDependencies;
-}
-
-function parseLinuxProcStartTicks(statContent: string): number | null {
-  const commandEnd = statContent.lastIndexOf(')');
-  if (commandEnd === -1) return null;
-  const fields = statContent.slice(commandEnd + 1).trim().split(/\s+/);
-  if (fields.length <= 19) return null;
-  const startTicks = Number(fields[19]);
-  return Number.isInteger(startTicks) && startTicks >= 0 ? startTicks : null;
-}
-
-function normalizeCmdline(cmdline: string | null | undefined): string | null {
-  if (!cmdline) return null;
-  const normalized = cmdline.replace(/\s+/g, ' ').trim();
-  return normalized || null;
-}
-
-function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | null {
-  try {
-    const startTicks = parseLinuxProcStartTicks(readFileSync(`/proc/${pid}/stat`, 'utf-8'));
-    if (startTicks == null) return null;
-    let cmdline: string | null = null;
-    try {
-      cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000+/g, ' ').trim();
-    } catch {
-      // The start tick is still useful when cmdline access is unavailable.
-    }
-    return { startTicks, cmdline: normalizeCmdline(cmdline) };
-  } catch {
-    return null;
-  }
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -453,165 +977,43 @@ function defaultIsPidAlive(pid: number): boolean {
   }
 }
 
-/**
- * Legacy boolean stale check retained for read compatibility. The pointer
- * classifier below keeps indeterminate liveness distinct from definitely dead.
- */
-export function isSessionStale(
-  state: SessionState,
-  options: SessionStaleCheckOptions = {},
-): boolean {
-  if (!Number.isInteger(state.pid) || state.pid <= 0) return true;
-  const isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
-  if (!isPidAlive(state.pid)) return true;
+function parseLinuxProcStartTicks(statContent: string): number | null {
+  const commandEnd = statContent.lastIndexOf(')');
+  if (commandEnd === -1) return null;
 
-  const platform = options.platform ?? process.platform;
-  if (platform !== 'linux') return false;
+  const remainder = statContent.slice(commandEnd + 1).trim();
+  const fields = remainder.split(/\s+/);
+  if (fields.length <= 19) return null;
 
-  const liveIdentity = (options.readLinuxIdentity ?? readLinuxProcessIdentity)(state.pid);
-  if (!liveIdentity || typeof state.pid_start_ticks !== 'number') return true;
-  if (state.pid_start_ticks !== liveIdentity.startTicks) return true;
-
-  const expectedCmdline = normalizeCmdline(state.pid_cmdline);
-  if (!expectedCmdline) return false;
-  const liveCmdline = normalizeCmdline(liveIdentity.cmdline);
-  return !liveCmdline || liveCmdline !== expectedCmdline;
+  const startTicks = Number(fields[19]);
+  return Number.isFinite(startTicks) ? startTicks : null;
 }
 
-export function isSessionStateAuthoritativeForCwd(state: SessionState, cwd: string): boolean {
-  if (!normalizeSessionId(state.session_id)) return false;
-  if (typeof state.cwd !== 'string' || !state.cwd.trim()) return false;
+function normalizeCmdline(cmdline: string | null | undefined): string | null {
+  if (!cmdline) return null;
+  const normalized = cmdline.replace(/\s+/g, ' ').trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | null {
   try {
-    return sameFilePath(state.cwd, cwd);
-  } catch {
-    return false;
-  }
-}
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const startTicks = parseLinuxProcStartTicks(stat);
+    if (startTicks == null) return null;
 
-export function isSessionStateUsable(
-  state: SessionState,
-  cwd: string,
-  options: SessionStaleCheckOptions = {},
-): boolean {
-  if (!normalizeSessionId(state.session_id)) return false;
-  if (typeof state.cwd === 'string' && state.cwd.trim() && !isSessionStateAuthoritativeForCwd(state, cwd)) return false;
-  const hasPidMetadata = Number.isInteger(state.pid) && state.pid > 0;
-  const hasLinuxIdentityMetadata = typeof state.pid_start_ticks === 'number'
-    || typeof state.pid_cmdline === 'string';
-  return !hasPidMetadata && !hasLinuxIdentityMetadata || !isSessionStale(state, options);
-}
+    let cmdline: string | null = null;
+    try {
+      cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8')
+        .replace(/\u0000+/g, ' ')
+        .trim();
+    } catch {
+      cmdline = null;
+    }
 
-function isValidStartTicks(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
-}
-
-function classifySessionProcess(
-  state: SessionState,
-  dependencies: SessionPointerTransactionDependencies,
-): 'usable' | 'stale-dead' | 'identity-indeterminate' {
-  const hasPidMetadata = Number.isInteger(state.pid) && state.pid > 0;
-  const hasIdentityMetadata = typeof state.pid_start_ticks === 'number' || typeof state.pid_cmdline === 'string';
-  if (!hasPidMetadata && !hasIdentityMetadata) return 'usable';
-  if (!hasPidMetadata) return 'identity-indeterminate';
-
-  let pidStatus: PidProbeResult;
-  try {
-    pidStatus = dependencies.probePid(state.pid);
-  } catch {
-    return 'identity-indeterminate';
-  }
-  if (pidStatus === 'dead') return 'stale-dead';
-  if (pidStatus !== 'alive') return 'identity-indeterminate';
-
-  const platform = state.platform ?? process.platform;
-  if (platform !== 'linux') return 'usable';
-  if (!isValidStartTicks(state.pid_start_ticks)) return 'identity-indeterminate';
-
-  let liveIdentity: ReturnType<SessionPointerTransactionDependencies['readProcessIdentity']>;
-  try {
-    liveIdentity = dependencies.readProcessIdentity(state.pid, platform);
-  } catch {
-    return 'identity-indeterminate';
-  }
-  if (!liveIdentity || !isValidStartTicks(liveIdentity.startTicks)) return 'identity-indeterminate';
-  if (liveIdentity.startTicks !== state.pid_start_ticks) return 'stale-dead';
-  if (liveIdentity.status !== 'matching') return 'identity-indeterminate';
-
-  const expectedCmdlineHash = hashCmdline(state.pid_cmdline);
-  if (expectedCmdlineHash && liveIdentity.cmdlineHash !== expectedCmdlineHash) {
-    return 'identity-indeterminate';
-  }
-  return 'usable';
-}
-
-function classifyParsedSessionPointer(
-  context: SessionPointerContext,
-  value: unknown,
-  raw: string,
-): SessionPointerReadResult {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return { status: 'malformed', raw };
-  }
-  const state = value as SessionState;
-  if (!normalizeSessionId(state.session_id)) return { status: 'malformed', raw };
-  if (typeof state.cwd === 'string' && state.cwd.trim() && !isSessionStateAuthoritativeForCwd(state, context.cwd)) {
-    return { status: 'foreign-cwd', raw, state };
-  }
-
-  const processStatus = classifySessionProcess(state, transactionDependencies);
-  return { status: processStatus, state, raw };
-}
-
-/** Read and classify only context.sessionPath; no alternate root is consulted. */
-export async function readSessionPointer(context: SessionPointerContext): Promise<SessionPointerReadResult> {
-  let raw: string;
-  try {
-    raw = await transactionDependencies.fs.readFile(context.sessionPath, 'utf8');
-  } catch (error) {
-    if (isNotFound(error)) return { status: 'absent' };
-    throw error;
-  }
-
-  try {
-    return classifyParsedSessionPointer(context, JSON.parse(raw), raw);
-  } catch (error) {
-    if (error instanceof SyntaxError) return { status: 'malformed', raw };
-    throw error;
-  }
-}
-
-export async function readSessionStateFromContext(context: SessionPointerContext): Promise<SessionState | null> {
-  try {
-    const raw = await transactionDependencies.fs.readFile(context.sessionPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as SessionState : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function readUsableSessionStateFromContext(context: SessionPointerContext): Promise<SessionState | null> {
-  const state = await readSessionStateFromContext(context);
-  return state && isSessionStateUsable(state, context.cwd) ? state : null;
-}
-
-/** Read current session state from the exact selected root. */
-export async function readSessionState(cwd: string): Promise<SessionState | null> {
-  try {
-    return await readSessionStateFromContext(resolveSessionPointerContext(cwd));
-  } catch {
-    return null;
-  }
-}
-
-export async function readUsableSessionState(
-  cwd: string,
-  options: SessionStaleCheckOptions = {},
-): Promise<SessionState | null> {
-  try {
-    const context = resolveSessionPointerContext(cwd);
-    const state = await readSessionStateFromContext(context);
-    return state && isSessionStateUsable(state, context.cwd, options) ? state : null;
+    return {
+      startTicks,
+      cmdline: normalizeCmdline(cmdline),
+    };
   } catch {
     return null;
   }
@@ -635,12 +1037,28 @@ function createSessionState(
   } = {},
 ): SessionState {
   const nowIso = options.nowIso ?? new Date().toISOString();
-  const nativeSessionId = normalizeNonempty(options.nativeSessionId);
-  const previousNativeSessionId = normalizeNonempty(options.previousNativeSessionId);
-  const nativeSessionSwitchedAt = normalizeNonempty(options.nativeSessionSwitchedAt);
-  const ownerOmxSessionId = normalizeSessionId(options.ownerOmxSessionId);
-  const tmuxSessionName = normalizeNonempty(options.tmuxSessionName);
-  const tmuxPaneId = normalizeNonempty(options.tmuxPaneId);
+  const nativeSessionId = typeof options.nativeSessionId === 'string' && options.nativeSessionId.trim()
+    ? options.nativeSessionId.trim()
+    : undefined;
+  const tmuxSessionName = typeof options.tmuxSessionName === 'string' && options.tmuxSessionName.trim()
+    ? options.tmuxSessionName.trim()
+    : undefined;
+  const tmuxPaneId = typeof options.tmuxPaneId === 'string' && options.tmuxPaneId.trim()
+    ? options.tmuxPaneId.trim()
+    : undefined;
+  const previousNativeSessionId =
+    typeof options.previousNativeSessionId === 'string' && options.previousNativeSessionId.trim()
+      ? options.previousNativeSessionId.trim()
+      : undefined;
+  const nativeSessionSwitchedAt =
+    typeof options.nativeSessionSwitchedAt === 'string' && options.nativeSessionSwitchedAt.trim()
+      ? options.nativeSessionSwitchedAt.trim()
+      : undefined;
+  const ownerOmxSessionId =
+    typeof options.ownerOmxSessionId === 'string' && options.ownerOmxSessionId.trim()
+      ? options.ownerOmxSessionId.trim()
+      : undefined;
+
   return {
     session_id: sessionId,
     ...(nativeSessionId ? { native_session_id: nativeSessionId } : {}),
@@ -651,1046 +1069,296 @@ function createSessionState(
     cwd,
     pid,
     platform,
-    ...(linuxIdentity ? { pid_start_ticks: linuxIdentity.startTicks } : {}),
-    ...(linuxIdentity?.cmdline ? { pid_cmdline: linuxIdentity.cmdline } : {}),
+    pid_start_ticks: linuxIdentity?.startTicks,
+    pid_cmdline: linuxIdentity?.cmdline ?? undefined,
     ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
     ...(tmuxPaneId ? { tmux_pane_id: tmuxPaneId } : {}),
   };
 }
 
-function normalizeNonempty(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function resolvePid(options: SessionStartOptions): number {
-  return Number.isInteger(options.pid) && options.pid && options.pid > 0 ? options.pid : process.pid;
-}
-
-function sessionIdentityFor(pid: number, platform: NodeJS.Platform): LinuxProcessIdentity | null {
-  return platform === 'linux' ? readLinuxProcessIdentity(pid) : null;
-}
-
-function currentOwnerAlias(state: SessionState): string | undefined {
-  return normalizeSessionId(state.owner_omx_session_id);
-}
-
-function verifiedOwnerCandidate(
-  context: SessionPointerContext,
-  options: SessionStartOptions,
-): string | undefined {
-  if (context.rootSource === 'team-env' || options.ownerAliasVerified !== true) return undefined;
-  return normalizeSessionId(process.env.OMX_SESSION_ID);
-}
-
-function mergeOwnerAlias(
-  existing: SessionState | undefined,
-  candidate: string | undefined,
-  verified: boolean,
-): string | undefined {
-  const current = existing && currentOwnerAlias(existing);
-  if (current) {
-    if (candidate && candidate !== current) {
-      throw new Error(`Session pointer is already bound to owner ${current}`);
-    }
-    return current;
-  }
-  if (!candidate || !verified || candidate === existing?.session_id) return undefined;
-  return candidate;
-}
-
-function isStartCompatible(existing: SessionState, requestedSessionId: string): boolean {
-  return existing.session_id === requestedSessionId
-    || existing.native_session_id === requestedSessionId
-    || currentOwnerAlias(existing) === requestedSessionId;
-}
-
-function getOmxLaunchSessionId(state: SessionState): string | undefined {
-  if (state.session_id.startsWith('omx-')) return state.session_id;
-  const owner = currentOwnerAlias(state);
-  return owner?.startsWith('omx-') ? owner : undefined;
-}
-
-interface SessionPointerLockOwnerV1 {
-  version: 1;
-  token: string;
-  pid: number;
-  platform: NodeJS.Platform;
-  pid_start_ticks?: number;
-  pid_cmdline_hash?: string;
-  created_at: string;
-}
-
-type LockOwnerStatus = 'live' | 'dead' | 'reused' | 'identity-indeterminate' | 'missing' | 'malformed';
-
-function parseLockOwner(raw: string): SessionPointerLockOwnerV1 | null {
-  try {
-    const value = JSON.parse(raw) as Partial<SessionPointerLockOwnerV1>;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    if (value.version !== 1 || !isValidToken(value.token) || typeof value.pid !== 'number' || !Number.isInteger(value.pid) || value.pid <= 0) return null;
-    if (typeof value.platform !== 'string' || !value.platform || typeof value.created_at !== 'string' || !value.created_at) {
-      return null;
-    }
-    if (value.pid_start_ticks !== undefined && !isValidStartTicks(value.pid_start_ticks)) return null;
-    if (value.pid_cmdline_hash !== undefined
-      && (typeof value.pid_cmdline_hash !== 'string' || !SHA256_PATTERN.test(value.pid_cmdline_hash))) {
-      return null;
-    }
-    return value as SessionPointerLockOwnerV1;
-  } catch {
-    return null;
-  }
-}
-
-function isValidToken(value: unknown): value is string {
-  return typeof value === 'string' && SESSION_POINTER_TOKEN_PATTERN.test(value);
-}
-
-async function inspectLockOwner(lockPath: string): Promise<{
-  status: LockOwnerStatus;
-  owner?: SessionPointerLockOwnerV1;
-}> {
-  let raw: string;
-  try {
-    raw = await transactionDependencies.fs.readFile(join(lockPath, 'owner.json'), 'utf8');
-  } catch (error) {
-    return isNotFound(error) ? { status: 'missing' } : { status: 'identity-indeterminate' };
-  }
-
-  const owner = parseLockOwner(raw);
-  if (!owner) return { status: 'malformed' };
-
-  let pidStatus: PidProbeResult;
-  try {
-    pidStatus = transactionDependencies.probePid(owner.pid);
-  } catch {
-    return { status: 'identity-indeterminate', owner };
-  }
-  if (pidStatus === 'dead') return { status: 'dead', owner };
-  if (pidStatus !== 'alive') return { status: 'identity-indeterminate', owner };
-
-  // Without Linux immutable start metadata, a live PID cannot be proved to be
-  // the same process. Preserve the lock instead of guessing.
-  if (owner.platform !== 'linux' || !isValidStartTicks(owner.pid_start_ticks)) {
-    return { status: 'identity-indeterminate', owner };
-  }
-
-  let liveIdentity: ReturnType<SessionPointerTransactionDependencies['readProcessIdentity']>;
-  try {
-    liveIdentity = transactionDependencies.readProcessIdentity(owner.pid, owner.platform);
-  } catch {
-    return { status: 'identity-indeterminate', owner };
-  }
-  if (!liveIdentity || !isValidStartTicks(liveIdentity.startTicks)) {
-    return { status: 'identity-indeterminate', owner };
-  }
-  if (liveIdentity.startTicks !== owner.pid_start_ticks) return { status: 'reused', owner };
-  if (liveIdentity.status !== 'matching') return { status: 'identity-indeterminate', owner };
-  if (owner.pid_cmdline_hash && owner.pid_cmdline_hash !== liveIdentity.cmdlineHash) {
-    return { status: 'identity-indeterminate', owner };
-  }
-  return { status: 'live', owner };
-}
-
-interface HeldPointerLock {
-  context: SessionPointerContext;
-  token: string;
-}
-
-function buildLockOwner(token: string): SessionPointerLockOwnerV1 {
-  let identity: ReturnType<SessionPointerTransactionDependencies['readProcessIdentity']> | undefined;
-  try {
-    identity = transactionDependencies.readProcessIdentity(process.pid, process.platform);
-  } catch {
-    // Publication remains valid with optional identity metadata omitted.
-  }
-  return {
-    version: 1,
-    token,
-    pid: process.pid,
-    platform: process.platform,
-    ...(identity?.status === 'matching' && isValidStartTicks(identity.startTicks)
-      ? { pid_start_ticks: identity.startTicks }
-      : {}),
-    ...(identity?.status === 'matching' && identity.cmdlineHash && SHA256_PATTERN.test(identity.cmdlineHash)
-      ? { pid_cmdline_hash: identity.cmdlineHash }
-      : {}),
-    created_at: new Date(transactionDependencies.nowMs()).toISOString(),
-  };
-}
-
-async function removeOwnedPath(path: string): Promise<SessionPointerSecondaryFailure | undefined> {
-  try {
-    await transactionDependencies.fs.unlink(path);
-    return undefined;
-  } catch (error) {
-    if (isNotFound(error)) return undefined;
-    try {
-      await transactionDependencies.fs.readFile(path, 'utf8');
-    } catch (readError) {
-      if (isNotFound(readError)) return undefined;
-    }
-    return {
-      operation: 'precommit-cleanup',
-      phase: 'remove-pointer-temp',
-      ownership: 'held',
-      message: `Unable to remove transaction-owned pointer temporary file: ${errorMessage(error)}`,
-      cause: error,
-      evidencePath: path,
-    };
-  }
-}
-
-async function rollbackUnpublishedLock(
-  context: SessionPointerContext,
-  ownerTempPath?: string,
-): Promise<SessionPointerSecondaryFailure[]> {
-  const failures: SessionPointerSecondaryFailure[] = [];
-  if (ownerTempPath) {
-    try {
-      await transactionDependencies.fs.unlink(ownerTempPath);
-    } catch (error) {
-      if (!isNotFound(error)) {
-        failures.push({
-          operation: 'precommit-cleanup',
-          phase: 'remove-owner-temp',
-          ownership: 'held',
-          message: `Unable to remove transaction-owned lock owner temporary file: ${errorMessage(error)}`,
-          cause: error,
-          evidencePath: ownerTempPath,
-        });
-      }
-    }
-  }
-
-  let entries: string[];
-  try {
-    entries = await transactionDependencies.fs.readdir(context.lockPath);
-  } catch (error) {
-    failures.push({
-      operation: 'precommit-cleanup',
-      phase: 'inspect-unpublished-lock',
-      ownership: 'uncertain',
-      message: `Unable to inspect unpublished session pointer lock: ${errorMessage(error)}`,
-      cause: error,
-      evidencePath: context.lockPath,
-    });
-    return failures;
-  }
-
-  if (entries.length > 0) {
-    failures.push({
-      operation: 'precommit-cleanup',
-      phase: 'inspect-unpublished-lock',
-      ownership: 'uncertain',
-      message: 'Unpublished session pointer lock contains unexpected evidence.',
-      evidencePath: context.lockPath,
-    });
-    return failures;
-  }
-
-  try {
-    await transactionDependencies.fs.rmdir(context.lockPath);
-  } catch (error) {
-    failures.push({
-      operation: 'precommit-cleanup',
-      phase: 'remove-unpublished-lock',
-      ownership: 'held',
-      message: `Unable to remove empty unpublished session pointer lock: ${errorMessage(error)}`,
-      cause: error,
-      evidencePath: context.lockPath,
-    });
-  }
-  return failures;
-}
-
-async function acquirePointerLock(
-  context: SessionPointerContext,
-  candidateSessionId: string | undefined,
-  timeoutMs: number,
-): Promise<HeldPointerLock> {
-  const deadline = transactionDependencies.nowMs() + timeoutMs;
-  let attempt = 0;
-
-  while (true) {
-    try {
-      await transactionDependencies.fs.mkdir(context.lockPath);
-      break;
-    } catch (error) {
-      if (!isAlreadyExists(error)) {
-        throw resolvedAbort(context, {
-          code: 'session_pointer_io_failure',
-          operation: 'lock-acquire',
-          ...(candidateSessionId ? { candidateSessionId } : {}),
-          lockPath: context.lockPath,
-          reason: `Unable to acquire session pointer lock: ${errorMessage(error)}`,
-          cause: error,
-        });
-      }
-
-      const owner = await inspectLockOwner(context.lockPath);
-      if (owner.status !== 'live') {
-        throw resolvedAbort(context, {
-          code: 'session_pointer_lock_recovery_required',
-          operation: 'lock-acquire',
-          ...(candidateSessionId ? { candidateSessionId } : {}),
-          lockPath: context.lockPath,
-          lockOwnerStatus: owner.status,
-          reason: `Session pointer lock requires explicit recovery (${owner.status}).`,
-        });
-      }
-
-      const remaining = deadline - transactionDependencies.nowMs();
-      if (remaining <= 0) {
-        throw resolvedAbort(context, {
-          code: 'session_pointer_lock_timeout',
-          operation: 'lock-acquire',
-          ...(candidateSessionId ? { candidateSessionId } : {}),
-          lockPath: context.lockPath,
-          lockOwnerStatus: 'live',
-          reason: 'Timed out waiting for the live session pointer lock owner.',
-        });
-      }
-      const delay = Math.min(LOCK_RETRY_DELAYS_MS[Math.min(attempt, LOCK_RETRY_DELAYS_MS.length - 1)], remaining);
-      attempt += 1;
-      try {
-        await transactionDependencies.sleep(delay);
-      } catch (sleepError) {
-        throw resolvedAbort(context, {
-          code: 'session_pointer_io_failure',
-          operation: 'lock-acquire',
-          ...(candidateSessionId ? { candidateSessionId } : {}),
-          lockPath: context.lockPath,
-          reason: `Unable to wait for session pointer lock: ${errorMessage(sleepError)}`,
-          cause: sleepError,
-        });
-      }
-    }
-  }
-
-  let token: string;
-  try {
-    token = transactionDependencies.token();
-  } catch (error) {
-    const primary = resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'lock-owner-publish',
-      ...(candidateSessionId ? { candidateSessionId } : {}),
-      lockPath: context.lockPath,
-      reason: `Unable to create session pointer lock token: ${errorMessage(error)}`,
-      cause: error,
-    });
-    const failures = await rollbackUnpublishedLock(context);
-    if (failures.length === 0) throw primary;
-    throw recoveryAbort(context, primary, failures, 'precommit-cleanup');
-  }
-
-  if (!isValidToken(token)) {
-    const cause = new Error('Session pointer transaction token is invalid.');
-    const primary = resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'lock-owner-publish',
-      ...(candidateSessionId ? { candidateSessionId } : {}),
-      lockPath: context.lockPath,
-      reason: cause.message,
-      cause,
-    });
-    const failures = await rollbackUnpublishedLock(context);
-    if (failures.length === 0) throw primary;
-    throw recoveryAbort(context, primary, failures, 'precommit-cleanup');
-  }
-
-  const ownerTempPath = join(context.lockPath, `owner.${token}.tmp`);
-  const ownerPath = join(context.lockPath, 'owner.json');
-  try {
-    await transactionDependencies.fs.writeFile(ownerTempPath, JSON.stringify(buildLockOwner(token)), { mode: 0o600 });
-    await transactionDependencies.fs.openAndSync(ownerTempPath);
-    await transactionDependencies.fs.rename(ownerTempPath, ownerPath);
-  } catch (error) {
-    const primary = resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'lock-owner-publish',
-      ...(candidateSessionId ? { candidateSessionId } : {}),
-      lockPath: context.lockPath,
-      reason: `Unable to publish session pointer lock owner: ${errorMessage(error)}`,
-      cause: error,
-    });
-    const failures = await rollbackUnpublishedLock(context, ownerTempPath);
-    if (failures.length === 0) throw primary;
-    throw recoveryAbort(context, primary, failures, 'precommit-cleanup');
-  }
-
-  return { context, token };
-}
-
-async function releasePointerLock(lock: HeldPointerLock): Promise<SessionPointerSecondaryFailure[]> {
-  const ownerPath = join(lock.context.lockPath, 'owner.json');
-  let owner: SessionPointerLockOwnerV1 | null = null;
-  try {
-    owner = parseLockOwner(await transactionDependencies.fs.readFile(ownerPath, 'utf8'));
-  } catch {
-    // The error is represented as a token-check uncertainty below.
-  }
-
-  if (!owner || owner.token !== lock.token) {
-    return [{
-      operation: 'lock-release',
-      phase: 'token-check',
-      ownership: 'uncertain',
-      message: 'Unable to prove ownership of the canonical session pointer lock.',
-      evidencePath: lock.context.lockPath,
-    }];
-  }
-
-  const releasePath = `${lock.context.lockPath}.release-${lock.token}`;
-  try {
-    await transactionDependencies.fs.rename(lock.context.lockPath, releasePath);
-  } catch (error) {
-    return [{
-      operation: 'lock-release',
-      phase: 'rename',
-      ownership: 'held',
-      message: `Unable to release the canonical session pointer lock: ${errorMessage(error)}`,
-      cause: error,
-      evidencePath: lock.context.lockPath,
-    }];
-  }
-  try {
-    await transactionDependencies.fs.unlink(join(releasePath, 'owner.json'));
-  } catch (error) {
-    if (!isNotFound(error)) {
-      return [{
-        operation: 'lock-release',
-        phase: 'remove-release-dir',
-        ownership: 'released',
-        message: `Unable to remove released session pointer lock owner: ${errorMessage(error)}`,
-        cause: error,
-        evidencePath: releasePath,
-      }];
-    }
-  }
-
-  try {
-    await transactionDependencies.fs.rmdir(releasePath);
-    return [];
-  } catch (error) {
-    return [{
-      operation: 'lock-release',
-      phase: 'remove-release-dir',
-      ownership: 'released',
-      message: `Unable to remove released session pointer lock evidence: ${errorMessage(error)}`,
-      cause: error,
-      evidencePath: releasePath,
-    }];
-  }
-}
-
-function recoveryAbort(
-  context: SessionPointerContext,
-  primary: ResolvedSessionPointerAbort,
-  failures: readonly SessionPointerSecondaryFailure[],
-  operation: 'precommit-cleanup' | 'lock-release',
-): ResolvedSessionPointerAbort {
-  return resolvedAbort(context, {
-    code: 'session_pointer_lock_recovery_required',
-    operation,
-    ...(primary.candidateSessionId ? { candidateSessionId: primary.candidateSessionId } : {}),
-    ...(primary.canonicalSessionId ? { canonicalSessionId: primary.canonicalSessionId } : {}),
-    lockPath: context.lockPath,
-    ...(primary.pointerStatus ? { pointerStatus: primary.pointerStatus } : {}),
-    reason: `Session pointer cleanup requires explicit recovery after ${primary.operation}.`,
-    cause: primary.cause,
-    primaryOperation: primary.operation as ResolvedSessionPointerAbort['primaryOperation'],
-    secondaryFailures: failures,
-  });
-}
-
-function releaseFailureError(failures: readonly SessionPointerSecondaryFailure[]): Error {
-  const error = new Error('Session pointer committed, but lock release left recovery evidence.');
-  Object.assign(error, { secondaryFailures: failures });
-  return error;
-}
-
-async function finalizePrecommitAbort(
-  lock: HeldPointerLock,
-  primary: ResolvedSessionPointerAbort,
-  pointerTempPath?: string,
-): Promise<ResolvedSessionPointerAbort> {
-  const failures: SessionPointerSecondaryFailure[] = [];
-  if (pointerTempPath) {
-    const pointerTempFailure = await removeOwnedPath(pointerTempPath);
-    if (pointerTempFailure) failures.push(pointerTempFailure);
-  }
-  failures.push(...await releasePointerLock(lock));
-  if (failures.length === 0) return primary;
-  return recoveryAbort(
-    lock.context,
-    primary,
-    failures,
-    pointerTempPath && failures[0]?.phase === 'remove-pointer-temp' ? 'precommit-cleanup' : 'lock-release',
-  );
-}
-
-function unusablePointerAbort(
-  context: SessionPointerContext,
-  candidateSessionId: string | undefined,
-  pointer: SessionPointerReadResult,
-): ResolvedSessionPointerAbort {
-  const pointerStatus = pointer.status === 'malformed'
-    || pointer.status === 'foreign-cwd'
-    || pointer.status === 'identity-indeterminate'
-    ? pointer.status
-    : undefined;
-  return resolvedAbort(context, {
-    code: 'session_pointer_unusable',
-    operation: 'pointer-classify',
-    ...(candidateSessionId ? { candidateSessionId } : {}),
-    ...(pointer.state?.session_id ? { canonicalSessionId: pointer.state.session_id } : {}),
-    lockPath: context.lockPath,
-    ...(pointerStatus ? { pointerStatus } : {}),
-    reason: `Selected session pointer is ${pointer.status} and is preserved.`,
-  });
-}
-
-function ownerConflictAbort(
-  context: SessionPointerContext,
-  candidateSessionId: string,
+/**
+ * Check if a session is stale.
+ * - If the owning PID is dead, it is stale.
+ * - On Linux, require process identity validation (start ticks, optional cmdline).
+ *   If identity cannot be validated, treat the session as stale.
+ */
+export function isSessionStale(
   state: SessionState,
-  cause?: unknown,
-): ResolvedSessionPointerAbort {
-  return resolvedAbort(context, {
-    code: 'session_pointer_owner_conflict',
-    operation: 'owner-conflict',
-    candidateSessionId,
-    canonicalSessionId: state.session_id,
-    lockPath: context.lockPath,
-    reason: `Session pointer ${state.session_id} conflicts with requested session ${candidateSessionId}.`,
-    ...(cause ? { cause } : {}),
-  });
-}
+  options: SessionStaleCheckOptions = {},
+): boolean {
+  if (!Number.isInteger(state.pid) || state.pid <= 0) return true;
 
-interface PointerTransactionResult<T> {
-  context: SessionPointerContext;
-  value: T;
-}
+  const isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
+  if (!isPidAlive(state.pid)) return true;
 
-async function writePointerTransaction<T>(
-  cwd: string,
-  candidateSessionId: string | undefined,
-  options: Pick<SessionStartOptions, 'context'>,
-  timeoutMs: number,
-  transition: (pointer: SessionPointerReadResult, context: SessionPointerContext) => T,
-  pointerState: (value: T) => SessionState,
-): Promise<PointerTransactionResult<T>> {
-  let context: SessionPointerContext;
-  try {
-    context = options.context ?? resolveSessionPointerContext(cwd);
-  } catch (error) {
-    throw contextAbort(cwd, candidateSessionId, error);
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'linux') return false;
+
+  const readIdentity = options.readLinuxIdentity ?? readLinuxProcessIdentity;
+  const liveIdentity = readIdentity(state.pid);
+  if (!liveIdentity) return true;
+
+  if (typeof state.pid_start_ticks !== 'number') return true;
+  if (state.pid_start_ticks !== liveIdentity.startTicks) return true;
+
+  const expectedCmdline = normalizeCmdline(state.pid_cmdline);
+  if (expectedCmdline) {
+    const liveCmdline = normalizeCmdline(liveIdentity.cmdline);
+    if (!liveCmdline || liveCmdline !== expectedCmdline) return true;
   }
 
-  if (!candidateSessionId) {
-    const cause = new Error('A valid session ID is required for pointer mutation.');
-    throw resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'pointer-classify',
-      lockPath: context.lockPath,
-      reason: cause.message,
-      cause,
-    });
-  }
-
-  try {
-    await transactionDependencies.fs.mkdir(context.baseStateDir, { recursive: true });
-  } catch (error) {
-    throw resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'state-dir-create',
-      candidateSessionId,
-      lockPath: context.lockPath,
-      reason: `Unable to create selected session state directory: ${errorMessage(error)}`,
-      cause: error,
-    });
-  }
-
-  const lock = await acquirePointerLock(
-    context,
-    candidateSessionId,
-    timeoutMs,
-  );
-  const pointerTempPath = `${context.sessionPath}.tmp-${lock.token}`;
-  let pointerCommitted = false;
-
-  try {
-    let pointer: SessionPointerReadResult;
-    try {
-      pointer = await readSessionPointer(context);
-    } catch (error) {
-      throw resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-read',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Unable to read selected session pointer: ${errorMessage(error)}`,
-        cause: error,
-      });
-    }
-
-    let next: T;
-    try {
-      next = transition(pointer, context);
-    } catch (error) {
-      if (isSessionPointerLaunchAbort(error)) throw error;
-      const state = pointer.state;
-      throw ownerConflictAbort(context, candidateSessionId, state ?? {
-        session_id: candidateSessionId,
-        started_at: '',
-        cwd: context.cwd,
-        pid: 0,
-      }, error);
-    }
-
-    const serialized = JSON.stringify(pointerState(next), null, 2);
-    try {
-      await transactionDependencies.fs.writeFile(pointerTempPath, serialized, { mode: 0o600, flag: 'wx' });
-    } catch (error) {
-      throw resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-temp-write',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Unable to write session pointer temporary file: ${errorMessage(error)}`,
-        cause: error,
-      });
-    }
-    try {
-      await transactionDependencies.fs.openAndSync(pointerTempPath);
-    } catch (error) {
-      throw resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-fsync',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Unable to sync session pointer temporary file: ${errorMessage(error)}`,
-        cause: error,
-      });
-    }
-    try {
-      await transactionDependencies.fs.rename(pointerTempPath, context.sessionPath);
-      pointerCommitted = true;
-    } catch (error) {
-      throw resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-rename',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Unable to atomically publish session pointer: ${errorMessage(error)}`,
-        cause: error,
-      });
-    }
-
-    const releaseFailures = await releasePointerLock(lock);
-    if (releaseFailures.length > 0) throw releaseFailureError(releaseFailures);
-    return { context, value: next };
-  } catch (error) {
-    if (pointerCommitted) throw error;
-    const primary = isSessionPointerLaunchAbort(error)
-      ? error as ResolvedSessionPointerAbort
-      : resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-classify',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Session pointer transition failed before commit: ${errorMessage(error)}`,
-        cause: error,
-      });
-    const ownsPointerTemp = primary.operation === 'pointer-temp-write'
-      || primary.operation === 'pointer-fsync'
-      || primary.operation === 'pointer-rename';
-    throw await finalizePrecommitAbort(lock, primary, ownsPointerTemp ? pointerTempPath : undefined);
-  }
+  return false;
 }
 
-function startPointerTransition(
-  requestedSessionId: string,
-  options: SessionStartOptions,
-): (pointer: SessionPointerReadResult, context: SessionPointerContext) => SessionState {
-  return (pointer, context) => {
-    if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
-      throw unusablePointerAbort(context, requestedSessionId, pointer);
-    }
-
-    const existing = pointer.status === 'usable' ? pointer.state : undefined;
-    if (existing && !isStartCompatible(existing, requestedSessionId)) {
-      throw ownerConflictAbort(context, requestedSessionId, existing);
-    }
-
-    const canonicalSessionId = existing?.session_id ?? requestedSessionId;
-    const pid = resolvePid(options);
-    const platform = options.platform ?? process.platform;
-    const ownerCandidate = verifiedOwnerCandidate(context, options);
-    let ownerOmxSessionId: string | undefined;
-    try {
-      ownerOmxSessionId = mergeOwnerAlias(
-        existing,
-        ownerCandidate,
-        ownerCandidate !== undefined,
-      );
-    } catch (error) {
-      throw ownerConflictAbort(context, requestedSessionId, existing ?? {
-        session_id: canonicalSessionId,
-        started_at: '',
-        cwd: context.cwd,
-        pid,
-      }, error);
-    }
-
-    return createSessionState(context.cwd, canonicalSessionId, pid, platform, sessionIdentityFor(pid, platform), {
-      nativeSessionId: options.nativeSessionId ?? existing?.native_session_id,
-      previousNativeSessionId: options.previousNativeSessionId ?? existing?.previous_native_session_id,
-      nativeSessionSwitchedAt: options.nativeSessionSwitchedAt ?? existing?.native_session_switched_at,
-      ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-      tmuxSessionName: options.tmuxSessionName ?? existing?.tmux_session_name,
-      tmuxPaneId: options.tmuxPaneId ?? existing?.tmux_pane_id,
-    });
-  };
-}
-
-/** Write or merge a wrapper-owned canonical pointer through the exact-root transaction. */
+/**
+ * Write session start state after the workspace authority is committed and
+ * validated. The recorded cwd is diagnostic metadata; it never selects roots.
+ */
 export async function writeSessionStart(
   cwd: string,
   sessionId: string,
   options: SessionStartOptions = {},
 ): Promise<SessionState> {
-  const requestedSessionId = normalizeSessionId(sessionId);
-  const result = await writePointerTransaction(
-    cwd,
-    requestedSessionId,
-    options,
-    DEFAULT_POINTER_TIMEOUT_MS,
-    startPointerTransition(requestedSessionId ?? sessionId, options),
-    (state) => state,
-  );
-  await appendToLogAtContext(result.context, {
-    event: 'session_start',
-    session_id: result.value.session_id,
-    ...(result.value.native_session_id ? { native_session_id: result.value.native_session_id } : {}),
-    pid: result.value.pid,
-    timestamp: result.value.started_at,
-  }).catch(() => {});
-  return result.value;
-}
+  const authority = await initializeSessionAuthority(cwd, sessionId, sessionAliases(options));
 
-interface NativeReconcileTransition {
-  state: SessionState;
-  replacementLog?: Record<string, unknown>;
-}
-
-function reconcileNativeTransition(
-  nativeSessionId: string,
-  options: SessionStartOptions,
-): (pointer: SessionPointerReadResult, context: SessionPointerContext) => NativeReconcileTransition {
-  return (pointer, context) => {
-    if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
-      throw unusablePointerAbort(context, nativeSessionId, pointer);
-    }
-
-    const pid = resolvePid(options);
+  return await withStateAuthorityTransaction(authority, async (context) => {
+    const stateDir = context.canonical_state_root;
+    const existing = await readSessionStateAt(stateDir, context.generation.root_identity);
+    const sameSession = existing?.session_id === sessionId;
+    const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+      ? options.pid
+      : process.pid;
     const platform = options.platform ?? process.platform;
-    const linuxIdentity = sessionIdentityFor(pid, platform);
-    const existing = pointer.status === 'usable' ? pointer.state : undefined;
-    const nowIso = new Date().toISOString();
+    const linuxIdentity = platform === 'linux'
+      ? readLinuxProcessIdentity(pid)
+      : null;
+    const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
+      nativeSessionId: options.nativeSessionId ?? (sameSession ? existing?.native_session_id : undefined),
+      previousNativeSessionId: options.previousNativeSessionId ?? (sameSession ? existing?.previous_native_session_id : undefined),
+      nativeSessionSwitchedAt: options.nativeSessionSwitchedAt ?? (sameSession ? existing?.native_session_switched_at : undefined),
+      ownerOmxSessionId: options.ownerOmxSessionId ?? (sameSession ? existing?.owner_omx_session_id : undefined),
+      tmuxSessionName: options.tmuxSessionName ?? (sameSession ? existing?.tmux_session_name : undefined),
+      tmuxPaneId: options.tmuxPaneId ?? (sameSession ? existing?.tmux_pane_id : undefined),
+    });
 
-    if (!existing) {
-      const ownerCandidate = verifiedOwnerCandidate(context, options);
-      const ownerOmxSessionId = ownerCandidate;
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        }),
-      };
-    }
+    await writeSessionIoFile(
+      stateDir,
+      context.generation.root_identity,
+      sessionPath(stateDir),
+      JSON.stringify(state, null, 2),
+    );
+    const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
+    await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, {
+      event: 'session_start',
+      session_id: sessionId,
+      ...(state.native_session_id ? { native_session_id: state.native_session_id } : {}),
+      pid,
+      timestamp: state.started_at,
+    });
+    return state;
+  });
+}
 
-    const existingNativeSessionId = normalizeSessionId(existing.native_session_id);
-    if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
-      const ownerOmxSessionId = getOmxLaunchSessionId(existing);
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? {
-            previousNativeSessionId: existingNativeSessionId,
-            nativeSessionSwitchedAt: nowIso,
-            ownerOmxSessionId,
-          } : {}),
-        }),
-        ...(ownerOmxSessionId ? {
-          replacementLog: {
-            event: 'native_session_replaced',
-            session_id: ownerOmxSessionId,
-            ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
-            previous_native_session_id: existingNativeSessionId,
-            replaced_by_native_session_id: nativeSessionId,
-            pid,
-            timestamp: nowIso,
-          },
-        } : {}),
-      };
-    }
-
-    const ownerCandidate = verifiedOwnerCandidate(context, options);
-    let ownerOmxSessionId: string | undefined;
-    try {
-      ownerOmxSessionId = mergeOwnerAlias(
-        existing,
-        ownerCandidate,
-        ownerCandidate !== undefined,
-      );
-    } catch (error) {
-      throw ownerConflictAbort(context, nativeSessionId, existing, error);
-    }
-
-    return {
-      state: createSessionState(context.cwd, existing.session_id, pid, platform, linuxIdentity, {
-        nowIso,
-        nativeSessionId,
-        previousNativeSessionId: existing.previous_native_session_id,
-        nativeSessionSwitchedAt: existing.native_session_switched_at,
-        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        startedAt: existing.started_at,
-        tmuxSessionName: existing.tmux_session_name,
-        tmuxPaneId: existing.tmux_pane_id,
-      }),
-    };
-  };
+function getOmxLaunchSessionId(state: SessionState): string | undefined {
+  if (state.session_id.startsWith('omx-')) return state.session_id;
+  if (typeof state.owner_omx_session_id === 'string' && state.owner_omx_session_id.startsWith('omx-')) {
+    return state.owner_omx_session_id;
+  }
+  return undefined;
 }
 
 /**
- * Reconcile a native SessionStart without borrowing another root's pointer.
- * A different native ID retains the existing OMX owner chain, but never binds a
- * new owner alias during that replacement transition.
+ * Reconcile a native/Codex SessionStart with the canonical OMX launch session.
+ * Same-native restarts preserve the current logical session and refresh
+ * PID/native metadata. Native-session replacements start a fresh native-scoped
+ * session to avoid inheriting stale task-scoped state; when the replaced session
+ * belongs to an OMX launch wrapper, retain that wrapper as owner for later
+ * archive/cleanup and log the replacement chain.
  */
 export async function reconcileNativeSessionStart(
   cwd: string,
   nativeSessionId: string,
   options: SessionStartOptions = {},
 ): Promise<SessionState> {
-  const normalizedNativeSessionId = normalizeSessionId(nativeSessionId);
-  const result = await writePointerTransaction(
-    cwd,
-    normalizedNativeSessionId,
-    options,
-    NATIVE_POINTER_TIMEOUT_MS,
-    reconcileNativeTransition(normalizedNativeSessionId ?? nativeSessionId, options),
-    (transition) => transition.state,
-  );
-  if (result.value.replacementLog) {
-    await appendToLogAtContext(result.context, result.value.replacementLog).catch(() => {});
+  const existing = await readUsableSessionState(cwd, {
+    ...(options.platform ? { platform: options.platform } : {}),
+  });
+  if (!existing) {
+    const previousAuthoritySessionId = (await resolveExistingSessionAuthority(cwd))?.session_binding?.canonical_session_id;
+    return await writeSessionStart(cwd, nativeSessionId, {
+      ...options,
+      nativeSessionId,
+      ...(previousAuthoritySessionId ? { previousNativeSessionId: previousAuthoritySessionId } : {}),
+    });
   }
-  await appendToLogAtContext(result.context, {
-    event: result.value.replacementLog ? 'session_start' : 'session_start_reconciled',
-    session_id: result.value.state.session_id,
-    native_session_id: normalizedNativeSessionId ?? nativeSessionId,
-    pid: result.value.state.pid,
-    timestamp: result.value.state.native_session_switched_at ?? new Date().toISOString(),
-  }).catch(() => {});
-  return result.value.state;
-}
 
-function historyDirectory(context: SessionPointerContext): string {
-  return join(dirname(context.baseStateDir), 'logs');
-}
+  const existingNativeSessionId = typeof existing.native_session_id === 'string'
+    ? existing.native_session_id.trim()
+    : '';
+  if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
+    const ownerOmxSessionId = getOmxLaunchSessionId(existing);
+    if (ownerOmxSessionId) {
+      const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+        ? options.pid
+        : process.pid;
+      const nowIso = new Date().toISOString();
+      await appendToLog(cwd, {
+        event: 'native_session_replaced',
+        session_id: ownerOmxSessionId,
+        ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
+        previous_native_session_id: existingNativeSessionId,
+        replaced_by_native_session_id: nativeSessionId,
+        pid,
+        timestamp: nowIso,
+      });
 
-function historyPath(context: SessionPointerContext): string {
-  return join(historyDirectory(context), HISTORY_FILE);
-}
-
-async function removeDeadSessionHudState(
-  context: SessionPointerContext,
-  sessionIds: Array<string | undefined>,
-): Promise<void> {
-  const uniqueSessionIds = [...new Set(sessionIds.filter((value): value is string => Boolean(normalizeSessionId(value))))];
-  const candidatePaths = [
-    join(context.baseStateDir, 'hud-state.json'),
-    ...uniqueSessionIds.map((sessionId) => join(context.baseStateDir, 'sessions', sessionId, 'hud-state.json')),
-  ];
-  await Promise.all(candidatePaths.map(async (path) => {
-    try {
-      await rm(path, { force: true });
-    } catch {
-      // HUD cleanup remains best effort after history has been recorded.
+      return await writeSessionStart(cwd, nativeSessionId, {
+        ...options,
+        nativeSessionId,
+        previousNativeSessionId: existingNativeSessionId,
+        nativeSessionSwitchedAt: nowIso,
+        ownerOmxSessionId,
+      });
     }
-  }));
+
+    return await writeSessionStart(cwd, nativeSessionId, {
+      ...options,
+      nativeSessionId,
+    });
+  }
+
+  const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+    ? options.pid
+    : process.pid;
+  const platform = options.platform ?? process.platform;
+  const linuxIdentity = platform === 'linux'
+    ? readLinuxProcessIdentity(pid)
+    : null;
+  const nowIso = new Date().toISOString();
+  const authority = await initializeSessionAuthority(
+    cwd,
+    existing.session_id,
+    sessionAliases({
+      nativeSessionId,
+      previousNativeSessionId: options.previousNativeSessionId ?? existing.previous_native_session_id,
+      ownerOmxSessionId: options.ownerOmxSessionId ?? existing.owner_omx_session_id,
+    }),
+  );
+  return await withStateAuthorityTransaction(authority, async (context) => {
+    const state = createSessionState(cwd, existing.session_id, pid, platform, linuxIdentity, {
+      nowIso,
+      nativeSessionId,
+      previousNativeSessionId: existing.previous_native_session_id,
+      nativeSessionSwitchedAt: existing.native_session_switched_at,
+      ownerOmxSessionId: options.ownerOmxSessionId ?? existing.owner_omx_session_id,
+      startedAt: existing.started_at,
+      tmuxSessionName: existing.tmux_session_name,
+      tmuxPaneId: existing.tmux_pane_id,
+    });
+    await writeSessionIoFile(
+      context.canonical_state_root,
+      context.generation.root_identity,
+      sessionPath(context.canonical_state_root),
+      JSON.stringify(state, null, 2),
+    );
+    const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
+    await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, {
+      event: 'session_start_reconciled',
+      session_id: state.session_id,
+      native_session_id: nativeSessionId,
+      pid,
+      timestamp: nowIso,
+    });
+    return state;
+  });
 }
 
 /**
- * Archive first and remove an owned pointer only after that history write
- * succeeds. Present unusable pointer evidence is never repaired or archived.
+ * Write session end: record durable authority evidence, archive history, then
+ * remove only the owned session pointer.
  */
-export async function writeSessionEnd(
-  cwd: string,
-  sessionId: string,
-  options: Pick<SessionStartOptions, 'context'> = {},
-): Promise<void> {
-  const candidateSessionId = normalizeSessionId(sessionId);
-  let context: SessionPointerContext;
-  try {
-    context = options.context ?? resolveSessionPointerContext(cwd);
-  } catch (error) {
-    throw contextAbort(cwd, candidateSessionId, error);
-  }
-  if (!candidateSessionId) {
-    const cause = new Error('A valid session ID is required to end a session pointer.');
-    throw resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'pointer-classify',
-      lockPath: context.lockPath,
-      reason: cause.message,
-      cause,
-    });
-  }
-
-  try {
-    await transactionDependencies.fs.mkdir(context.baseStateDir, { recursive: true });
-  } catch (error) {
-    throw resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'state-dir-create',
-      candidateSessionId,
-      lockPath: context.lockPath,
-      reason: `Unable to create selected session state directory: ${errorMessage(error)}`,
-      cause: error,
-    });
-  }
-
-  const lock = await acquirePointerLock(
-    context,
-    candidateSessionId,
-    DEFAULT_POINTER_TIMEOUT_MS,
-  );
-  let primary: unknown;
-  try {
-    let pointer: SessionPointerReadResult;
-    try {
-      pointer = await readSessionPointer(context);
-    } catch (error) {
-      throw resolvedAbort(context, {
-        code: 'session_pointer_io_failure',
-        operation: 'pointer-read',
-        candidateSessionId,
-        lockPath: context.lockPath,
-        reason: `Unable to read selected session pointer: ${errorMessage(error)}`,
-        cause: error,
-      });
-    }
-    if (pointer.status !== 'absent' && pointer.status !== 'usable') {
-      throw unusablePointerAbort(context, candidateSessionId, pointer);
-    }
-
-    const state = pointer.state;
-    const ownsCurrentSessionFile = state == null
-      || state.session_id === candidateSessionId
-      || state.native_session_id === candidateSessionId
-      || state.owner_omx_session_id === candidateSessionId;
+export async function writeSessionEnd(cwd: string, sessionId: string): Promise<void> {
+  const authority = await resolveSessionAuthorityForGuard(cwd);
+  await withStateAuthorityTransaction(authority, async (context) => {
+    const state = await readSessionStateAt(context.canonical_state_root, context.generation.root_identity);
     const endTime = new Date().toISOString();
+    const ownsCurrentSessionFile = state == null
+      || state.session_id === sessionId
+      || state.native_session_id === sessionId
+      || state.owner_omx_session_id === sessionId;
+    const recordedSessionId = ownsCurrentSessionFile
+      ? (state?.owner_omx_session_id === sessionId ? sessionId : state?.session_id || sessionId)
+      : sessionId;
+    const preservedActiveSessionId = !ownsCurrentSessionFile && state?.session_id
+      ? state.session_id
+      : undefined;
+
+    await appendStateAuthorityEvidence(context.generation, {
+      kind: 'session_end',
+      session_id: recordedSessionId,
+      requested_session_id: sessionId,
+      owns_current_session_file: ownsCurrentSessionFile,
+      timestamp: endTime,
+    });
+
     const historyEntry = {
-      session_id: ownsCurrentSessionFile
-        ? (state?.owner_omx_session_id === candidateSessionId ? candidateSessionId : state?.session_id || candidateSessionId)
-        : candidateSessionId,
+      session_id: recordedSessionId,
       ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
       started_at: ownsCurrentSessionFile ? state?.started_at || 'unknown' : 'unknown',
       ended_at: endTime,
-      cwd: context.cwd,
+      cwd,
       pid: ownsCurrentSessionFile ? state?.pid || process.pid : process.pid,
-      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === candidateSessionId && state?.session_id
+      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
         ? { active_session_id: state.session_id }
         : {}),
-      ...(!ownsCurrentSessionFile && state?.session_id ? { preserved_active_session_id: state.session_id } : {}),
+      ...(preservedActiveSessionId ? { preserved_active_session_id: preservedActiveSessionId } : {}),
     };
+    const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
+    const history = historyPath(context.generation.canonical_omx_root);
+    await appendSessionIoFile(
+      context.generation.canonical_omx_root,
+      omxRootIdentity,
+      history,
+      `${JSON.stringify(historyEntry)}\n`,
+    );
 
-    await nodeMkdir(historyDirectory(context), { recursive: true });
-    await appendFile(historyPath(context), `${JSON.stringify(historyEntry)}\n`);
-    await removeDeadSessionHudState(context, [
-      ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
-      candidateSessionId,
-    ]);
+    await removeDeadSessionHudState(
+      context.canonical_state_root,
+      context.generation.root_identity,
+      [
+        ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
+        sessionId,
+      ],
+      ownsCurrentSessionFile && state !== null,
+    );
     if (ownsCurrentSessionFile) {
-      try {
-        await transactionDependencies.fs.unlink(context.sessionPath);
-      } catch (error) {
-        if (!isNotFound(error)) throw error;
-      }
+      await deleteSessionIoFile(
+        context.canonical_state_root,
+        context.generation.root_identity,
+        sessionPath(context.canonical_state_root),
+      );
     }
-    await appendToLogAtContext(context, {
+
+    await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, {
       event: 'session_end',
-      session_id: historyEntry.session_id,
-      ...(historyEntry.native_session_id ? { native_session_id: historyEntry.native_session_id } : {}),
-      ...(historyEntry.active_session_id ? { active_session_id: historyEntry.active_session_id } : {}),
-      ...(historyEntry.preserved_active_session_id ? { preserved_active_session_id: historyEntry.preserved_active_session_id } : {}),
+      session_id: recordedSessionId,
+      ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
+        ? { active_session_id: state.session_id }
+        : {}),
+      ...(preservedActiveSessionId ? { preserved_active_session_id: preservedActiveSessionId } : {}),
       timestamp: endTime,
-    }).catch(() => {});
-  } catch (error) {
-    primary = error;
-  }
-
-  const releaseFailures = await releasePointerLock(lock);
-  if (primary) {
-    if (isSessionPointerLaunchAbort(primary) && releaseFailures.length > 0) {
-      throw recoveryAbort(context, primary as ResolvedSessionPointerAbort, releaseFailures, 'lock-release');
-    }
-    throw primary;
-  }
-  if (releaseFailures.length > 0) throw releaseFailureError(releaseFailures);
-}
-
-/** Reset session-scoped HUD/metrics files at launch. */
-export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
-  const context = resolveSessionPointerContext(cwd);
-  const omxDir = omxRoot(context.cwd);
-  await nodeMkdir(omxDir, { recursive: true });
-  await transactionDependencies.fs.mkdir(context.baseStateDir, { recursive: true });
-
-  const now = new Date().toISOString();
-  await nodeWriteFile(join(omxDir, 'metrics.json'), JSON.stringify({
-    total_turns: 0,
-    session_turns: 0,
-    last_activity: now,
-    session_input_tokens: 0,
-    session_output_tokens: 0,
-    session_total_tokens: 0,
-    five_hour_limit_pct: 0,
-    weekly_limit_pct: 0,
-  }, null, 2));
-
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  const hudStatePath = normalizedSessionId
-    ? join(context.baseStateDir, 'sessions', normalizedSessionId, 'hud-state.json')
-    : join(context.baseStateDir, 'hud-state.json');
-  await nodeMkdir(dirname(hudStatePath), { recursive: true });
-  await nodeWriteFile(hudStatePath, JSON.stringify({
-    last_turn_at: now,
-    last_progress_at: now,
-    turn_count: 0,
-    last_agent_output: '',
-  }, null, 2));
-}
-
-async function appendToLogAtContext(
-  context: SessionPointerContext,
-  entry: Record<string, unknown>,
-): Promise<void> {
-  const logsDir = historyDirectory(context);
-  await nodeMkdir(logsDir, { recursive: true });
-  const logFile = join(logsDir, `omx-${new Date().toISOString().slice(0, 10)}.jsonl`);
-  await appendFile(logFile, `${JSON.stringify({ ...entry, _ts: new Date().toISOString() })}\n`);
+    });
+  });
 }
 
 /**
- * Append a root log entry for callers that do not already own a pointer
- * context. Lifecycle transitions use appendToLogAtContext instead.
+ * Append a structured JSONL entry using the committed authority's OMX root.
  */
 export async function appendToLog(cwd: string, entry: Record<string, unknown>): Promise<void> {
-  const logsDir = omxLogsDir(cwd);
-  await nodeMkdir(logsDir, { recursive: true });
-  const logFile = join(logsDir, `omx-${new Date().toISOString().slice(0, 10)}.jsonl`);
-  await appendFile(logFile, `${JSON.stringify({ ...entry, _ts: new Date().toISOString() })}\n`);
+  const authority = await resolveSessionAuthorityForGuard(cwd);
+  await withStateAuthorityTransaction(authority, async (context) => {
+    const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
+    await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, entry);
+  });
 }

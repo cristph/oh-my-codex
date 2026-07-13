@@ -173,7 +173,7 @@ describe('collectSidecarSnapshot', () => {
   });
 });
 
-describe('collectSidecarSnapshot canonical Team state root parity', () => {
+describe('collectSidecarSnapshot canonical Team state root authority', () => {
   async function withBoxedTeam(
     envKey: 'OMX_ROOT' | 'OMX_STATE_ROOT',
     test: (params: { cwd: string; env: NodeJS.ProcessEnv; boxedRoot: string }) => Promise<void>,
@@ -196,30 +196,30 @@ describe('collectSidecarSnapshot canonical Team state root parity', () => {
     }
   }
 
-  it('resolves sidecar team state under OMX_ROOT like the Team runtime', async () => {
-    await withBoxedTeam('OMX_ROOT', async ({ cwd, env, boxedRoot }) => {
-      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), join(boxedRoot, '.omx', 'state'));
+  it('ignores OMX_ROOT as a public Team authority override', async () => {
+    await withBoxedTeam('OMX_ROOT', async ({ cwd, env }) => {
+      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), join(cwd, '.omx', 'state'));
       const snapshot = await collectSidecarSnapshot('demo', { cwd, env, now: new Date('2026-04-27T02:01:00.000Z') });
-      assert.ok(snapshot, 'sidecar must read team state from the canonical OMX_ROOT location');
+      assert.ok(snapshot, 'sidecar must read team state from the canonical workspace authority location');
       assert.equal(snapshot.team_name, 'demo');
     });
   });
 
-  it('resolves sidecar team state under OMX_STATE_ROOT like the Team runtime', async () => {
-    await withBoxedTeam('OMX_STATE_ROOT', async ({ cwd, env, boxedRoot }) => {
-      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), join(boxedRoot, '.omx', 'state'));
+  it('ignores OMX_STATE_ROOT as a public Team authority override', async () => {
+    await withBoxedTeam('OMX_STATE_ROOT', async ({ cwd, env }) => {
+      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), join(cwd, '.omx', 'state'));
       const snapshot = await collectSidecarSnapshot('demo', { cwd, env, now: new Date('2026-04-27T02:01:00.000Z') });
-      assert.ok(snapshot, 'sidecar must read team state from the canonical OMX_STATE_ROOT location');
+      assert.ok(snapshot, 'sidecar must read team state from the canonical workspace authority location');
       assert.equal(snapshot.team_name, 'demo');
     });
   });
 
-  it('still honors OMX_TEAM_STATE_ROOT precedence over OMX_ROOT', async () => {
+  it('ignores conflicting OMX_TEAM_STATE_ROOT and OMX_ROOT aliases', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-sidecar-precedence-'));
     try {
       const teamStateRoot = join(cwd, 'explicit-team-state');
       const env = { OMX_TEAM_STATE_ROOT: teamStateRoot, OMX_ROOT: join(cwd, 'box') } as NodeJS.ProcessEnv;
-      const teamRoot = join(teamStateRoot, 'team', 'demo');
+      const teamRoot = join(cwd, '.omx', 'state', 'team', 'demo');
       await mkdir(teamRoot, { recursive: true });
       await writeJson(join(teamRoot, 'config.json'), {
         name: 'demo',
@@ -227,9 +227,9 @@ describe('collectSidecarSnapshot canonical Team state root parity', () => {
         tmux_session: 'omx-demo',
         workers: [{ name: 'worker-1', index: 1, role: 'executor' }],
       });
-      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), teamStateRoot);
+      assert.equal(resolveCanonicalTeamStateRoot(cwd, env), join(cwd, '.omx', 'state'));
       const snapshot = await collectSidecarSnapshot('demo', { cwd, env, now: new Date('2026-04-27T02:01:00.000Z') });
-      assert.ok(snapshot, 'OMX_TEAM_STATE_ROOT must win over OMX_ROOT for sidecar lookup');
+      assert.ok(snapshot, 'sidecar must ignore ambient aliases and read canonical workspace team state');
       assert.equal(snapshot.team_name, 'demo');
     } finally {
       await rm(cwd, { recursive: true, force: true });

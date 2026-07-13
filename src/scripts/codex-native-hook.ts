@@ -2,8 +2,9 @@ import { execFileSync } from "child_process";
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from "fs";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "fs/promises";
 import { extname, isAbsolute, join, relative, resolve } from "path";
+
 import { pathToFileURL } from "url";
-import { readModeStateForActiveDecision, readModeStateForSession, updateModeState } from "../modes/base.js";
+import { readModeStateForSession, updateModeState } from "../modes/base.js";
 import { redactAuthSecrets } from "../auth/redact.js";
 import {
   SKILL_ACTIVE_STATE_FILE,
@@ -27,40 +28,30 @@ import {
   resolveInstalledRoleName,
 } from "../subagents/tracker.js";
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
-import { resolveCanonicalTeamStateRoot, resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
+import { resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
 import { inferTerminalLifecycleOutcome } from "../runtime/run-outcome.js";
 import {
   appendToLog,
-  isSessionPointerLaunchAbort,
   isSessionStale,
   isSessionStateUsable,
-  normalizeSessionId,
-  readSessionPointer,
-  readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
-  resolveSessionPointerContext,
+  resolveAuthenticatedTransportAuthority,
   type SessionState,
 } from "../hooks/session.js";
 import {
   appendTeamEvent,
   readTeamLeaderAttention,
   readTeamConfig,
-  readTeamManifestV2,
   readTeamPhase,
   writeTeamLeaderAttention,
   writeTeamPhase,
 } from "../team/state.js";
 import { omxNotepadPath, resolveProjectMemoryPath } from "../utils/paths.js";
-import { findGitLayout } from "../utils/git-layout.js";
-import {
-  getAuthoritativeActiveStatePaths,
-  getBaseStateDir,
-  getStateFilePath,
-  getStatePath,
-  resolveWritableStateScope,
-  WRITABLE_STATE_SCOPE_ERRORS,
-} from "../mcp/state-paths.js";
+import { findGitLayout, resolveWorkspaceIdentity } from "../utils/git-layout.js";
+import { getBaseStateDir, getStateFilePath, getStatePath } from "../mcp/state-paths.js";
+
+import type { ResolvedStateAuthorityContext } from "../state/authority.js";
 import {
   detectKeywords,
   detectPrimaryKeyword,
@@ -124,7 +115,6 @@ import {
   type NativeSubagentUnsupportedReason,
   type RoleRoutingUnavailableMarker,
 } from "../leader/contract.js";
-import { readRunState } from "../runtime/run-state.js";
 import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
 import {
   buildCodexGoalTerminalCleanupNotice,
@@ -183,7 +173,123 @@ export interface NativeHookDispatchResult {
   outputJson: Record<string, unknown> | null;
 }
 
+interface InheritedAuthorityResolution {
+  context?: Readonly<ResolvedStateAuthorityContext>;
+  failure?: string;
+}
+
+async function resolveInheritedAuthority(
+  observedCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<InheritedAuthorityResolution> {
+  try {
+    const context = await resolveAuthenticatedTransportAuthority(observedCwd, env);
+    if (context) return { context: Object.freeze(context) };
+    if (safeString(env.OMX_CODEX_LAUNCH_ID).trim()) {
+      return {
+        failure: "authoritative launch session evidence is present but the inherited state-authority transport is absent; restart the launch through OMX instead of setting root environment variables.",
+      };
+    }
+    return {};
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      failure: `state authority validation failed: ${detail}. Do not use OMX_ROOT, OMX_STATE_ROOT, or OMX_RUNS_DIR to select state; restart from the authoritative OMX parent launch.`,
+    };
+  }
+}
+function hasOmxLaunchAuthorityEvidence(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    safeString(env.OMX_CODEX_LAUNCH_ID).trim()
+    || safeString(env.OMX_STATE_AUTHORITY_PATH).trim()
+    || safeString(env.OMX_STATE_AUTHORITY_ID).trim()
+    || safeString(env.OMX_STATE_AUTHORITY_GENERATION_ID).trim()
+    || safeString(env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST).trim()
+    || safeString(env.OMX_STATE_AUTHORITY_CAPABILITY).trim(),
+  );
+}
+
+
+function buildAuthorityHookDenial(
+  hookEventName: CodexHookEventName | null,
+  failure: string,
+): Record<string, unknown> {
+  const reason = `OMX denied this hook because ${failure}`;
+  if (hookEventName === "PreToolUse") {
+    return {
+      systemMessage: reason,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: reason,
+      },
+    };
+  }
+  if (hookEventName === "Stop") {
+    return {
+      decision: "block",
+      reason,
+      stopReason: "state_authority_conflict",
+      systemMessage: reason,
+    };
+  }
+  return {
+    continue: false,
+    stopReason: "state_authority_conflict",
+    systemMessage: reason,
+  };
+}
+
+function legacyHookStateDirectory(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  const teamStateRoot = safeString(env.OMX_TEAM_STATE_ROOT).trim();
+  if (teamStateRoot) return resolve(cwd, teamStateRoot);
+  const omxRoot = safeString(env.OMX_ROOT).trim();
+  if (omxRoot) return join(resolve(cwd, omxRoot), ".omx", "state");
+  const omxStateRoot = safeString(env.OMX_STATE_ROOT).trim();
+  if (omxStateRoot) return join(resolve(cwd, omxStateRoot), ".omx", "state");
+  return join(resolveWorkspaceIdentity(cwd).canonical_path, ".omx", "state");
+}
+function fallbackHookStateDirectory(cwd: string): string {
+  return legacyHookStateDirectory(cwd);
+}
+
+function authorityAmbientRootConflict(
+  cwd: string,
+  authority: Readonly<ResolvedStateAuthorityContext>,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const expectedStateRoot = resolve(authority.canonical_state_root);
+  const rootAliases: Array<[string, string]> = [
+    ["OMX_TEAM_STATE_ROOT", safeString(env.OMX_TEAM_STATE_ROOT).trim()],
+    ["OMX_ROOT", safeString(env.OMX_ROOT).trim()],
+    ["OMX_STATE_ROOT", safeString(env.OMX_STATE_ROOT).trim()],
+  ];
+  for (const [name, value] of rootAliases) {
+    if (!value) continue;
+    const candidate = name === "OMX_TEAM_STATE_ROOT"
+      ? resolve(cwd, value)
+      : join(resolve(cwd, value), ".omx", "state");
+    if (resolve(candidate) !== expectedStateRoot) return name;
+  }
+  return null;
+}
+
+
 const TERMINAL_MODE_PHASES = new Set(["complete", "completed", "failed", "cancelled"]);
+const CANONICAL_WORKFLOW_MODES = [
+  "autopilot",
+  "autoresearch",
+  "deep-interview",
+  "ralph",
+  "ultrawork",
+  "team",
+  "ultraqa",
+  "ultragoal",
+  "ralplan",
+] as const;
+
+type CanonicalWorkflowMode = (typeof CANONICAL_WORKFLOW_MODES)[number];
+
 const SKILL_STOP_BLOCKERS = new Set(["ralplan"]);
 const TEAM_STOP_BLOCKING_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
 const TEAM_WORKER_TERMINAL_RUN_STATES = new Set(["done", "complete", "completed", "failed", "stopped", "cancelled"]);
@@ -254,18 +360,19 @@ function safeString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function normalizeHookSessionId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_-]{1,64}$/.test(trimmed) ? trimmed : undefined;
+}
+
 async function resolveVerifiedOwnerOmxSessionId(): Promise<string | undefined> {
-  const candidate = normalizeSessionId(process.env.OMX_SESSION_ID);
+  const candidate = normalizeHookSessionId(process.env.OMX_SESSION_ID);
   if (!candidate) return undefined;
   const evidence = await probeActualTmuxInstanceEvidence(process.env.TMUX_PANE);
   return tmuxEvidenceBindsCandidate(evidence, candidate) ? candidate : undefined;
 }
 
-function isImplicitWritableScopeFailure(error: unknown): boolean {
-  return error instanceof Error
-    && (error.message === WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment
-      || error.message === WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
-}
 
 function safeObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -1247,13 +1354,13 @@ function shouldHonorCanonicalTerminalRunState(
 }
 
 async function readCanonicalTerminalRunStateForStop(
-  cwd: string,
+  stateDir: string,
   sessionId: string | undefined,
   mode: string,
 ): Promise<Record<string, unknown> | null> {
-  if (!safeString(sessionId).trim()) return null;
-  const runState = await readRunState(cwd, sessionId).catch(() => null);
-  const runRecord = runState as unknown as Record<string, unknown> | null;
+  const normalizedSessionId = safeString(sessionId).trim();
+  if (!normalizedSessionId) return null;
+  const runRecord = await readJsonIfExists(join(stateDir, "sessions", normalizedSessionId, "run-state.json"));
   return shouldHonorCanonicalTerminalRunState(runRecord, mode) ? runRecord : null;
 }
 
@@ -1383,10 +1490,9 @@ async function readRalphCompletionAuditBlockState(
     tmuxPaneId?: string;
   },
 ): Promise<RalphCompletionAuditBlockState | null> {
-  const [rawSessionInfo, usableSessionInfo] = await Promise.all([
-    readSessionState(cwd),
-    readUsableSessionState(cwd),
-  ]);
+  const sessionEvidence = await readSessionStateEvidence(cwd, stateDir);
+  const rawSessionInfo = sessionEvidence.raw;
+  const usableSessionInfo = sessionEvidence.usable;
   const currentOmxSessionId = safeString(usableSessionInfo?.session_id).trim();
   const currentNativeSessionId = safeString(usableSessionInfo?.native_session_id).trim();
   const staleCurrentSessionId = rawSessionInfo && !isSessionStateUsable(rawSessionInfo, cwd)
@@ -1413,7 +1519,7 @@ async function readRalphCompletionAuditBlockState(
 
   for (const sessionId of sessionCandidates) {
     if (staleCurrentSessionId && sessionId === staleCurrentSessionId) continue;
-    const sessionScopedPath = getStateFilePath("ralph-state.json", cwd, sessionId);
+    const sessionScopedPath = join(stateDir, "sessions", sessionId, "ralph-state.json");
     const result = evaluateCandidate(await readJsonIfExists(sessionScopedPath), sessionScopedPath, sessionId);
     if (result) return result;
   }
@@ -1448,21 +1554,27 @@ async function readActiveRalphState(
     payload?: CodexHookPayload;
   },
 ): Promise<ActiveRalphStopState | null> {
-  const [rawSessionInfo, usableSessionInfo] = await Promise.all([
-    readSessionState(cwd),
-    readUsableSessionState(cwd),
-  ]);
+  const sessionEvidence = await readSessionStateEvidence(cwd, stateDir);
+  const rawSessionInfo = sessionEvidence.raw;
+  const usableSessionInfo = sessionEvidence.usable;
   const currentOmxSessionId = safeString(usableSessionInfo?.session_id).trim();
   const currentNativeSessionId = safeString(usableSessionInfo?.native_session_id).trim();
   const staleCurrentSessionId = rawSessionInfo && !isSessionStateUsable(rawSessionInfo, cwd)
     ? safeString(rawSessionInfo.session_id).trim()
     : "";
+  const payloadSessionId = safeString(ownerContext?.payloadSessionId).trim();
+  const payloadIsCurrentSessionAlias = Boolean(
+    usableSessionInfo
+    && payloadSessionId
+    && payloadMatchesSessionPointer(payloadSessionId, usableSessionInfo),
+  );
   const sessionCandidates = [...new Set([
     safeString(preferredSessionId).trim(),
     currentOmxSessionId,
+    ...(payloadIsCurrentSessionAlias ? [payloadSessionId] : []),
   ].filter(Boolean))];
   const completedCanonicalPath = currentOmxSessionId
-    ? getStateFilePath("ralph-state.json", cwd, currentOmxSessionId)
+    ? join(stateDir, "sessions", currentOmxSessionId, "ralph-state.json")
     : "";
   const completedCanonicalState = completedCanonicalPath
     ? await readJsonIfExists(completedCanonicalPath)
@@ -1475,10 +1587,10 @@ async function readActiveRalphState(
     if (staleCurrentSessionId && sessionId === staleCurrentSessionId) {
       continue;
     }
-    if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "ralph")) {
+    if (await readCanonicalTerminalRunStateForStop(stateDir, sessionId, "ralph")) {
       continue;
     }
-    const sessionScopedPath = getStateFilePath("ralph-state.json", cwd, sessionId);
+    const sessionScopedPath = join(stateDir, "sessions", sessionId, "ralph-state.json");
     const sessionScoped = await readJsonIfExists(sessionScopedPath);
     if (sessionScoped?.active === true) {
       if (
@@ -2030,6 +2142,7 @@ async function buildSessionStartContext(
     payload?: CodexHookPayload;
     canonicalSessionId?: string;
     nativeSessionId?: string;
+    stateDir?: string;
   } = {},
 ): Promise<string | null> {
   const sections: string[] = [];
@@ -2048,12 +2161,16 @@ async function buildSessionStartContext(
 
   const modeSummaries: string[] = [];
   for (const mode of ["ralph", "autopilot", "ultrawork", "ultraqa", "ralplan", "deep-interview", "team"] as const) {
-    const state = await readJsonIfExists(getStatePath(mode, cwd, sessionId));
+    const state = options.stateDir
+      ? await readJsonIfExists(join(options.stateDir, "sessions", sessionId, `${mode}-state.json`))
+      : await readJsonIfExists(getStatePath(mode, cwd, sessionId));
     if (state?.active !== true || !isNonTerminalPhase(state.current_phase)) continue;
     if (mode === "team") {
       const teamName = safeString(state.team_name).trim();
       if (teamName) {
-        const phase = await readTeamPhase(teamName, cwd);
+        const phase = options.stateDir
+          ? await readJsonIfExists(join(options.stateDir, "team", teamName, "phase.json"))
+          : await readTeamPhase(teamName, cwd);
         const canonicalPhase = phase?.current_phase ?? state.current_phase;
         if (isNonTerminalPhase(canonicalPhase)) {
           modeSummaries.push(`- team (${teamName}) phase: ${formatPhase(canonicalPhase)}`);
@@ -2578,17 +2695,10 @@ function hasTeamWorkerEnvironment(): boolean {
 async function resolveTeamStateDirForWorkerContext(
   cwd: string,
   workerContext: { teamName: string; workerName: string },
+  authoritativeStateDir?: string,
 ): Promise<string | null> {
-  const resolved = await resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
-  if (resolved) return resolved;
-  const explicit = safeString(process.env.OMX_TEAM_STATE_ROOT).trim();
-  if (explicit) {
-    const candidate = resolve(cwd, explicit);
-    const workerRoot = join(candidate, "team", workerContext.teamName, "workers", workerContext.workerName);
-    if (existsSync(workerRoot)) return candidate;
-    return candidate;
-  }
-  return null;
+  if (authoritativeStateDir) return authoritativeStateDir;
+  return await resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
 }
 
 async function isConfirmedTeamWorkerPromptSubmitPane(cwd: string): Promise<boolean> {
@@ -2633,6 +2743,7 @@ type TeamWorkerStopDecision =
 
 async function resolveTeamWorkerStopDecision(
   cwd: string,
+  authoritativeStateDir?: string,
 ): Promise<TeamWorkerStopDecision> {
   const workerContext =
     parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
@@ -2642,7 +2753,7 @@ async function resolveTeamWorkerStopDecision(
   const blockWorkerStop = (
     reasonCode: string,
     detail: string,
-    stateDirForDecision = getBaseStateDir(cwd),
+    stateDirForDecision = authoritativeStateDir ?? getBaseStateDir(cwd),
   ): TeamWorkerStopDecision => ({
     kind: "blocked",
     stateDir: stateDirForDecision,
@@ -2659,7 +2770,7 @@ async function resolveTeamWorkerStopDecision(
     },
   });
 
-  const stateDir = await resolveTeamStateDirForWorkerContext(cwd, workerContext);
+  const stateDir = await resolveTeamStateDirForWorkerContext(cwd, workerContext, authoritativeStateDir);
   if (!stateDir) {
     return blockWorkerStop("missing_state_dir", "team state root could not be resolved");
   }
@@ -2766,12 +2877,13 @@ function isStopExempt(payload: CodexHookPayload): boolean {
 
 async function readModeStateWithStopSource(
   mode: "autopilot" | "ultrawork" | "ultraqa",
-  cwd: string,
+  stateDir: string,
   sessionId?: string,
 ): Promise<{ state: Record<string, unknown>; path: string } | null> {
-  const paths = await getAuthoritativeActiveStatePaths(mode, cwd, sessionId?.trim() || undefined).catch(() => [] as string[]);
-  const path = paths[0];
-  if (!path) return null;
+  const normalizedSessionId = sessionId?.trim();
+  const path = normalizedSessionId
+    ? join(stateDir, "sessions", normalizedSessionId, `${mode}-state.json`)
+    : join(stateDir, `${mode}-state.json`);
   const state = await readJsonIfExists(path);
   return state ? { state, path } : null;
 }
@@ -2837,18 +2949,19 @@ function listRawActiveSkillEntries(state: SkillActiveStateLike | null): SkillAct
 async function buildModeBasedStopOutput(
   mode: "autopilot" | "ultrawork" | "ultraqa",
   cwd: string,
+  stateDir: string,
   sessionId?: string,
 ): Promise<Record<string, unknown> | null> {
-  if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, mode)) {
+  if (await readCanonicalTerminalRunStateForStop(stateDir, sessionId, mode)) {
     return null;
   }
   if (mode === "autopilot" && await readAutopilotDeepInterviewQuestionWaitState(cwd, sessionId)) {
     return null;
   }
-  const sourcedState = await readModeStateWithStopSource(mode, cwd, sessionId);
+  const sourcedState = await readModeStateWithStopSource(mode, stateDir, sessionId);
   const state = sourcedState?.state ?? null;
   if (!state || !shouldContinueRun(state)) return null;
-  const rootCanonicalState = await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(getBaseStateDir(cwd)).rootPath);
+  const rootCanonicalState = await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(stateDir).rootPath);
   const canonicalDisagreement = rootCanonicalState
     ? canonicalStopDisagreement(state, rootCanonicalState, mode, sessionId)
     : "canonical_state_missing";
@@ -3184,22 +3297,20 @@ async function readTeamModeStateForStop(
   return { state: rootState, scope: "root" };
 }
 
-async function buildTeamStopOutput(cwd: string, sessionId?: string, threadId?: string): Promise<Record<string, unknown> | null> {
-  if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "team")) {
+async function buildTeamStopOutput(cwd: string, sessionId?: string, threadId?: string, stateDir = fallbackHookStateDirectory(cwd)): Promise<Record<string, unknown> | null> {
+  if (await readCanonicalTerminalRunStateForStop(stateDir, sessionId, "team")) {
     return null;
   }
-  const teamStateForStop = await readTeamModeStateForStop(cwd, getBaseStateDir(cwd), sessionId, threadId);
+  const teamStateForStop = await readTeamModeStateForStop(cwd, stateDir, sessionId, threadId);
   if (!teamStateForStop || teamStateForStop.state.active !== true) return null;
   const teamState = teamStateForStop.state;
   const teamName = safeString(teamState.team_name).trim();
-  if (teamName) {
-    const canonicalTeamDir = join(resolveCanonicalTeamStateRoot(cwd), "team", teamName);
-    if (!existsSync(canonicalTeamDir)) {
-      return null;
-    }
-  }
+  const canonicalTeamDir = teamName ? join(stateDir, "team", teamName) : "";
+  if (teamName && !existsSync(canonicalTeamDir)) return null;
   const coarsePhase = teamState.current_phase;
-  const canonicalPhaseState = teamName ? await readTeamPhase(teamName, cwd) : null;
+  const canonicalPhaseState = teamName
+    ? await readJsonIfExists(join(canonicalTeamDir, "phase.json"))
+    : null;
   if (teamStateForStop.scope === "root" && !canonicalPhaseState) return null;
   const canonicalPhase = canonicalPhaseState?.current_phase ?? coarsePhase;
   if (!isNonTerminalPhase(canonicalPhase)) return null;
@@ -3640,6 +3751,25 @@ async function readUsableSessionStateFromStateDir(
   } catch {
     return null;
   }
+}
+
+interface SessionStateEvidence {
+  present: boolean;
+  raw: SessionState | null;
+  usable: SessionState | null;
+}
+
+async function readSessionStateEvidence(
+  cwd: string,
+  stateDir: string,
+): Promise<SessionStateEvidence> {
+  const present = existsSync(join(stateDir, "session.json"));
+  const raw = await readRootSessionStateFromStateDir(stateDir);
+  return {
+    present,
+    raw,
+    usable: raw && isSessionStateUsable(raw, cwd) ? raw : null,
+  };
 }
 
 async function readStopSessionPinnedState(
@@ -8692,7 +8822,7 @@ async function readBlockingSkillForStop(
     : [...SKILL_STOP_BLOCKERS];
 
   for (const skill of candidateSkills) {
-    const terminalRunState = await readCanonicalTerminalRunStateForStop(cwd, sessionId, skill);
+    const terminalRunState = await readCanonicalTerminalRunStateForStop(stateDir, sessionId, skill);
     if (terminalRunState) continue;
 
     const modeState = await readStopSessionPinnedState(`${skill}-state.json`, cwd, sessionId, stateDir);
@@ -9338,9 +9468,10 @@ async function findCanonicalActiveTeamForSession(
   cwd: string,
   sessionId: string,
   threadId?: string,
+  stateDir = fallbackHookStateDirectory(cwd),
 ): Promise<{ teamName: string; phase: string } | null> {
   if (!sessionId.trim()) return null;
-  const teamsRoot = join(resolveCanonicalTeamStateRoot(cwd), "team");
+  const teamsRoot = join(stateDir, "team");
   if (!existsSync(teamsRoot)) return null;
 
   const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
@@ -9350,13 +9481,14 @@ async function findCanonicalActiveTeamForSession(
     if (!teamName) continue;
 
     const [manifest, phaseState] = await Promise.all([
-      readTeamManifestV2(teamName, cwd),
-      readTeamPhase(teamName, cwd),
+      readJsonIfExists(join(teamsRoot, teamName, "manifest.v2.json")),
+      readJsonIfExists(join(teamsRoot, teamName, "phase.json")),
     ]);
     if (!manifest || !phaseState) continue;
-    const ownerSessionId = (manifest.leader?.session_id ?? "").trim();
+    const leader = manifest.leader as Record<string, unknown> | undefined;
+    const ownerSessionId = safeString(leader?.session_id).trim();
     if (ownerSessionId && ownerSessionId !== sessionId.trim()) continue;
-    if (!teamStateMatchesThreadForStop(manifest.leader as unknown as Record<string, unknown>, threadId)) continue;
+    if (!teamStateMatchesThreadForStop(leader ?? {}, threadId)) continue;
     if (!isNonTerminalPhase(phaseState.current_phase)) continue;
 
     return {
@@ -9378,7 +9510,7 @@ async function resolveActiveTeamNameForStop(
   const directTeamName = safeString(directState?.state.team_name).trim();
   if (directState?.state.active === true && directTeamName) return directTeamName;
 
-  const canonicalTeam = await findCanonicalActiveTeamForSession(cwd, sessionId, threadId);
+  const canonicalTeam = await findCanonicalActiveTeamForSession(cwd, sessionId, threadId, stateDir);
   return canonicalTeam?.teamName ?? "";
 }
 
@@ -9582,7 +9714,7 @@ async function buildStopHookOutput(
 
   const sessionId = readPayloadSessionId(payload);
   const canonicalSessionId = options.canonicalSessionId
-    ?? await resolveInternalSessionIdForPayload(cwd, sessionId);
+    ?? await resolveInternalSessionIdForPayload(cwd, sessionId, stateDir);
   const threadId = readPayloadThreadId(payload);
   const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
   if (canonicalSessionId) {
@@ -9633,7 +9765,7 @@ async function buildStopHookOutput(
   }
   const ralphState = options.skipRalphStopBlock === true
     ? null
-    : await readActiveRalphState(cwd, stateDir, sessionId || canonicalSessionId, ralphOwnerContext);
+    : await readActiveRalphState(cwd, stateDir, canonicalSessionId, ralphOwnerContext);
   if (!ralphState) {
     const autoresearchState = await readActiveAutoresearchState(cwd, canonicalSessionId);
     if (autoresearchState) {
@@ -9657,7 +9789,7 @@ async function buildStopHookOutput(
       }
     }
 
-    const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd);
+    const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd, stateDir);
     if (teamWorkerDecision.kind === "blocked") {
       return await returnPersistentStopBlock(
         payload,
@@ -9682,7 +9814,7 @@ async function buildStopHookOutput(
       return null;
     }
 
-    const autopilotOutput = await buildModeBasedStopOutput("autopilot", cwd, canonicalSessionId);
+    const autopilotOutput = await buildModeBasedStopOutput("autopilot", cwd, stateDir, canonicalSessionId);
     if (autopilotOutput) {
       return await returnPersistentStopBlock(
         payload,
@@ -9695,7 +9827,7 @@ async function buildStopHookOutput(
       );
     }
 
-    const ultraworkOutput = await buildModeBasedStopOutput("ultrawork", cwd, canonicalSessionId);
+    const ultraworkOutput = await buildModeBasedStopOutput("ultrawork", cwd, stateDir, canonicalSessionId);
     if (ultraworkOutput) {
       return await returnPersistentStopBlock(
         payload,
@@ -9708,7 +9840,7 @@ async function buildStopHookOutput(
       );
     }
 
-    const ultraqaOutput = await buildModeBasedStopOutput("ultraqa", cwd, canonicalSessionId);
+    const ultraqaOutput = await buildModeBasedStopOutput("ultraqa", cwd, stateDir, canonicalSessionId);
     if (ultraqaOutput) {
       return await returnPersistentStopBlock(
         payload,
@@ -9728,7 +9860,7 @@ async function buildStopHookOutput(
     );
     if (releaseReadinessFinalizeResult.matched) return releaseReadinessFinalizeResult.output;
 
-    const teamOutput = await buildTeamStopOutput(cwd, canonicalSessionId, threadId);
+    const teamOutput = await buildTeamStopOutput(cwd, canonicalSessionId, threadId, stateDir);
     if (teamOutput) {
       return await returnPersistentStopBlock(
         payload,
@@ -9758,9 +9890,9 @@ async function buildStopHookOutput(
         );
       }
 
-      const canonicalTeam = await readCanonicalTerminalRunStateForStop(cwd, canonicalSessionId, "team")
+      const canonicalTeam = await readCanonicalTerminalRunStateForStop(stateDir, canonicalSessionId, "team")
         ? null
-        : await findCanonicalActiveTeamForSession(cwd, canonicalSessionId, threadId);
+        : await findCanonicalActiveTeamForSession(cwd, canonicalSessionId, threadId, stateDir);
       if (canonicalTeam) {
         const canonicalTeamOutput = buildTeamStopOutputForPhase(
           canonicalTeam.teamName,
@@ -9900,7 +10032,31 @@ export async function dispatchCodexNativeHook(
 ): Promise<NativeHookDispatchResult> {
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
-  if (hookEventName === "Stop" && !hasNativeStopRuntimeSurface(cwd)) {
+  const inheritedAuthority = await resolveInheritedAuthority(cwd);
+  if (inheritedAuthority.failure) {
+    return {
+      hookEventName,
+      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+      skillState: null,
+      outputJson: buildAuthorityHookDenial(hookEventName, inheritedAuthority.failure),
+    };
+  }
+  const authority = inheritedAuthority.context;
+  if (authority) {
+    const conflictingAlias = authorityAmbientRootConflict(cwd, authority);
+    if (conflictingAlias) {
+      return {
+        hookEventName,
+        omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+        skillState: null,
+        outputJson: buildAuthorityHookDenial(
+          hookEventName,
+          `${conflictingAlias} conflicts with the inherited committed state authority`,
+        ),
+      };
+    }
+  }
+  if (hookEventName === "Stop" && !authority && !hasNativeStopRuntimeSurface(cwd)) {
     return {
       hookEventName,
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
@@ -9908,9 +10064,9 @@ export async function dispatchCodexNativeHook(
       outputJson: null,
     };
   }
-  // Native hooks must use the exact pointer root selected for this dispatch.
-  const pointerContext = resolveSessionPointerContext(cwd);
-  const stateDir = pointerContext.baseStateDir;
+  // Child hooks resolve only committed inherited authority. They never establish
+  // or migrate state, and raw root environment variables cannot retarget it.
+  const stateDir = authority?.canonical_state_root ?? fallbackHookStateDirectory(cwd);
   if (hookEventName !== "Stop") {
     await mkdir(stateDir, { recursive: true });
   }
@@ -9924,15 +10080,10 @@ export async function dispatchCodexNativeHook(
   const nativeSessionId = safeString(payload.session_id ?? payload.sessionId).trim();
   const threadId = safeString(payload.thread_id ?? payload.threadId).trim();
   const turnId = safeString(payload.turn_id ?? payload.turnId).trim();
-  const pointer = await readSessionPointer(pointerContext);
-  const currentSessionState = pointer.status === "usable" ? pointer.state ?? null : null;
-  let allowImplicitSessionSideEffects = pointer.status === "usable" || pointer.status === "absent";
-  let stopAuthorizationFailure: { stopReason: string; reason: string } | null = allowImplicitSessionSideEffects
-    ? null
-    : {
-      stopReason: "session_pointer_unusable",
-      reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
-    };
+  const sessionEvidence = await readSessionStateEvidence(cwd, stateDir);
+  const currentSessionState = sessionEvidence.usable;
+  let allowImplicitSessionSideEffects = true;
+  let stopAuthorizationFailure: { stopReason: string; reason: string } | null = null;
   let canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
@@ -9994,52 +10145,45 @@ export async function dispatchCodexNativeHook(
       }
     } else {
       const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
-      try {
-        const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
-          context: pointerContext,
-          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
-          ...(ownerOmxSessionId
-            ? { ownerOmxSessionId, ownerAliasVerified: true }
-            : {}),
-        });
-        canonicalSessionId = safeString(sessionState.session_id).trim();
-        resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
-        allowImplicitSessionSideEffects = true;
-        stopAuthorizationFailure = null;
-      } catch (error) {
-        if (!isSessionPointerLaunchAbort(error)) throw error;
-        canonicalSessionId = "";
-        resolvedNativeSessionId = nativeSessionId;
-        skipCanonicalSessionStartContext = true;
-        allowImplicitSessionSideEffects = false;
-        stopAuthorizationFailure = {
-          stopReason: "session_pointer_unusable",
-          reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
-        };
-      }
+      const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
+        pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      });
+      canonicalSessionId = safeString(sessionState.session_id).trim();
+      resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
     }
   } else if (!canonicalSessionId) {
     canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   }
 
   if (hookEventName === "Stop") {
-    const stopPayloadSessionId = readPayloadSessionId(payload);
+    const payloadSessionId = readPayloadSessionId(payload);
+    const inheritedSessionId = safeString(process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID).trim();
+    const stopPayloadSessionId = payloadSessionId || inheritedSessionId;
+    const allowUnboundPayloadFallback = authority === undefined
+      && !sessionEvidence.present
+      && Boolean(payloadSessionId);
     const stopCanonicalSessionId = await resolveInternalSessionIdForPayload(
       cwd,
       stopPayloadSessionId,
-      undefined,
+      stateDir,
       currentSessionState,
-      pointer.status === "absent",
+      allowUnboundPayloadFallback,
     );
-    if (stopPayloadSessionId && !stopCanonicalSessionId) {
+    if (sessionEvidence.present && !currentSessionState) {
       canonicalSessionId = "";
       allowImplicitSessionSideEffects = false;
-      if (!stopAuthorizationFailure) {
-        stopAuthorizationFailure = {
-          stopReason: "session_scope_unmatched",
-          reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,
-        };
-      }
+      stopAuthorizationFailure = {
+        stopReason: "session_pointer_unusable",
+        reason: "OMX cannot authorize Stop because the committed session pointer is identity-indeterminate or belongs to another workspace.",
+      };
+    } else if (stopPayloadSessionId && !stopCanonicalSessionId && (currentSessionState || authority)) {
+      canonicalSessionId = "";
+      allowImplicitSessionSideEffects = false;
+      stopAuthorizationFailure = {
+        stopReason: "session_scope_unmatched",
+        reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the inherited committed state authority remains authoritative.`,
+      };
     } else if (stopCanonicalSessionId) {
       canonicalSessionId = stopCanonicalSessionId;
     }
@@ -10050,7 +10194,7 @@ export async function dispatchCodexNativeHook(
   }
 
   let eventSessionId = canonicalSessionId || nativeSessionId || undefined;
-  let sessionIdForState: string | null = canonicalSessionId || null;
+  let sessionIdForState: string | null = canonicalSessionId || nativeSessionId || null;
   let outputJson: Record<string, unknown> | null = null;
   const typedAgentRolePayload = isTypedAgentRolePayload(payload);
   const isSubagentPromptSubmit = hookEventName === "UserPromptSubmit"
@@ -10080,7 +10224,7 @@ export async function dispatchCodexNativeHook(
     )).some(Boolean)
     : false;
   if (isSubagentStop && stopAuthorizationFailure?.stopReason === "session_scope_unmatched") {
-    canonicalSessionId = normalizeSessionId(readPayloadSessionId(payload)) ?? "";
+    canonicalSessionId = normalizeHookSessionId(readPayloadSessionId(payload)) ?? "";
     allowImplicitSessionSideEffects = true;
     stopAuthorizationFailure = null;
     eventSessionId = canonicalSessionId || nativeSessionId || undefined;
@@ -10094,27 +10238,10 @@ export async function dispatchCodexNativeHook(
     const prompt = readPromptText(payload);
     goalWorkflowAdditionalContext = await buildCompletedGoalCleanupPromptWarning(cwd, prompt).catch(() => null)
       ?? await buildGoalWorkflowReconciliationPromptWarning(cwd, prompt).catch(() => null);
-    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects
+    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit
       ? await applyUserPromptUltragoalSteering(cwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
-    let suppressActivationSeeding = !allowImplicitSessionSideEffects;
-    if (prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects) {
-      const rawHookSessionId = canonicalSessionId || nativeSessionId;
-      const normalizedHookSessionId = normalizeSessionId(rawHookSessionId);
-      const explicitHookSessionId = currentSessionState ? undefined : normalizedHookSessionId;
-      if (rawHookSessionId && !normalizedHookSessionId) {
-        suppressActivationSeeding = true;
-      } else {
-        try {
-          const writableScope = await resolveWritableStateScope(cwd, explicitHookSessionId);
-          sessionIdForState = writableScope.sessionId ?? null;
-        } catch (error) {
-          if (!isImplicitWritableScopeFailure(error)) throw error;
-          suppressActivationSeeding = true;
-        }
-      }
-    }
-    if (prompt && !isSubagentPromptSubmit && !suppressActivationSeeding) {
+    if (prompt && !isSubagentPromptSubmit) {
       skillState = buildNativeOutsideTmuxTeamPromptBlockState(
         prompt,
         cwd,
@@ -10161,9 +10288,7 @@ export async function dispatchCodexNativeHook(
                 },
                 suppress_followup: true,
               };
-              if (!suppressActivationSeeding) {
-                writeTriageState({ cwd, sessionId: sessionIdForState || null, state: newState });
-              }
+              writeTriageState({ cwd, sessionId: sessionIdForState || null, state: newState });
             } else if (decision.lane === "LIGHT") {
               if (decision.destination === "explore") {
                 triageAdditionalContext =
@@ -10192,9 +10317,7 @@ export async function dispatchCodexNativeHook(
                   },
                   suppress_followup: true,
                 };
-                if (!suppressActivationSeeding) {
-                  writeTriageState({ cwd, sessionId: sessionIdForState || null, state: newState });
-                }
+                writeTriageState({ cwd, sessionId: sessionIdForState || null, state: newState });
               }
             }
             // lane === "PASS": no context, no state write
@@ -10208,7 +10331,7 @@ export async function dispatchCodexNativeHook(
     const skipHudReconcileForDoctorSmoke = process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === "1";
     const skipHudReconcileForTeamWorkerPane = !isSubagentPromptSubmit
       && await isConfirmedTeamWorkerPromptSubmitPane(cwd).catch(() => false);
-    if (allowImplicitSessionSideEffects && !skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
+    if (!skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
       const reconcileHudForPromptSubmitFn = options.reconcileHudForPromptSubmitFn ?? reconcileHudForPromptSubmit;
       const hudSessionId = resolveHudReconcileSessionId(
         currentSessionState,
@@ -10227,6 +10350,11 @@ export async function dispatchCodexNativeHook(
 
   if (omxEventName && allowImplicitSessionSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
     const baseContext = buildBaseContext(cwd, payload, hookEventName!, canonicalSessionId);
+    if (authority) {
+      baseContext.state_authority_id = authority.generation.authority_id;
+      baseContext.state_authority_generation_id = authority.generation.generation_id;
+      baseContext.state_authority_workspace_digest = authority.workspace_identity.digest;
+    }
     if (resolvedNativeSessionId) {
       baseContext.native_session_id = resolvedNativeSessionId;
       baseContext.codex_session_id = resolvedNativeSessionId;
@@ -10263,6 +10391,7 @@ export async function dispatchCodexNativeHook(
         payload,
         canonicalSessionId,
         nativeSessionId: resolvedNativeSessionId || nativeSessionId,
+        stateDir,
       })
       : isSubagentPromptSubmit
         ? null
@@ -10283,27 +10412,45 @@ export async function dispatchCodexNativeHook(
   } else if (hookEventName === "PreToolUse") {
     const payloadSessionId = readPayloadSessionId(payload);
     const rootPointerConflict = await readLiveRootSessionPointerConflict(stateDir, payloadSessionId);
+    const isKnownSubagentPreToolUse = authority && payloadSessionId
+      ? await isNativeSubagentHook(
+        cwd,
+        canonicalSessionId,
+        payloadSessionId,
+        threadId,
+        safeString(currentSessionState?.native_session_id).trim(),
+      )
+      : false;
     const preToolUseSessionId = payloadSessionId
-      ? await resolveInternalSessionIdForPayload(cwd, payloadSessionId, stateDir)
+      ? await resolveInternalSessionIdForPayload(
+        cwd,
+        payloadSessionId,
+        stateDir,
+        currentSessionState,
+        authority === undefined || isKnownSubagentPreToolUse,
+      )
       : "";
-    outputJson = buildNativeUnknownRolePreToolUseOutput(payload)
-      ?? await buildDeepInterviewPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
-      ?? await buildRalplanPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
-      ?? await buildPlanningRootPointerConflictPreToolUseOutput(payload, cwd, stateDir, rootPointerConflict)
-      ?? await buildConductorPreToolUseWriteGuardOutput(payload, cwd, stateDir, preToolUseSessionId)
-      ?? await buildNativeSubagentCapacityCloseGuardOutput(payload, cwd, stateDir)
-      ?? buildMalformedPreToolUseBlockTestOutput(payload)
-      ?? buildNativePreToolUseOutput(payload);
+    outputJson = authority && payloadSessionId && !preToolUseSessionId && !isKnownSubagentPreToolUse
+      ? buildAuthorityHookDenial(
+        hookEventName,
+        `PreToolUse session id ${payloadSessionId} does not match the inherited committed state authority`,
+      )
+      : buildNativeUnknownRolePreToolUseOutput(payload)
+        ?? await buildDeepInterviewPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
+        ?? await buildRalplanPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
+        ?? await buildPlanningRootPointerConflictPreToolUseOutput(payload, cwd, stateDir, rootPointerConflict)
+        ?? await buildConductorPreToolUseWriteGuardOutput(payload, cwd, stateDir, preToolUseSessionId)
+        ?? await buildNativeSubagentCapacityCloseGuardOutput(payload, cwd, stateDir)
+        ?? buildMalformedPreToolUseBlockTestOutput(payload)
+        ?? buildNativePreToolUseOutput(payload);
   } else if (hookEventName === "PostToolUse") {
-    if (allowImplicitSessionSideEffects) {
-      await recordNativeSubagentCapacityBlocker(cwd, stateDir, payload).catch(() => {});
-      await recordNativeSubagentSupportBlocker(cwd, stateDir, payload).catch(() => {});
-      if (detectMcpTransportFailure(payload)) {
-        await markTeamTransportFailure(cwd, payload);
-      }
-      await handleTeamWorkerPostToolUseSuccess(payload, cwd);
+    await recordNativeSubagentCapacityBlocker(cwd, stateDir, payload).catch(() => {});
+    await recordNativeSubagentSupportBlocker(cwd, stateDir, payload).catch(() => {});
+    if (detectMcpTransportFailure(payload)) {
+      await markTeamTransportFailure(cwd, payload);
     }
     outputJson = buildNativePostToolUseOutput(payload);
+    await handleTeamWorkerPostToolUseSuccess(payload, cwd);
   } else if (hookEventName === "Stop") {
     if (allowImplicitSessionSideEffects) {
       outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
@@ -10312,8 +10459,8 @@ export async function dispatchCodexNativeHook(
       }) ?? await buildCompletedGoalCleanupStopOutput(payload, cwd);
     } else {
       const failure = stopAuthorizationFailure ?? {
-        stopReason: "session_pointer_unusable",
-        reason: "OMX cannot authorize Stop without a writable session authority.",
+        stopReason: "state_authority_conflict",
+        reason: "OMX cannot authorize Stop without a committed state authority.",
       };
       outputJson = {
         decision: "block",
@@ -10335,19 +10482,18 @@ export async function dispatchCodexNativeHook(
 function hasNativeStopRuntimeSurface(cwd: string): boolean {
   if (existsSync(join(cwd, ".omx"))) return true;
   if (findGitLayout(cwd)) return true;
-  const omxRoot = safeString(process.env.OMX_ROOT).trim();
-  if (omxRoot && existsSync(join(omxRoot, ".omx"))) return true;
-  const stateRoot = safeString(process.env.OMX_STATE_ROOT).trim();
-  if (stateRoot && existsSync(stateRoot)) return true;
+
   return [
     process.env.OMX_SESSION_ID,
     process.env.OMX_TEAM_INTERNAL_WORKER,
     process.env.OMX_TEAM_WORKER,
-    process.env.OMX_TEAM_STATE_ROOT,
     process.env.OMX_TEAM_LEADER_CWD,
     process.env.OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD,
     process.env.OMX_TMUX_HUD_OWNER,
     process.env.OMX_TMUX_HUD_LEADER_PANE,
+    process.env.OMX_ROOT,
+    process.env.OMX_STATE_ROOT,
+    process.env.OMX_TEAM_STATE_ROOT,
   ].some((value) => safeString(value).trim() !== "");
 }
 
@@ -10452,20 +10598,78 @@ function buildMalformedStdinHookOutput(
   };
 }
 
+function rawSessionPointerMatchesObservedWorkspace(state: SessionState, observedCwd: string): boolean {
+  const recordedCwd = safeString(state.cwd).trim();
+  if (!recordedCwd) return false;
+
+  try {
+    const recordedWorkspace = resolveWorkspaceIdentity(recordedCwd);
+    const observedWorkspace = resolveWorkspaceIdentity(observedCwd);
+    return recordedWorkspace.digest === observedWorkspace.digest;
+  } catch {
+    return false;
+  }
+}
+
+async function readOversizedStopCurrentSessionPointer(
+  cwd: string,
+  stateDir: string,
+  authenticatedAuthority: boolean,
+): Promise<SessionState | null> {
+  const state = await readUsableSessionStateFromStateDir(cwd, stateDir);
+  if (!state) return null;
+  return authenticatedAuthority || rawSessionPointerMatchesObservedWorkspace(state, cwd) ? state : null;
+}
+
+async function readOversizedStopActiveWorkflow(
+  stateDir: string,
+  sessionId: string,
+): Promise<{ mode: CanonicalWorkflowMode; phase: string } | null> {
+  for (const mode of CANONICAL_WORKFLOW_MODES) {
+    if (await readCanonicalTerminalRunStateForStop(stateDir, sessionId, mode)) continue;
+
+    const state = await readJsonIfExists(join(stateDir, "sessions", sessionId, `${mode}-state.json`));
+    if (state?.active !== true || !shouldContinueRun(state)) continue;
+
+    return { mode, phase: formatPhase(state.current_phase ?? state.currentPhase) };
+  }
+  return null;
+}
+
 async function buildOversizedStopActiveWorkflowOutput(cwd: string): Promise<Record<string, unknown> | null> {
-  const currentSession = await readUsableSessionState(cwd);
+  let stateDir: string;
+  let authority: Readonly<ResolvedStateAuthorityContext> | null = null;
+  try {
+    authority = await resolveAuthenticatedTransportAuthority(cwd);
+    if (!authority && hasOmxLaunchAuthorityEvidence()) {
+      return {
+        decision: "block",
+        reason: "OMX native Stop rejected oversized stdin because launch evidence requires a complete authenticated state-authority transport.",
+        stopReason: "state_authority_conflict",
+        systemMessage: "OMX native Stop rejected oversized stdin because authoritative launch evidence was not accompanied by a complete authenticated state-authority transport.",
+      };
+    }
+    stateDir = authority?.canonical_state_root ?? fallbackHookStateDirectory(cwd);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      decision: "block",
+      reason: `OMX native Stop rejected oversized stdin because state authority validation failed: ${detail}`,
+      stopReason: "state_authority_conflict",
+      systemMessage: "OMX native Stop rejected oversized stdin because inherited state authority validation failed.",
+    };
+  }
+
+  const currentSession = await readOversizedStopCurrentSessionPointer(cwd, stateDir, authority !== null);
   const currentSessionId = safeString(currentSession?.session_id).trim()
-    || safeString(process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID).trim();
+    || safeString(authority?.session_binding?.canonical_session_id).trim();
   if (!currentSessionId) return null;
 
-  if (await readCanonicalTerminalRunStateForStop(cwd, currentSessionId, "autopilot")) return null;
+  const activeWorkflow = await readOversizedStopActiveWorkflow(stateDir, currentSessionId);
+  if (!activeWorkflow) return null;
 
-  const autopilotState = await readModeStateForActiveDecision("autopilot", currentSessionId, cwd);
-  if (!autopilotState || !shouldContinueRun(autopilotState)) return null;
-
-  const phase = formatPhase(autopilotState.current_phase);
   const reason =
-    `OMX native Stop received oversized stdin before parsing while the current session has active OMX autopilot state (phase: ${phase}); continue once with a compact response or reduce hook payload size so normal Stop gates can run.`;
+    `OMX native Stop received oversized stdin before parsing while the current session has active OMX ${activeWorkflow.mode} state (phase: ${activeWorkflow.phase}); continue once with a compact response or reduce hook payload size so normal Stop gates can run.`;
   return {
     decision: "block",
     reason,

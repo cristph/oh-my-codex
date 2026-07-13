@@ -6,23 +6,57 @@ import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
 const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
 
-function runOmx(cwd: string, ...args: string[]) {
-  return spawnSync(process.execPath, [omxBin, ...args], {
-    cwd,
-    encoding: 'utf-8',
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
+
+async function establishCommittedAuthority(
+  cwd: string,
+  sessionId: string,
+): Promise<NodeJS.ProcessEnv> {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `cli-session-scope-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
   });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
+
+function unauthenticatedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
+    ...overrides,
+  };
 }
 
 function runOmxWithEnv(cwd: string, env: NodeJS.ProcessEnv, ...args: string[]) {
+  const childEnv = { ...process.env, ...env };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete childEnv[key];
+  }
   return spawnSync(process.execPath, [omxBin, ...args], {
     cwd,
     encoding: 'utf-8',
-    env: { ...process.env, ...env },
+    env: childEnv,
   });
 }
 
@@ -30,6 +64,8 @@ describe('CLI session-scoped state parity', () => {
   it('status and cancel include session-scoped states', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-session-scope-'));
     try {
+      const authorityTransport = await establishCommittedAuthority(wd, 'sess1');
+
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
       await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: 'sess1' }));
       const scopedDir = join(wd, '.omx', 'state', 'sessions', 'sess1');
@@ -39,12 +75,13 @@ describe('CLI session-scoped state parity', () => {
         current_phase: 'team-exec',
       }));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
       if (statusResult.error && /(EPERM|EACCES)/i.test(statusResult.error.message)) return;
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /team: ACTIVE/);
 
-      const cancelResult = runOmx(wd, 'cancel');
+      const cancelResult = runOmxWithEnv(wd, authorityTransport, 'cancel');
+
       assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
       assert.match(cancelResult.stdout, /Cancelled: team/);
 
@@ -57,7 +94,7 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('does not mutate an unmatched implicit OMX session, including force cleanup', async () => {
+  it('fails closed without committed authority and preserves unmatched implicit session state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-unmatched-session-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -79,9 +116,8 @@ describe('CLI session-scoped state parity', () => {
         '--force',
       );
 
-      assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
-      assert.match(cancelResult.stderr, /OMX_SESSION_ID is not bound to session\.json/);
-      assert.match(cancelResult.stdout, /No active modes to cancel\./);
+      assert.equal(cancelResult.status, 1, cancelResult.stderr || cancelResult.stdout);
+      assert.match(cancelResult.stderr, /requires a committed authenticated state authority/);
       assert.deepEqual(
         JSON.parse(await readFile(ralphPath, 'utf-8')),
         { active: true, current_phase: 'executing' },
@@ -100,6 +136,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-clear';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -114,8 +151,9 @@ describe('CLI session-scoped state parity', () => {
         current_phase: 'session-active',
       }));
 
-      const clearResult = runOmx(
+      const clearResult = runOmxWithEnv(
         wd,
+        authorityTransport,
         'state',
         'clear',
         '--input',
@@ -125,7 +163,8 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(clearResult.status, 0, clearResult.stderr || clearResult.stdout);
       assert.match(clearResult.stdout, /"cleared":true/);
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
+
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.doesNotMatch(statusResult.stdout, /deep-interview: ACTIVE/);
       assert.match(statusResult.stdout, /deep-interview: inactive \(phase: cleared\)/);
@@ -134,7 +173,7 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('cancels hook-visible run-dir session state when worktree state list-active is empty', async () => {
+  it('does not cancel unauthenticated hook-visible run-dir session state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-cancel-worktree-'));
     const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-cancel-runs-'));
     try {
@@ -167,30 +206,32 @@ describe('CLI session-scoped state parity', () => {
         run_dir: runDir,
       })}\n`);
 
-      const listResult = runOmx(wd, 'state', 'list-active', '--json');
+      const listResult = runOmxWithEnv(wd, unauthenticatedEnv({}), 'state', 'list-active', '--json');
       assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
       assert.deepEqual(JSON.parse(listResult.stdout), { active_modes: [] });
 
-      const cancelResult = runOmxWithEnv(wd, { OMX_RUNS_DIR: runsRoot }, 'cancel');
-      assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
-      assert.match(cancelResult.stdout, /Cancelled: autopilot/);
-      assert.doesNotMatch(cancelResult.stdout, /No active modes to cancel/);
+      const cancelResult = runOmxWithEnv(
+        wd,
+        unauthenticatedEnv({ OMX_RUNS_DIR: runsRoot }),
+        'cancel',
+      );
+      assert.notEqual(cancelResult.status, 0);
+      assert.match(cancelResult.stderr || cancelResult.stdout, /cancel requires a committed authenticated state authority/i);
+
 
       const autopilot = JSON.parse(await readFile(join(runSessionDir, 'autopilot-state.json'), 'utf-8'));
-      assert.equal(autopilot.active, false);
-      assert.equal(autopilot.current_phase, 'cancelled');
-      assert.ok(typeof autopilot.completed_at === 'string' && autopilot.completed_at.length > 0);
+      assert.equal(autopilot.active, true);
+      assert.equal(autopilot.current_phase, 'deep-interview');
 
       const skillActive = JSON.parse(await readFile(join(runSessionDir, 'skill-active-state.json'), 'utf-8'));
-      assert.equal(skillActive.active, false);
-      assert.equal(skillActive.current_phase, 'cancelled');
-      assert.equal(skillActive.phase, 'cancelled');
+      assert.equal(skillActive.active, true);
+      assert.equal(skillActive.phase, 'deep-interview');
       assert.deepEqual(
         skillActive.active_skills.map((skill: { active: unknown; phase: unknown }) => ({
           active: skill.active,
           phase: skill.phase,
         })),
-        [{ active: false, phase: 'cancelled' }],
+        [{ active: true, phase: 'deep-interview' }],
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -198,7 +239,7 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('reports hook-visible run-dir session state in status when worktree state list-active is empty', async () => {
+  it('does not report unauthenticated hook-visible run-dir session state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-status-worktree-'));
     const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-status-runs-'));
     try {
@@ -223,21 +264,25 @@ describe('CLI session-scoped state parity', () => {
         run_dir: runDir,
       })}\n`);
 
-      const listResult = runOmx(wd, 'state', 'list-active', '--json');
+      const listResult = runOmxWithEnv(wd, unauthenticatedEnv({}), 'state', 'list-active', '--json');
       assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
       assert.deepEqual(JSON.parse(listResult.stdout), { active_modes: [] });
 
-      const statusResult = runOmxWithEnv(wd, { OMX_RUNS_DIR: runsRoot }, 'status');
-      assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
-      assert.match(statusResult.stdout, /autopilot: ACTIVE \(phase: deep-interview\)/);
-      assert.doesNotMatch(statusResult.stdout, /No active modes\./);
+      const statusResult = runOmxWithEnv(
+        wd,
+        unauthenticatedEnv({ OMX_RUNS_DIR: runsRoot }),
+        'status',
+      );
+      assert.notEqual(statusResult.status, 0);
+      assert.match(statusResult.stderr || statusResult.stdout, /status requires a committed authenticated state authority/i);
+
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(runsRoot, { recursive: true, force: true });
     }
   });
 
-  it('finds hook-visible run-dir session state from an explicit worktree_cwd alias', async () => {
+  it('does not trust a bare active record from an explicit worktree_cwd alias', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-worktree-alias-source-'));
     const worktree = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-worktree-alias-wt-'));
     const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-run-dir-worktree-alias-runs-'));
@@ -268,17 +313,25 @@ describe('CLI session-scoped state parity', () => {
         tmux_pane_id: '%42',
       })}\n`);
 
-      const statusResult = runOmxWithEnv(worktree, { OMX_RUNS_DIR: runsRoot }, 'status');
-      assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
-      assert.match(statusResult.stdout, /autopilot: ACTIVE \(phase: deep-interview\)/);
+      const statusResult = runOmxWithEnv(
+        worktree,
+        unauthenticatedEnv({ OMX_RUNS_DIR: runsRoot }),
+        'status',
+      );
+      assert.notEqual(statusResult.status, 0);
+      assert.match(statusResult.stderr || statusResult.stdout, /status requires a committed authenticated state authority/i);
 
-      const cancelResult = runOmxWithEnv(worktree, { OMX_RUNS_DIR: runsRoot }, 'cancel');
-      assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
-      assert.match(cancelResult.stdout, /Cancelled: autopilot/);
+      const cancelResult = runOmxWithEnv(
+        worktree,
+        unauthenticatedEnv({ OMX_RUNS_DIR: runsRoot }),
+        'cancel',
+      );
+      assert.notEqual(cancelResult.status, 0);
+      assert.match(cancelResult.stderr || cancelResult.stdout, /cancel requires a committed authenticated state authority/i);
 
       const autopilot = JSON.parse(await readFile(join(runSessionDir, 'autopilot-state.json'), 'utf-8'));
-      assert.equal(autopilot.active, false);
-      assert.equal(autopilot.current_phase, 'cancelled');
+      assert.equal(autopilot.active, true);
+      assert.equal(autopilot.current_phase, 'deep-interview');
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(worktree, { recursive: true, force: true });
@@ -289,6 +342,8 @@ describe('CLI session-scoped state parity', () => {
   it('reports stale current-autopilot in status when no authoritative active modes exist', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-stale-current-autopilot-'));
     try {
+      const authorityTransport = await establishCommittedAuthority(wd, 'sess-stale-autopilot');
+
       const stateDir = join(wd, '.omx', 'state');
       await mkdir(stateDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-stale-autopilot' }, null, 2));
@@ -301,12 +356,13 @@ describe('CLI session-scoped state parity', () => {
       };
       await writeFile(currentAutopilotPath, JSON.stringify(currentAutopilot, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /autopilot: STALE \(phase: complete\)/);
       assert.doesNotMatch(statusResult.stdout, /No active modes\./);
 
-      const listResult = runOmx(wd, 'state', 'list-active', '--json');
+      const listResult = runOmxWithEnv(wd, authorityTransport, 'state', 'list-active', '--json');
+
       assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
       assert.deepEqual(JSON.parse(listResult.stdout), { active_modes: [] });
       assert.deepEqual(JSON.parse(await readFile(currentAutopilotPath, 'utf-8')), currentAutopilot);
@@ -321,6 +377,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-stale-autopilot-inactive';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
@@ -338,7 +395,8 @@ describe('CLI session-scoped state parity', () => {
         current_phase: 'cleared',
       }, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
+
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /deep-interview: inactive \(phase: cleared\)/);
       assert.match(statusResult.stdout, /autopilot: STALE \(phase: complete\)/);
@@ -354,6 +412,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-active-autopilot';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
@@ -369,7 +428,8 @@ describe('CLI session-scoped state parity', () => {
         current_phase: 'ralplan',
       }, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
+
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /autopilot: ACTIVE \(phase: ralplan\)/);
       assert.doesNotMatch(statusResult.stdout, /STALE/);
@@ -383,11 +443,14 @@ describe('CLI session-scoped state parity', () => {
   it('ignores unreportable current-autopilot in status', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-unreportable-current-autopilot-'));
     try {
+      const authorityTransport = await establishCommittedAuthority(wd, 'sess-unreportable-autopilot');
+
       const stateDir = join(wd, '.omx', 'state');
       await mkdir(stateDir, { recursive: true });
       await writeFile(join(stateDir, 'current-autopilot.json'), JSON.stringify({ active: true }, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
+
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /No active modes\./);
       assert.doesNotMatch(statusResult.stdout, /STALE/);
@@ -399,6 +462,8 @@ describe('CLI session-scoped state parity', () => {
   it('reports durable failed Ultragoal artifacts without advertising a cancellable active mode', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-failed-ultragoal-'));
     try {
+      const authorityTransport = await establishCommittedAuthority(wd, 'sess-failed-ultragoal');
+
       const ultragoalDir = join(wd, '.omx', 'ultragoal');
       await mkdir(ultragoalDir, { recursive: true });
       await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
@@ -414,12 +479,13 @@ describe('CLI session-scoped state parity', () => {
         ],
       }, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /ultragoal: FAILED \(phase: failed\)/);
       assert.doesNotMatch(statusResult.stdout, /ultragoal: ACTIVE \(phase: failed\)/);
 
-      const cancelResult = runOmx(wd, 'cancel');
+      const cancelResult = runOmxWithEnv(wd, authorityTransport, 'cancel');
+
       assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
       assert.match(cancelResult.stdout, /No active modes to cancel\./);
     } finally {
@@ -432,6 +498,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-active-ultragoal-failed-artifact';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       const ultragoalDir = join(wd, '.omx', 'ultragoal');
       await mkdir(sessionDir, { recursive: true });
@@ -456,7 +523,8 @@ describe('CLI session-scoped state parity', () => {
         ],
       }, null, 2));
 
-      const statusResult = runOmx(wd, 'status');
+      const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
+
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /ultragoal: ACTIVE \(phase: executing\)/);
       assert.doesNotMatch(statusResult.stdout, /ultragoal: FAILED \(phase: failed\)/);
@@ -471,6 +539,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-link';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -488,7 +557,8 @@ describe('CLI session-scoped state parity', () => {
         current_phase: 'executing',
       }));
 
-      const cancelResult = runOmx(wd, 'cancel');
+      const cancelResult = runOmxWithEnv(wd, authorityTransport, 'cancel');
+
       assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
       assert.match(cancelResult.stdout, /Cancelled: ralph/);
       assert.match(cancelResult.stdout, /Cancelled: ultrawork/);
@@ -510,6 +580,8 @@ describe('CLI session-scoped state parity', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cross-session-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
+      const authorityTransport = await establishCommittedAuthority(wd, 'sessA');
+
       const sessionA = join(stateDir, 'sessions', 'sessA');
       const sessionB = join(stateDir, 'sessions', 'sessB');
       await mkdir(sessionA, { recursive: true });
@@ -527,7 +599,8 @@ describe('CLI session-scoped state parity', () => {
         started_at: '2026-02-22T00:00:00.000Z',
       }));
 
-      const cancelResult = runOmx(wd, 'cancel');
+      const cancelResult = runOmxWithEnv(wd, authorityTransport, 'cancel');
+
       assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
       assert.match(cancelResult.stdout, /Cancelled: ralph/);
 
@@ -546,6 +619,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-stale-autopilot-mirror';
+      const authorityTransport = await establishCommittedAuthority(wd, sessionId);
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
@@ -578,11 +652,11 @@ describe('CLI session-scoped state parity', () => {
         sessions: { [sessionId]: { last_signature: 'autopilot-stop|stale' } },
       }, null, 2));
 
-      const clearAutopilot = runOmx(wd, 'state', 'clear', '--input', `{"mode":"autopilot","session_id":"${sessionId}"}`, '--json');
+      const clearAutopilot = runOmxWithEnv(wd, authorityTransport, 'state', 'clear', '--input', `{"mode":"autopilot","session_id":"${sessionId}"}`, '--json');
       assert.equal(clearAutopilot.status, 0, clearAutopilot.stderr || clearAutopilot.stdout);
-      const clearSkill = runOmx(wd, 'state', 'clear', '--input', `{"mode":"skill-active","session_id":"${sessionId}"}`, '--json');
+      const clearSkill = runOmxWithEnv(wd, authorityTransport, 'state', 'clear', '--input', `{"mode":"skill-active","session_id":"${sessionId}"}`, '--json');
       assert.equal(clearSkill.status, 0, clearSkill.stderr || clearSkill.stdout);
-      const cancelForce = runOmx(wd, 'cancel', '--force');
+      const cancelForce = runOmxWithEnv(wd, authorityTransport, 'cancel', '--force');
       assert.equal(cancelForce.status, 0, cancelForce.stderr || cancelForce.stdout);
 
       const autopilot = JSON.parse(await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8'));
@@ -591,7 +665,7 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(existsSync(join(sessionDir, 'skill-active-state.json')), false);
       const nativeStop = JSON.parse(await readFile(join(sessionDir, 'native-stop-state.json'), 'utf-8'));
       assert.deepEqual(nativeStop.sessions, {});
-      const listResult = runOmx(wd, 'state', 'list-active', '--json');
+      const listResult = runOmxWithEnv(wd, authorityTransport, 'state', 'list-active', '--json');
       assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
       assert.deepEqual(JSON.parse(listResult.stdout), { active_modes: [] });
     } finally {

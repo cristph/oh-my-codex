@@ -1,10 +1,11 @@
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const STARTUP_SETTLE_MS = 150;
 const SPAWN_TIMEOUT_MS = 1_500;
@@ -19,6 +20,36 @@ const IDLE_ENTRYPOINTS = [
 ] as const;
 
 type EntryPoint = (typeof IDLE_ENTRYPOINTS)[number];
+
+const RUNTIME_ENTRYPOINT_FILES = new Map<string, string>();
+const RUNTIME_ENTRYPOINT_SUFFIX = `${process.pid}-${randomUUID()}`;
+
+function runtimeEntrypointPath(entrypoint: EntryPoint): string {
+  const path = RUNTIME_ENTRYPOINT_FILES.get(entrypoint.file);
+  assert.ok(path, `runtime lifecycle fixture is not initialized for ${entrypoint.file}`);
+  return path;
+}
+
+function runtimeEntrypointMarker(entrypoint: EntryPoint): string {
+  return basename(runtimeEntrypointPath(entrypoint));
+}
+
+before(async () => {
+  for (const entrypoint of IDLE_ENTRYPOINTS) {
+    const source = join(process.cwd(), 'dist', 'mcp', entrypoint.file);
+    const fixtureName = `lifecycle-${RUNTIME_ENTRYPOINT_SUFFIX}-${entrypoint.server.replace(/_/g, '-')}-server.js`;
+    const target = join(process.cwd(), 'dist', 'mcp', fixtureName);
+    await copyFile(source, target);
+    RUNTIME_ENTRYPOINT_FILES.set(entrypoint.file, target);
+  }
+});
+
+after(async () => {
+  await Promise.all([...RUNTIME_ENTRYPOINT_FILES.values()].map(async (path) => {
+    await rm(path, { force: true });
+  }));
+  RUNTIME_ENTRYPOINT_FILES.clear();
+});
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -110,11 +141,12 @@ function spawnEntrypoint(entrypoint: EntryPoint): {
   stdout: string[];
   stderr: string[];
 } {
-  const child = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+  const child = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       OMX_MCP_DUPLICATE_SIBLING_INITIAL_DELAY_MS: '5000',
+      OMX_MCP_ENTRYPOINT_MARKER: runtimeEntrypointMarker(entrypoint),
       OMX_MCP_LIFECYCLE_LOG: 'off',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -223,12 +255,13 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
     const entrypoint = IDLE_ENTRYPOINTS[0];
     const sharedEnv = {
       ...process.env,
+      OMX_MCP_ENTRYPOINT_MARKER: runtimeEntrypointMarker(entrypoint),
       OMX_MCP_PARENT_WATCHDOG_INTERVAL_MS: '250',
       OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS: '250',
       OMX_MCP_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS: '500',
       OMX_MCP_LIFECYCLE_LOG: 'off',
     };
-    const older = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+    const older = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
       cwd: process.cwd(),
       env: sharedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -249,7 +282,7 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
       await waitForSpawn(older, entrypoint, stderr, stdout);
       await assertChildAliveBeforeTeardown(older, entrypoint, stderr, stdout);
 
-      newer = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+      newer = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
         cwd: process.cwd(),
         env: sharedEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -279,12 +312,13 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
     const entrypoint = IDLE_ENTRYPOINTS[0];
     const sharedEnv = {
       ...process.env,
+      OMX_MCP_ENTRYPOINT_MARKER: runtimeEntrypointMarker(entrypoint),
       OMX_MCP_PARENT_WATCHDOG_INTERVAL_MS: '250',
       OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS: '250',
       OMX_MCP_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS: '500',
       OMX_MCP_LIFECYCLE_LOG: 'off',
     };
-    const older = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+    const older = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
       cwd: process.cwd(),
       env: sharedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -317,7 +351,7 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
       })}\n`);
       await delay(100);
 
-      newer = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+      newer = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
         cwd: process.cwd(),
         env: sharedEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -351,6 +385,7 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
     const logDir = await mkdtemp(join(tmpdir(), 'omx-mcp-runtime-lifecycle-'));
     const sharedEnv = {
       ...process.env,
+      OMX_MCP_ENTRYPOINT_MARKER: runtimeEntrypointMarker(entrypoint),
       OMX_MCP_PARENT_WATCHDOG_INTERVAL_MS: '250',
       OMX_MCP_DUPLICATE_SIBLING_INITIAL_DELAY_MS: '0',
       OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS: '250',
@@ -370,7 +405,7 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
 
     try {
       for (let index = 0; index < 5; index += 1) {
-        const child = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
+        const child = spawn(process.execPath, [runtimeEntrypointPath(entrypoint)], {
           cwd: process.cwd(),
           env: sharedEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -392,7 +427,7 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
         `hard cap should preserve the newest four children: ${formatFailureContext(entrypoint, stderr, stdout)}`,
       );
 
-      const telemetry = await readFile(join(logDir, 'state-server.js.ndjson'), 'utf8');
+      const telemetry = await readFile(join(logDir, `${runtimeEntrypointMarker(entrypoint)}.ndjson`), 'utf8');
       assert.match(telemetry, /duplicate_sibling_observed/);
       assert.match(telemetry, /superseded_hard_cap_pre_traffic/);
     } finally {

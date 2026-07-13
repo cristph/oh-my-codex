@@ -4,6 +4,10 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runAuthHotswap, type HotswapLifecycle } from "../hotswap.js";
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from "../../state/authority.js";
 
 function sessionPointerAbort(cwd: string): Error {
   return Object.assign(new Error("selected pointer root is unavailable"), {
@@ -26,13 +30,35 @@ function lifecycle(overrides: Partial<HotswapLifecycle> = {}): HotswapLifecycle 
     normalizeCodexLaunchArgs: (args) => args,
     injectModelInstructionsBypassArgs: (_cwd, args) => args,
     sessionModelInstructionsPath: (cwd, sessionId) => join(cwd, `${sessionId}.md`),
-    resolveOmxRootForLaunch: () => undefined,
     resolveNotifyTempContract: (args) => ({
       contract: { active: false },
       passthroughArgs: args,
     }),
     ...overrides,
   };
+}
+
+async function committedHotswapAuthority(cwd: string, sessionId: string) {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.freeze(authority.workspace_identity);
+  Object.freeze(authority.generation.workspace_identity);
+  Object.freeze(authority.generation.root_identity);
+  Object.freeze(authority.generation.root_capability);
+  Object.freeze(authority.generation);
+  if (authority.session_binding) {
+    Object.freeze(authority.session_binding.aliases.current_session_aliases);
+    Object.freeze(authority.session_binding.aliases.previous_session_aliases);
+    Object.freeze(authority.session_binding.aliases.owner_session_aliases);
+    Object.freeze(authority.session_binding.aliases);
+    Object.freeze(authority.session_binding);
+  }
+  return Object.freeze(authority);
 }
 
 async function writeAuthSlot(home: string, slot = "first"): Promise<string> {
@@ -69,6 +95,7 @@ describe("auth hotswap pointer abort lifecycle", () => {
         home,
         env: { CODEX_HOME: runtimeHome },
         argv: [],
+        authority: await committedHotswapAuthority(cwd, "hotswap-pointer-abort"),
         lifecycle: lifecycle({
           prepareCodexHomeForLaunch: async () => ({
             codexHomeOverride: runtimeHome,
@@ -112,6 +139,7 @@ describe("auth hotswap pointer abort lifecycle", () => {
         home,
         env: { CODEX_HOME: runtimeHome },
         argv: [],
+        authority: await committedHotswapAuthority(cwd, "hotswap-use-slot-failure"),
         lifecycle: lifecycle({
           prepareCodexHomeForLaunch: async () => ({
             codexHomeOverride: runtimeHome,
@@ -175,6 +203,7 @@ describe("auth hotswap pointer abort lifecycle", () => {
           PATH: `${binDir}:/usr/bin:/bin`,
         },
         argv: [],
+        authority: await committedHotswapAuthority(cwd, "hotswap-rotation-failure"),
         lifecycle: lifecycle({
           prepareCodexHomeForLaunch: async () => ({
             codexHomeOverride: runtimeHome,

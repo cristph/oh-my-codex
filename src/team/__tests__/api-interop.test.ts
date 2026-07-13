@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -341,8 +341,8 @@ describe('executeTeamApiOperation: send-message', () => {
 
   it('returns the persisted leader mailbox message when hook-targeted sends are deduped from a worker worktree', async () => {
     const teamName = 'msg-team-leader-dedupe';
-    const repoCwd = await mkdtemp(join(tmpdir(), 'omx-interop-send-root-'));
-    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-interop-send-worktree-'));
+    const repoCwd = await realpath(await mkdtemp(join(tmpdir(), 'omx-interop-send-root-')));
+    const workerCwd = await realpath(await mkdtemp(join(tmpdir(), 'omx-interop-send-worktree-')));
     const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
 
@@ -416,43 +416,34 @@ describe('executeTeamApiOperation: send-message', () => {
     }
   });
 
-  it('returns the persisted mailbox message when bridge compat omits the mailbox row under an explicit shared state root', async () => {
-    const teamName = 'msg-team-shared-root';
-    const root = await mkdtemp(join(tmpdir(), 'omx-interop-shared-root-'));
+  it('returns the persisted mailbox message when bridge compat omits the canonical mailbox row', async () => {
+    const teamName = 'msg-team-canonical-root';
+    const root = await mkdtemp(join(tmpdir(), 'omx-interop-canonical-root-'));
     const leaderCwd = join(root, 'leader');
-    const workerCwd = join(root, 'worker-worktree');
-    const sharedStateRoot = join(root, 'shared-state');
-    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-
     try {
       await mkdir(leaderCwd, { recursive: true });
-      await mkdir(workerCwd, { recursive: true });
-      process.env.OMX_TEAM_STATE_ROOT = sharedStateRoot;
-      await initTeamState(teamName, 'shared state root mailbox fallback', 'executor', 2, leaderCwd);
-
+      await initTeamState(teamName, 'canonical mailbox fallback', 'executor', 2, leaderCwd);
       await withMailboxCompatHoleRuntime(root, async () => {
         const result = await executeTeamApiOperation('send-message', {
           team_name: teamName,
           from_worker: 'worker-1',
           to_worker: 'leader-fixed',
-          body: 'shared-root hello',
-        }, workerCwd);
+          body: 'canonical-root hello',
+        }, leaderCwd);
 
         assert.equal(result.ok, true);
         if (!result.ok) throw new Error('expected send-message call to succeed');
 
         const message = result.data.message as Record<string, unknown>;
-        assert.equal(message.body, 'shared-root hello');
+        assert.equal(message.body, 'canonical-root hello');
         assert.equal(message.to_worker, 'leader-fixed');
 
         const mailbox = JSON.parse(
-          await readFile(join(sharedStateRoot, 'team', teamName, 'mailbox', 'leader-fixed.json'), 'utf8'),
+          await readFile(join(leaderCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'), 'utf8'),
         ) as { messages?: Array<Record<string, unknown>> };
         assert.equal(mailbox.messages?.length, 1);
       });
     } finally {
-      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(root, { recursive: true, force: true });
     }
   });

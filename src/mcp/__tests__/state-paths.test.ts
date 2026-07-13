@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
 
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve as resolvePath } from 'path';
+
 import {
   getAllScopedStateDirs,
   getAllScopedStatePaths,
@@ -290,6 +291,31 @@ describe('state paths', () => {
       await rm(outsideRoot, { recursive: true, force: true });
     }
   });
+
+  it(
+    'accepts the native Win32 temporary-directory spelling in the MCP allowlist',
+    { skip: process.platform !== 'win32' },
+    async () => {
+      const allowedRoot = await mkdtemp(join(tmpdir(), 'omx-mcp-win32-alias-'));
+      const canonicalRoot = realpathSync.native(allowedRoot);
+      const prev = process.env.OMX_MCP_WORKDIR_ROOTS;
+      process.env.OMX_MCP_WORKDIR_ROOTS = allowedRoot;
+      try {
+        if (process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_OS === 'Windows') {
+          assert.notEqual(
+            allowedRoot,
+            canonicalRoot,
+            'hosted Windows authority evidence must exercise the 8.3/long-name alias path',
+          );
+        }
+        assert.equal(resolveWorkingDirectoryForState(allowedRoot), canonicalRoot);
+      } finally {
+        if (typeof prev === 'string') process.env.OMX_MCP_WORKDIR_ROOTS = prev;
+        else delete process.env.OMX_MCP_WORKDIR_ROOTS;
+        await rm(allowedRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('builds global state paths', () => {
     const base = getBaseStateDir('/repo');

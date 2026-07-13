@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { TEAM_NAME_SAFE_PATTERN } from './contracts.js';
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
 export interface TeamIdentityScope {
   sessionId: string;
@@ -123,6 +124,14 @@ function candidateFromDir(root: string, teamName: string): TeamLookupCandidate |
 }
 
 function teamLookupRoots(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (
+    env.OMX_STATE_AUTHORITY_PATH?.trim()
+    || env.OMX_STATE_AUTHORITY_ID?.trim()
+    || env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim()
+    || env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim()
+  ) {
+    return [join(resolveCanonicalTeamStateRoot(cwd, env), 'team')];
+  }
   const roots: string[] = [];
   const addStateRoot = (stateRoot: string): void => {
     const trimmed = stateRoot.trim();
@@ -180,12 +189,13 @@ export function resolveTeamNameForCurrentContext(inputName: string, cwd: string,
   if (candidates.length === 0) return input;
 
   const scope = resolveTeamIdentityScope(env);
+  const current = candidates.filter((candidate) => matchingCurrentLeader(candidate, scope));
+  if (current.length === 1) return current[0].teamName;
+  if (current.length > 1) throw new TeamLookupAmbiguityError(input, current);
+
   const activeCandidates = candidates.filter((candidate) => !candidate.terminal);
   const lookupCandidates = activeCandidates.length > 0 ? activeCandidates : candidates;
   if (lookupCandidates.length === 1) return lookupCandidates[0].teamName;
-
-  const current = lookupCandidates.filter((candidate) => matchingCurrentLeader(candidate, scope));
-  if (current.length === 1) return current[0].teamName;
 
   if (activeCandidates.length === 0) {
     const latestTerminal = selectLatestTerminalCandidate(lookupCandidates);

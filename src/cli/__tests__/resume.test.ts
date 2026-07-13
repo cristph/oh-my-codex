@@ -391,7 +391,7 @@ printf '{"type":"session_meta","payload":{"id":"new-project-resume"}}\n' > "$COD
     }
   });
 
-  it('includes associated madmax boxed run-root sessions for plain resume', async () => {
+  it('ignores bare madmax registry sessions during plain resume', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-resume-madmax-runtime-'));
     try {
       const home = join(wd, 'home');
@@ -437,7 +437,7 @@ if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-unrelated-session.jsonl" ]; the
 
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:resume\b/);
-      assert.match(result.stdout, /madmax-rollout-present=yes/);
+      assert.match(result.stdout, /madmax-rollout-present=no/);
       assert.match(result.stdout, /unrelated-rollout-present=no/);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -518,7 +518,7 @@ case "$(cat "$CODEX_HOME/config.toml")" in *'source = "${repoRoot}"'*) echo mark
     }
   });
 
-  it('keeps madmax runtime history deduped across repeated resume cleanup', async () => {
+  it('keeps project runtime history unchanged when madmax registry evidence is unauthenticated', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-resume-madmax-dedupe-'));
     try {
       const home = join(wd, 'home');
@@ -562,11 +562,11 @@ case "$(cat "$CODEX_HOME/config.toml")" in *'source = "${repoRoot}"'*) echo mark
 
       assert.equal(
         await readFile(join(projectCodexHome, 'history.jsonl'), 'utf-8'),
-        '{"session_id":"project-session"}\n{"session_id":"madmax-session"}\n',
+        '{"session_id":"project-session"}\n',
       );
       assert.equal(
         await readFile(join(projectCodexHome, 'session_index.jsonl'), 'utf-8'),
-        '{"id":"project-session"}\n{"id":"madmax-session"}\n',
+        '{"id":"project-session"}\n',
       );
     } finally {
       await rm(wd, { recursive: true, force: true });

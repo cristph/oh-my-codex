@@ -1,24 +1,41 @@
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { constants, existsSync } from 'node:fs';
+import { lstat, mkdir, open, readdir, unlink, writeFile } from 'node:fs/promises';
+
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+
 
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
-  getAllScopedStatePaths,
-  getAuthoritativeActiveStateDirs,
-  getBaseStateDir,
-  getBaseStateDirWithSource,
-  getReadScopedStateDirs,
-  getReadScopedStatePaths,
-  getStateDir,
-  getStatePath,
+  resolveAuthorityRuntimeStateScope,
   resolveRuntimeStateScope,
-  resolveWritableStateScope,
   resolveWorkingDirectoryForState,
   validateSessionId,
   validateStateModeSegment,
-  type StateRootSource,
+  type ResolvedAuthorityRuntimeStateScope,
+  type ResolvedRuntimeStateScope,
 } from '../mcp/state-paths.js';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  STATE_AUTHORITY_TOMBSTONE_FILE,
+  StateAuthorityError,
+  appendStateAuthorityEvidence,
+  atomicWriteAuthorityFile,
+  authorityGenerationPaths,
+  captureRootFilesystemIdentity,
+  fsyncAuthorityDirectory,
+  isTrustedAuthorityPlatformRootAlias,
+  resolveWorkspaceIdentity,
+  readStateAuthorityEvidence,
+  readWorkspaceAuthorityAnchor,
+  sameRootFilesystemIdentity,
+  validateStateAuthority,
+  validateStateAuthorityGeneration,
+  withStateAuthorityTransaction,
+  type AcquiredStateAuthorityLock,
+  type ResolvedStateAuthorityContext,
+  type StateAuthorityGeneration,
+} from './authority.js';
 import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
@@ -31,13 +48,12 @@ import {
 } from '../autopilot/completion-gate.js';
 import { readUltragoalState } from '../hud/state.js';
 import {
+  SKILL_ACTIVE_STATE_FILE,
   SKILL_ACTIVE_STATE_MODE,
   clearTerminalSkillActiveMarkers,
   getSkillActiveStatePathsForStateDir,
   isTerminalSkillActiveState,
   listActiveSkills,
-  readSkillActiveState,
-  readVisibleSkillActiveStateForStateDir,
   syncCanonicalSkillStateForMode,
   type SkillActiveEntry,
   type SkillActiveStateLike,
@@ -45,11 +61,15 @@ import {
 } from './skill-active.js';
 import {
   buildWorkflowTransitionError,
-  evaluateWorkflowTransition,
+  TRACKED_WORKFLOW_MODES,
   isTrackedWorkflowMode,
   type TrackedWorkflowMode,
 } from './workflow-transition.js';
-import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
+import {
+  applyPlannedWorkflowTransition,
+  planWorkflowTransition,
+  type PlannedWorkflowTransition,
+} from './workflow-transition-reconcile.js';
 import {
   buildAutopilotDeepInterviewRalplanGateError,
   canAdvanceAutopilotDeepInterviewToRalplan,
@@ -129,6 +149,28 @@ export interface StateOperationResponse {
 }
 
 const stateWriteQueues = new Map<string, Promise<void>>();
+const stateMutationAdmissionQueues = new Map<string, Promise<void>>();
+
+async function withStateMutationAdmission<T>(workspaceKey: string, fn: () => Promise<T>): Promise<T> {
+  const tail = stateMutationAdmissionQueues.get(workspaceKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = tail.finally(() => gate);
+  stateMutationAdmissionQueues.set(workspaceKey, queued);
+
+  await tail.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (stateMutationAdmissionQueues.get(workspaceKey) === queued) {
+      stateMutationAdmissionQueues.delete(workspaceKey);
+    }
+  }
+}
+
 
 async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const tail = stateWriteQueues.get(path) ?? Promise.resolve();
@@ -150,22 +192,973 @@ async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promis
   }
 }
 
-async function writeAtomicFile(path: string, data: string): Promise<void> {
-  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
-  await writeFile(tmpPath, data, 'utf-8');
+async function writeAtomicFile(baseStateDir: string, path: string, data: string): Promise<void> {
+  const rootIdentity = await captureRootFilesystemIdentity(baseStateDir);
+  await atomicWriteAuthorityFile(path, data, {
+    authority_root: baseStateDir,
+    expected_root_identity: rootIdentity,
+  });
+}
+
+async function unlinkDurably(
+  baseStateDir: string,
+  path: string,
+  label = 'state clear target',
+): Promise<boolean> {
+  const target = resolve(path);
+  const directory = dirname(target);
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await rename(tmpPath, path);
+    const directoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    const beforeOpen = await lstat(target);
+    assertRegularStateReadFile(beforeOpen, target, label);
+    try {
+      handle = await open(target, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} must not be a symbolic link: ${target}`);
+      }
+      throw error;
+    }
+    const opened = await handle.stat();
+    const afterOpen = await lstat(target);
+    if (afterOpen.isSymbolicLink() || !afterOpen.isFile()
+      || !sameStateReadFileIdentity(beforeOpen, opened)
+      || !sameStateReadFileIdentity(opened, afterOpen)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} changed while opening for deletion: ${target}`);
+    }
+    const afterOpenDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    if (!sameStateReadDirectoryIdentity(directoryIdentity, afterOpenDirectoryIdentity)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while opening for deletion: ${target}`);
+    }
+    await awaitStateOperationTestBarrier('before_state_unlink');
+    const atUnlinkBoundary = await lstat(target);
+    if (atUnlinkBoundary.isSymbolicLink() || !atUnlinkBoundary.isFile()
+      || !sameStateReadFileIdentity(opened, atUnlinkBoundary)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced before deletion: ${target}`);
+    }
+    const atUnlinkDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    if (!sameStateReadDirectoryIdentity(directoryIdentity, atUnlinkDirectoryIdentity)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced before deletion: ${target}`);
+    }
+    if (process.platform === 'win32') {
+      await handle.close();
+      handle = undefined;
+      const afterClose = await lstat(target);
+      if (afterClose.isSymbolicLink() || !afterClose.isFile()
+        || !sameStateReadFileIdentity(opened, afterClose)) {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced before deletion: ${target}`);
+      }
+      const afterCloseDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+      if (!sameStateReadDirectoryIdentity(directoryIdentity, afterCloseDirectoryIdentity)) {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced before deletion: ${target}`);
+      }
+    }
+    await unlink(target);
+    await fsyncAuthorityDirectory(directory);
+    return true;
   } catch (error) {
-    await unlink(tmpPath).catch(() => {});
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+
+type StateOperationJournalStage = 'prepared' | 'committed' | 'aborted';
+type DurableStateOperationName = 'state_write' | 'state_clear';
+
+interface DurableStateOperation {
+  operation_id: string;
+  name: DurableStateOperationName;
+  mode: string;
+  session_id?: string;
+  all_sessions?: boolean;
+  targets: string[];
+  recovery_args: Record<string, unknown>;
+}
+
+interface StateOperationExecutionOptions {
+  skipPreparedOperationRecovery?: boolean;
+  authorityTransaction?: {
+    authority: ResolvedStateAuthorityContext;
+    lock: AcquiredStateAuthorityLock;
+  };
+  recoveryOperation?: DurableStateOperation;
+}
+
+interface DurableStateOperationEvidence {
+  schema_version?: unknown;
+  authority_id?: unknown;
+  generation_id?: unknown;
+  event?: {
+    kind?: unknown;
+    stage?: unknown;
+    operation_id?: unknown;
+    mode?: unknown;
+    session_id?: unknown;
+    all_sessions?: unknown;
+    targets?: unknown;
+    recovery_args?: unknown;
+    fencing_token?: unknown;
+    anchor_revision?: unknown;
+  };
+}
+
+type ParsedDurableStateOperationEvidence = {
+  operation: DurableStateOperation;
+  stage: StateOperationJournalStage;
+};
+
+const stateOperationRecoveryQueues = new Map<string, Promise<void>>();
+
+type StateOperationFaultInjectionPoint =
+  | 'after_effects_before_committed_evidence'
+  | 'after_first_state_clear_effect';
+type StateOperationTestBarrierPoint =
+  | 'before_mutation_transaction'
+  | 'before_state_evidence_read'
+  | 'before_state_evidence_append'
+  | 'before_state_unlink';
+
+function injectStateOperationFault(point: StateOperationFaultInjectionPoint): void {
+  if (process.env.OMX_STATE_OPERATION_FAULT_INJECTION === point) {
+    throw new Error(`injected state operation crash at ${point}`);
+  }
+}
+
+/** Test-only cross-process synchronization seam; it is never persisted or user-facing. */
+async function awaitStateOperationTestBarrier(point: StateOperationTestBarrierPoint): Promise<void> {
+  const directory = process.env.OMX_STATE_OPERATION_TEST_BARRIER_DIR;
+  const configuredPoint = process.env.OMX_STATE_OPERATION_TEST_BARRIER_POINT ?? 'before_mutation_transaction';
+  if (!directory || configuredPoint !== point) return;
+
+  const reachedPath = join(directory, `${point}.reached`);
+  const releasePath = join(directory, `${point}.release`);
+  await writeFile(reachedPath, '', { flag: 'w' });
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(releasePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting at state operation test barrier: ${point}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function createRecoveryArguments(
+  rawArgs: Record<string, unknown>,
+  effectiveSessionId: string | undefined,
+): Record<string, unknown> {
+  const { workingDirectory: _workingDirectory, ...request } = rawArgs;
+  const recoveryArgs = JSON.parse(JSON.stringify(request)) as Record<string, unknown>;
+  if (effectiveSessionId) recoveryArgs.session_id = effectiveSessionId;
+  return recoveryArgs;
+}
+
+function createDurableStateOperation(input: Omit<DurableStateOperation, 'operation_id'>): DurableStateOperation {
+  return {
+    operation_id: `state-operation-${randomUUID()}`,
+    ...input,
+  };
+}
+
+async function appendDurableStateOperationEvidence(
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+  operation: DurableStateOperation,
+  stage: StateOperationJournalStage,
+  error?: unknown,
+): Promise<void> {
+  await awaitStateOperationTestBarrier('before_state_evidence_append');
+  await appendStateAuthorityEvidence(authority.generation, {
+
+    kind: operation.name === 'state_clear' ? 'state_clear_tombstone' : 'state_write_transaction',
+    stage,
+    operation_id: operation.operation_id,
+    mode: operation.mode,
+    ...(operation.session_id ? { session_id: operation.session_id } : {}),
+    ...(operation.all_sessions ? { all_sessions: true } : {}),
+    targets: operation.targets,
+    recovery_args: operation.recovery_args,
+    fencing_token: lock.record.fencing_token,
+    anchor_revision: lock.record.anchor_revision,
+    ...(stage === 'aborted' ? { error: error instanceof Error ? error.message : String(error) } : {}),
+  });
+}
+
+function malformedDurableStateOperationEvidence(message: string): never {
+  throw new StateAuthorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, message);
+}
+
+function validateDurableStateOperationEvidence(evidence: unknown): DurableStateOperationEvidence {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid record');
+  }
+  const record = evidence as DurableStateOperationEvidence;
+  if (
+    record.schema_version !== 1
+    || typeof record.authority_id !== 'string'
+    || record.authority_id.length === 0
+    || typeof record.generation_id !== 'string'
+    || record.generation_id.length === 0
+    || !record.event
+    || typeof record.event !== 'object'
+    || Array.isArray(record.event)
+  ) {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid envelope');
+  }
+  return record;
+}
+
+type HistoricalGenerationDirectoryIdentity = Array<Awaited<ReturnType<typeof lstat>>>;
+
+async function captureHistoricalGenerationDirectoryIdentity(
+  stateRoot: string,
+  generationId: string,
+): Promise<HistoricalGenerationDirectoryIdentity> {
+  const generationDirectory = authorityGenerationPaths(stateRoot, generationId).generation_directory;
+  const directories = [
+    stateRoot,
+    join(stateRoot, 'authority'),
+    join(stateRoot, 'authority', 'generations'),
+    generationDirectory,
+  ];
+  const identity = await Promise.all(directories.map((directory) => lstat(directory)));
+  for (let index = 0; index < identity.length; index += 1) {
+    const details = identity[index]!;
+    if (details.isSymbolicLink()) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootSymlink,
+        `historical authority generation directory must not be a symbolic link: ${directories[index]}`,
+      );
+    }
+    if (!details.isDirectory()) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `historical authority generation directory is not a directory: ${directories[index]}`,
+      );
+    }
+  }
+  return identity;
+}
+
+function sameHistoricalGenerationDirectoryIdentity(
+  expected: HistoricalGenerationDirectoryIdentity,
+  actual: HistoricalGenerationDirectoryIdentity,
+): boolean {
+  return expected.length === actual.length
+    && expected.every((details, index) => sameStateReadFileIdentity(details, actual[index]!));
+}
+
+async function readLocallyRootedHistoricalGeneration(
+  authority: ResolvedStateAuthorityContext,
+  generationId: string,
+): Promise<StateAuthorityGeneration> {
+  const stateRoot = authority.generation.canonical_state_root;
+  const authorityPath = authorityGenerationPaths(stateRoot, generationId).authority_path;
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+
+  const rootBefore = await captureRootFilesystemIdentity(stateRoot);
+  if (!sameRootFilesystemIdentity(authority.generation.root_identity, rootBefore)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'the active state root changed before historical generation validation',
+    );
+  }
+  await assertStatePathHasNoSymlinkComponents(authorityPath, 'historical authority generation');
+  const directoriesBefore = await captureHistoricalGenerationDirectoryIdentity(stateRoot, generationId);
+  const beforeOpen = await lstat(authorityPath);
+  assertRegularStateReadFile(beforeOpen, authorityPath, 'historical authority generation');
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    try {
+      handle = await open(authorityPath, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `historical authority generation must not be a symbolic link: ${authorityPath}`);
+      }
+      throw error;
+    }
+    const opened = await handle.stat();
+    assertRegularStateReadFile(opened, authorityPath, 'historical authority generation');
+    const afterOpen = await lstat(authorityPath);
+    assertRegularStateReadFile(afterOpen, authorityPath, 'historical authority generation');
+    if (!sameStateReadFileIdentity(beforeOpen, opened) || !sameStateReadFileIdentity(opened, afterOpen)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `historical authority generation changed while opening: ${authorityPath}`,
+      );
+    }
+    const directoriesAfterOpen = await captureHistoricalGenerationDirectoryIdentity(stateRoot, generationId);
+    if (!sameHistoricalGenerationDirectoryIdentity(directoriesBefore, directoriesAfterOpen)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `historical authority generation directory changed while opening: ${authorityPath}`,
+      );
+    }
+
+    const content = await handle.readFile({ encoding: 'utf8' }) as string;
+    const afterRead = await lstat(authorityPath);
+    assertRegularStateReadFile(afterRead, authorityPath, 'historical authority generation');
+    if (!sameStateReadFileIdentity(opened, afterRead)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `historical authority generation changed while reading: ${authorityPath}`,
+      );
+    }
+    const directoriesAfterRead = await captureHistoricalGenerationDirectoryIdentity(stateRoot, generationId);
+    if (!sameHistoricalGenerationDirectoryIdentity(directoriesBefore, directoriesAfterRead)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `historical authority generation directory changed while reading: ${authorityPath}`,
+      );
+    }
+    const rootAfter = await captureRootFilesystemIdentity(stateRoot);
+    if (!sameRootFilesystemIdentity(rootBefore, rootAfter)
+      || !sameRootFilesystemIdentity(authority.generation.root_identity, rootAfter)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+        'the active state root changed while validating a historical generation',
+      );
+    }
+    try {
+      const generation = JSON.parse(content) as StateAuthorityGeneration;
+      validateStateAuthorityGeneration(generation);
+      return generation;
+    } catch (error) {
+      if (error instanceof StateAuthorityError) throw error;
+      malformedDurableStateOperationEvidence(`historical authority generation contains invalid JSON: ${authorityPath}`);
+      throw error;
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function isLocallyProvenHistoricalDurableStateOperationEvidence(
+  evidence: DurableStateOperationEvidence,
+  authority: ResolvedStateAuthorityContext,
+): Promise<boolean> {
+  if (evidence.authority_id === authority.generation.authority_id
+    && evidence.generation_id === authority.generation.generation_id) {
+    return true;
+  }
+
+  const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
+  if (!anchor || anchor.active_generation_id !== authority.generation.generation_id) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      'state authority changed while validating historical state operation evidence',
+    );
+  }
+
+  const stateRoot = authority.generation.canonical_state_root;
+  let descendant = authority.generation;
+  const seenGenerationIds = new Set([descendant.generation_id]);
+  let isImmediatePredecessor = true;
+  while (descendant.prior_generation_id) {
+    const historicalGenerationId = descendant.prior_generation_id;
+    if (seenGenerationIds.has(historicalGenerationId)) {
+      malformedDurableStateOperationEvidence('state operation evidence historical generation lineage contains a cycle');
+    }
+    seenGenerationIds.add(historicalGenerationId);
+
+    let historical: StateAuthorityGeneration;
+    try {
+      historical = await readLocallyRootedHistoricalGeneration(authority, historicalGenerationId);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        malformedDurableStateOperationEvidence('state operation evidence does not belong to the active state root lineage');
+      }
+      throw error;
+    }
+    const expectedAuthorityPath = authorityGenerationPaths(stateRoot, historicalGenerationId).authority_path;
+    if (historical.generation_id !== historicalGenerationId
+      || historical.canonical_state_root !== stateRoot
+      || !sameRootFilesystemIdentity(historical.root_identity, authority.generation.root_identity)) {
+      malformedDurableStateOperationEvidence('state operation evidence references a generation outside the active state root lineage');
+    }
+    const terminal = anchor.last_terminal;
+    if (isImmediatePredecessor && (
+      !terminal
+      || terminal.status !== 'terminal'
+      || terminal.generation_id !== historicalGenerationId
+      || terminal.generation_locator !== expectedAuthorityPath
+    )) {
+      malformedDurableStateOperationEvidence('state operation evidence immediate predecessor is not terminalized in the active authority lineage');
+    }
+    const validation = await validateStateAuthority(historical, {
+      workspace_identity: authority.workspace_identity,
+    });
+    if (!validation.valid) {
+      malformedDurableStateOperationEvidence(
+        `state operation evidence references an invalid historical generation: ${validation.diagnostics[0]?.message ?? 'unknown validation failure'}`,
+      );
+    }
+    if (historical.authority_id === evidence.authority_id
+      && historical.generation_id === evidence.generation_id) {
+      return false;
+    }
+
+    descendant = historical;
+    isImmediatePredecessor = false;
+  }
+
+  malformedDurableStateOperationEvidence('state operation evidence does not belong to the active state root lineage');
+}
+
+function parseDurableStateOperation(
+  evidence: DurableStateOperationEvidence,
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+): ParsedDurableStateOperationEvidence | null {
+  const event = evidence.event!;
+  if (event.kind !== 'state_write_transaction' && event.kind !== 'state_clear_tombstone') return null;
+  if (
+    event.stage !== 'prepared'
+    && event.stage !== 'committed'
+    && event.stage !== 'aborted'
+  ) {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid journal stage');
+  }
+  if (typeof event.operation_id !== 'string' || event.operation_id.length === 0 || typeof event.mode !== 'string') {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid operation identity');
+  }
+  if (!Array.isArray(event.targets) || !event.targets.every((target) => typeof target === 'string')) {
+    malformedDurableStateOperationEvidence('state operation evidence has invalid targets');
+  }
+  if (!event.recovery_args || typeof event.recovery_args !== 'object' || Array.isArray(event.recovery_args)) {
+    malformedDurableStateOperationEvidence('state operation evidence has invalid recovery arguments');
+  }
+  if (event.session_id !== undefined && typeof event.session_id !== 'string') {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid session ID');
+  }
+  if (event.all_sessions !== undefined && event.all_sessions !== true) {
+    malformedDurableStateOperationEvidence('state operation evidence has an invalid all-sessions flag');
+  }
+  if (
+    typeof event.fencing_token !== 'number'
+    || !Number.isSafeInteger(event.fencing_token)
+    || event.fencing_token < authority.generation.creation_fence
+    || event.fencing_token > lock.record.fencing_token
+  ) {
+    malformedDurableStateOperationEvidence('state operation evidence has a fence outside the current authority generation');
+  }
+  if (
+    typeof event.anchor_revision !== 'number'
+    || !Number.isSafeInteger(event.anchor_revision)
+    || event.anchor_revision < 0
+    || event.anchor_revision > lock.record.anchor_revision
+  ) {
+    malformedDurableStateOperationEvidence('state operation evidence has an anchor revision outside the current authority generation');
+  }
+  return {
+    operation: {
+      operation_id: event.operation_id,
+      name: event.kind === 'state_clear_tombstone' ? 'state_clear' : 'state_write',
+      mode: event.mode,
+      ...(typeof event.session_id === 'string' ? { session_id: event.session_id } : {}),
+      ...(event.all_sessions === true ? { all_sessions: true } : {}),
+      targets: event.targets,
+      recovery_args: event.recovery_args as Record<string, unknown>,
+    },
+    stage: event.stage,
+  };
+}
+
+async function repairTornDurableStateOperationEvidence(
+  authority: ResolvedStateAuthorityContext,
+  completeContent: string,
+): Promise<void> {
+  const evidencePath = join(
+    authority.generation.canonical_state_root,
+    'authority',
+    STATE_AUTHORITY_TOMBSTONE_FILE,
+  );
+  await writeAtomicFile(authority.generation.canonical_state_root, evidencePath, completeContent);
+  await fsyncAuthorityDirectory(dirname(evidencePath));
+}
+
+async function readPreparedDurableStateOperations(
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+): Promise<DurableStateOperation[]> {
+  let content: string;
+  await awaitStateOperationTestBarrier('before_state_evidence_read');
+  try {
+    content = await readStateAuthorityEvidence(authority.generation) ?? '';
+  } catch (error) {
+    if (error instanceof StateAuthorityError) throw error;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const hasTornTail = content.length > 0 && !content.endsWith('\n');
+  const completeContent = hasTornTail ? content.slice(0, content.lastIndexOf('\n') + 1) : content;
+  const lines = completeContent.length > 0 ? completeContent.slice(0, -1).split('\n') : [];
+  const prepared = new Map<string, DurableStateOperation>();
+  for (const line of lines) {
+    if (!line.trim()) {
+      malformedDurableStateOperationEvidence('state operation evidence contains an empty complete record');
+    }
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(line);
+    } catch {
+      malformedDurableStateOperationEvidence('state operation evidence contains invalid JSON');
+    }
+    const durableEvidence = validateDurableStateOperationEvidence(evidence);
+    if (!await isLocallyProvenHistoricalDurableStateOperationEvidence(durableEvidence, authority)) continue;
+    const parsed = parseDurableStateOperation(durableEvidence, authority, lock);
+    if (!parsed) continue;
+    if (parsed.stage === 'prepared') {
+      prepared.set(parsed.operation.operation_id, parsed.operation);
+    } else {
+      prepared.delete(parsed.operation.operation_id);
+    }
+  }
+  if (hasTornTail) {
+    await repairTornDurableStateOperationEvidence(authority, completeContent);
+  }
+  return [...prepared.values()];
+}
+
+async function isDurableStateOperationTerminal(
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+  operationId: string,
+): Promise<boolean> {
+  const prepared = await readPreparedDurableStateOperations(authority, lock);
+  return !prepared.some((operation) => operation.operation_id === operationId);
+}
+
+function stateOperationRecoveryKey(authority: ResolvedStateAuthorityContext): string {
+  return `${authority.workspace_identity.canonical_path}:${authority.generation.generation_id}`;
+}
+
+async function recoverPreparedDurableStateOperations(authority: ResolvedStateAuthorityContext): Promise<void> {
+  const key = stateOperationRecoveryKey(authority);
+  const queued = stateOperationRecoveryQueues.get(key);
+  if (queued) {
+    await queued;
+    return;
+  }
+
+  const recovery = replayPreparedDurableStateOperations(authority);
+  stateOperationRecoveryQueues.set(key, recovery);
+  try {
+    await recovery;
+  } finally {
+    if (stateOperationRecoveryQueues.get(key) === recovery) {
+      stateOperationRecoveryQueues.delete(key);
+    }
+  }
+}
+
+async function replayPreparedDurableStateOperationsUnderTransaction(
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+): Promise<void> {
+  const prepared = await readPreparedDurableStateOperations(authority, lock);
+  for (const operation of prepared) {
+    if (await isDurableStateOperationTerminal(authority, lock, operation.operation_id)) continue;
+    const response = await executeStateOperationInternal(
+      operation.name,
+      {
+        ...operation.recovery_args,
+        workingDirectory: authority.workspace_identity.canonical_path,
+      },
+      {
+        skipPreparedOperationRecovery: true,
+        authorityTransaction: { authority, lock },
+        recoveryOperation: operation,
+      },
+    );
+    if (response.isError) {
+      throw new Error(`prepared ${operation.name} recovery failed: ${(response.payload as { error?: unknown }).error ?? 'unknown error'}`);
+    }
+  }
+}
+
+async function replayPreparedDurableStateOperations(authority: ResolvedStateAuthorityContext): Promise<void> {
+  await withStateAuthorityTransaction(authority, replayPreparedDurableStateOperationsUnderTransaction);
+}
+
+/**
+ * The authority evidence log is the durable state-operation journal. A caller
+ * observes success only after every effect and its fenced committed record sync.
+ * Failed effects stay prepared: a prepared record is replayed from its persisted
+ * request rather than being misclassified as aborted after a partial mutation.
+ */
+async function withDurableStateOperation<T>(
+  authority: ResolvedStateAuthorityContext,
+  lock: AcquiredStateAuthorityLock,
+  operation: DurableStateOperation,
+  effect: (markEffectsStarted: () => void) => Promise<T>,
+  options: { preparedAlreadyRecorded?: boolean } = {},
+): Promise<T> {
+  if (!options.preparedAlreadyRecorded) {
+    await appendDurableStateOperationEvidence(authority, lock, operation, 'prepared');
+  }
+  let effectsStarted = false;
+  try {
+    const result = await effect(() => {
+      effectsStarted = true;
+    });
+    injectStateOperationFault('after_effects_before_committed_evidence');
+    await appendDurableStateOperationEvidence(authority, lock, operation, 'committed');
+    return result;
+  } catch (error) {
+    if (!effectsStarted) {
+      await appendDurableStateOperationEvidence(authority, lock, operation, 'aborted', error);
+    }
     throw error;
   }
 }
 
+async function assertStateDirectory(path: string, label: string): Promise<void> {
+  const details = await lstat(path);
+  if (details.isSymbolicLink()) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootSymlink,
+      `${label} must not be a symbolic link: ${path}`,
+    );
+  }
+  if (!details.isDirectory()) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      `${label} must be a directory: ${path}`,
+    );
+  }
+}
+
+async function assertStateDirectoryIfPresent(path: string, label: string): Promise<boolean> {
+  try {
+    await assertStateDirectory(path, label);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function ensureStateChildDirectory(parent: string, child: string, label: string): Promise<string> {
+  await assertStateDirectory(parent, `${label} parent`);
+  const path = join(parent, child);
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  await assertStateDirectory(parent, `${label} parent`);
+  await assertStateDirectory(path, label);
+  return path;
+}
+
+async function assertSessionStateDirectoryForRead(baseStateDir: string, sessionId?: string): Promise<void> {
+  if (!sessionId) return;
+  if (!await assertStateDirectoryIfPresent(baseStateDir, 'state root')) return;
+  const sessionsDir = join(baseStateDir, 'sessions');
+  if (!await assertStateDirectoryIfPresent(sessionsDir, 'state sessions directory')) return;
+  await assertStateDirectory(sessionsDir, 'state sessions directory');
+  const sessionDir = join(sessionsDir, sessionId);
+  if (!await assertStateDirectoryIfPresent(sessionDir, 'state session directory')) return;
+  await assertStateDirectory(sessionsDir, 'state sessions directory');
+  await assertStateDirectory(sessionDir, 'state session directory');
+}
+
+function isPathWithinStateRoot(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate);
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
+
+function stateReadError(code: typeof AUTHORITY_DIAGNOSTIC_CODES[keyof typeof AUTHORITY_DIAGNOSTIC_CODES], message: string): never {
+
+  throw new StateAuthorityError(code, message);
+}
+
+async function assertStatePathHasNoSymlinkComponents(path: string, label: string): Promise<void> {
+  const target = resolve(path);
+  const components: string[] = [];
+  let cursor = target;
+  while (dirname(cursor) !== cursor) {
+    components.unshift(cursor.slice(dirname(cursor).length).replace(/^[\\/]+/, ''));
+    cursor = dirname(cursor);
+  }
+
+  let current = cursor;
+  for (const component of ['', ...components]) {
+    if (component) current = join(current, component);
+    try {
+      const details = await lstat(current);
+      if (
+        details.isSymbolicLink()
+        && !await isTrustedAuthorityPlatformRootAlias(current, details)
+      ) {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} has a symbolic-link component: ${current}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
+}
+
+
+async function assertStateReadDirectory(baseStateDir: string, directory: string, label: string): Promise<void> {
+  const stateRoot = resolve(baseStateDir);
+  const stateDirectory = resolve(directory);
+  if (!isPathWithinStateRoot(stateRoot, stateDirectory)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      `${label} escapes the active authority state root: ${stateDirectory}`,
+    );
+  }
+
+  await assertStatePathHasNoSymlinkComponents(stateRoot, label);
+  await assertStateDirectory(stateRoot, 'state root');
+
+  if (stateDirectory === stateRoot) return;
+
+  const segments = relative(stateRoot, stateDirectory).split(/[\\/]+/);
+  if (segments.length !== 2 || segments[0] !== 'sessions' || !/^[A-Za-z0-9_-]{1,64}$/.test(segments[1])) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      `${label} is outside the active authority session schema: ${stateDirectory}`,
+    );
+  }
+
+  const sessionsDir = join(stateRoot, 'sessions');
+  await assertStateDirectory(sessionsDir, 'state sessions directory');
+  await assertStateDirectory(stateDirectory, 'state session directory');
+  await assertStateDirectory(sessionsDir, 'state sessions directory');
+  await assertStatePathHasNoSymlinkComponents(stateRoot, label);
+  await assertStateDirectory(stateRoot, 'state root');
+}
+
+async function assertStateReadDirectoryIfPresent(baseStateDir: string, directory: string, label: string): Promise<boolean> {
+  try {
+    await assertStateReadDirectory(baseStateDir, directory, label);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function assertRegularStateReadFile(
+  details: Awaited<ReturnType<typeof lstat>>,
+  path: string,
+  label: string,
+): void {
+  if (details.isSymbolicLink()) {
+    stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} must not be a symbolic link: ${path}`);
+  }
+  if (!details.isFile()) {
+    stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} must be a regular file: ${path}`);
+  }
+}
+
+function sameStateReadFileIdentity(
+  expected: Pick<Awaited<ReturnType<typeof lstat>>, 'dev' | 'ino'>,
+  actual: Pick<Awaited<ReturnType<typeof lstat>>, 'dev' | 'ino'>,
+): boolean {
+  return expected.dev === actual.dev && expected.ino === actual.ino;
+}
+
+type StateReadDirectoryIdentity = {
+  stateRoot: Awaited<ReturnType<typeof lstat>>;
+  sessionsDir?: Awaited<ReturnType<typeof lstat>>;
+  sessionDir?: Awaited<ReturnType<typeof lstat>>;
+};
+
+async function captureStateReadDirectoryIdentity(
+  baseStateDir: string,
+  directory: string,
+  label: string,
+): Promise<StateReadDirectoryIdentity> {
+  await assertStateReadDirectory(baseStateDir, directory, label);
+  const stateRoot = resolve(baseStateDir);
+  const stateDirectory = resolve(directory);
+  const identity: StateReadDirectoryIdentity = { stateRoot: await lstat(stateRoot) };
+  if (stateDirectory !== stateRoot) {
+    const sessionsDir = join(stateRoot, 'sessions');
+    identity.sessionsDir = await lstat(sessionsDir);
+    identity.sessionDir = await lstat(stateDirectory);
+  }
+  return identity;
+}
+
+function sameStateReadDirectoryIdentity(
+  expected: StateReadDirectoryIdentity,
+  actual: StateReadDirectoryIdentity,
+): boolean {
+  return sameStateReadFileIdentity(expected.stateRoot, actual.stateRoot)
+    && (!expected.sessionsDir || (actual.sessionsDir !== undefined && sameStateReadFileIdentity(expected.sessionsDir, actual.sessionsDir)))
+    && (!expected.sessionDir || (actual.sessionDir !== undefined && sameStateReadFileIdentity(expected.sessionDir, actual.sessionDir)));
+}
+
+
+async function readRegularStateFile(baseStateDir: string, path: string, label: string): Promise<string> {
+  const target = resolve(path);
+  const directory = dirname(target);
+  const directoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+
+
+  const beforeOpen = await lstat(target);
+  assertRegularStateReadFile(beforeOpen, target, label);
+
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    try {
+      handle = await open(target, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} must not be a symbolic link: ${target}`);
+      }
+      throw error;
+    }
+    const opened = await handle.stat();
+    assertRegularStateReadFile(opened, target, label);
+    if (!sameStateReadFileIdentity(beforeOpen, opened)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} changed while opening: ${target}`);
+    }
+
+    const afterOpen = await lstat(target);
+    assertRegularStateReadFile(afterOpen, target, label);
+    if (!sameStateReadFileIdentity(opened, afterOpen)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced while opening: ${target}`);
+    }
+    const afterOpenDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    if (!sameStateReadDirectoryIdentity(directoryIdentity, afterOpenDirectoryIdentity)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while opening: ${target}`);
+    }
+
+
+    const content = await handle.readFile({ encoding: 'utf8' }) as string;
+    const afterRead = await lstat(target);
+    assertRegularStateReadFile(afterRead, target, label);
+    if (!sameStateReadFileIdentity(opened, afterRead)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced while reading: ${target}`);
+    }
+    const afterReadDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    if (!sameStateReadDirectoryIdentity(directoryIdentity, afterReadDirectoryIdentity)) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while reading: ${target}`);
+    }
+    return content;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function readRegularStateFileIfPresent(baseStateDir: string, path: string, label: string): Promise<string | null> {
+  try {
+    return await readRegularStateFile(baseStateDir, path, label);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function readSafeSkillActiveState(baseStateDir: string, path: string): Promise<SkillActiveStateLike | null> {
+  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state');
+  if (content === null) return null;
+  try {
+    return JSON.parse(content) as SkillActiveStateLike;
+  } catch {
+    return null;
+  }
+}
+
+async function readVisibleSafeSkillActiveState(
+  baseStateDir: string,
+  sessionId?: string,
+): Promise<SkillActiveStateLike | null> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(baseStateDir, sessionId);
+  return sessionPath
+    ? readSafeSkillActiveState(baseStateDir, sessionPath)
+    : readSafeSkillActiveState(baseStateDir, rootPath);
+}
+
+async function listStateSessionDirectories(baseStateDir: string): Promise<string[]> {
+  await assertStatePathHasNoSymlinkComponents(baseStateDir, 'state root');
+  await assertStateDirectory(baseStateDir, 'state root');
+  const sessionsDir = join(baseStateDir, 'sessions');
+  if (!await assertStateDirectoryIfPresent(sessionsDir, 'state sessions directory')) return [];
+  const entries = await readdir(sessionsDir, { withFileTypes: true });
+  await assertStateDirectory(sessionsDir, 'state sessions directory');
+  await assertStatePathHasNoSymlinkComponents(baseStateDir, 'state root');
+  await assertStateDirectory(baseStateDir, 'state root');
+
+  const directories: string[] = [];
+  for (const entry of entries) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(entry.name)) continue;
+    await assertStateDirectory(sessionsDir, 'state sessions directory');
+    const sessionDir = join(sessionsDir, entry.name);
+    await assertStateDirectory(sessionDir, 'state session directory');
+    directories.push(sessionDir);
+  }
+  return directories;
+}
+
+async function finalizeCanonicalSkillStateDurability(
+  baseStateDir: string,
+  options: { sessionId?: string; allSessions?: boolean; sessionIds?: readonly string[] } = {},
+): Promise<void> {
+  const directories = new Set<string>([baseStateDir]);
+  if (options.sessionId) {
+    const sessionsDir = join(baseStateDir, 'sessions');
+    await assertStateDirectory(sessionsDir, 'state sessions directory');
+    const sessionDir = join(sessionsDir, options.sessionId);
+    await assertStateDirectory(sessionsDir, 'state sessions directory');
+    await assertStateDirectory(sessionDir, 'state session directory');
+    directories.add(sessionDir);
+  } else if (options.allSessions) {
+    if (options.sessionIds) {
+      const sessionsDir = join(baseStateDir, 'sessions');
+      const seenSessionIds = new Set<string>();
+      for (const candidate of options.sessionIds) {
+        const sessionId = validateSessionId(candidate)!;
+        if (seenSessionIds.has(sessionId)) {
+          throw new Error(`canonical skill-state durability session inventory contains duplicate session ID: ${sessionId}`);
+        }
+        seenSessionIds.add(sessionId);
+        await assertStateDirectory(sessionsDir, 'state sessions directory');
+        const sessionDir = join(sessionsDir, sessionId);
+        await assertStateDirectory(sessionDir, 'state session directory');
+        directories.add(sessionDir);
+      }
+    } else {
+      for (const sessionDir of await listStateSessionDirectories(baseStateDir)) {
+        directories.add(sessionDir);
+      }
+    }
+  }
+
+  for (const directory of directories) {
+    const path = join(directory, SKILL_ACTIVE_STATE_FILE);
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state');
+    if (content !== null) {
+      JSON.parse(content);
+      await writeAtomicFile(baseStateDir, path, content);
+
+    }
+    await fsyncAuthorityDirectory(directory);
+  }
+
+}
+
 async function writeClearedSessionScopedModeState(
+  baseStateDir: string,
   path: string,
   mode: string,
   sessionId: string,
 ): Promise<void> {
+
   const nowIso = new Date().toISOString();
   const clearedState = withModeRuntimeContext({}, {
     mode,
@@ -175,7 +1168,8 @@ async function writeClearedSessionScopedModeState(
     completed_at: nowIso,
     session_id: sessionId,
   });
-  await writeAtomicFile(path, JSON.stringify(clearedState, null, 2));
+  await writeAtomicFile(baseStateDir, path, JSON.stringify(clearedState, null, 2));
+
 }
 
 async function clearSessionNativeStopState(baseStateDir: string, sessionId: string): Promise<string[]> {
@@ -183,23 +1177,41 @@ async function clearSessionNativeStopState(baseStateDir: string, sessionId: stri
     join(baseStateDir, 'native-stop-state.json'),
     join(baseStateDir, 'sessions', sessionId, 'native-stop-state.json'),
   ];
-  const changed: string[] = [];
+  const pending = [] as Array<{
+    path: string;
+    state: Record<string, unknown>;
+    sessions: Record<string, unknown>;
+  }>;
   for (const path of paths) {
-    if (!existsSync(path)) continue;
-    let state: Record<string, unknown>;
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'native Stop state');
+    if (content === null) continue;
+    let value: unknown;
     try {
-      state = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+      value = JSON.parse(content);
     } catch {
-      continue;
+      throw new Error(`native Stop state contains malformed JSON: ${path}`);
     }
-    const sessions = state.sessions && typeof state.sessions === 'object' && !Array.isArray(state.sessions)
-      ? { ...(state.sessions as Record<string, unknown>) }
-      : null;
-    if (!sessions || !Object.prototype.hasOwnProperty.call(sessions, sessionId)) continue;
-    delete sessions[sessionId];
-    state.sessions = sessions;
-    await writeAtomicFile(path, JSON.stringify(state, null, 2));
-    changed.push(path);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`native Stop state has a malformed root container: ${path}`);
+    }
+    const state = value as Record<string, unknown>;
+    if (!state.sessions || typeof state.sessions !== 'object' || Array.isArray(state.sessions)) {
+      throw new Error(`native Stop state has a malformed sessions container: ${path}`);
+    }
+    pending.push({
+      path,
+      state,
+      sessions: { ...(state.sessions as Record<string, unknown>) },
+    });
+  }
+
+  const changed: string[] = [];
+  for (const entry of pending) {
+    if (!Object.prototype.hasOwnProperty.call(entry.sessions, sessionId)) continue;
+    delete entry.sessions[sessionId];
+    entry.state.sessions = entry.sessions;
+    await writeAtomicFile(baseStateDir, entry.path, JSON.stringify(entry.state, null, 2));
+    changed.push(entry.path);
   }
   return changed;
 }
@@ -216,18 +1228,231 @@ function validateStrictReadableMode(mode: unknown): string {
   return normalized;
 }
 
+function modeStatePath(baseStateDir: string, mode: string, sessionId?: string): string {
+  const fileName = `${validateStateModeSegment(mode)}-state.json`;
+  return sessionId ? join(baseStateDir, 'sessions', sessionId, fileName) : join(baseStateDir, fileName);
+}
+
+
 async function initializeStateEnvironment(
-  cwd: string,
+  baseStateDir: string,
+  workspaceRoot: string,
   effectiveSessionId?: string,
-  rootSource?: StateRootSource,
+  authoritativeOmxRoot?: string,
 ): Promise<void> {
-  await mkdir(getStateDir(cwd), { recursive: true });
+  await mkdir(baseStateDir, { recursive: true });
+  await assertStateDirectory(baseStateDir, 'state root');
+  await fsyncAuthorityDirectory(baseStateDir);
   if (effectiveSessionId) {
-    await mkdir(getStateDir(cwd, effectiveSessionId), { recursive: true });
+    const sessionsDir = await ensureStateChildDirectory(baseStateDir, 'sessions', 'state sessions directory');
+    await fsyncAuthorityDirectory(baseStateDir);
+    await ensureStateChildDirectory(sessionsDir, effectiveSessionId, 'state session directory');
+    await fsyncAuthorityDirectory(sessionsDir);
   }
-  if (rootSource === 'team-env') return;
   const { ensureTmuxHookInitialized } = await import('../cli/tmux-hook.js');
-  await ensureTmuxHookInitialized(cwd);
+  await ensureTmuxHookInitialized(workspaceRoot, authoritativeOmxRoot);
+}
+
+function uniqueStatePaths(paths: Array<string | undefined>): string[] {
+  return [...new Set(paths.filter((path): path is string => typeof path === 'string' && path.length > 0))];
+}
+
+type PersistedWriteTargetInventory = {
+  modeStatePath: string;
+  skillStatePaths: string[];
+  transitionSourcePaths: string[];
+};
+
+function validatePreparedWriteTargetInventory(
+  authority: ResolvedStateAuthorityContext,
+  baseStateDir: string,
+  operation: DurableStateOperation,
+  expectedModePath: string,
+  sessionId?: string,
+): PersistedWriteTargetInventory {
+  const stateRoot = resolve(authority.canonical_state_root);
+  if (resolve(baseStateDir) !== stateRoot || resolve(authority.generation.canonical_state_root) !== stateRoot) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      'prepared state write recovery does not use the active authority state root',
+    );
+  }
+  if (operation.targets.length === 0 || new Set(operation.targets).size !== operation.targets.length) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      'prepared state write target inventory is empty or contains duplicates',
+    );
+  }
+
+  const modePath = resolve(expectedModePath);
+  const expectedSkillPaths = uniqueStatePaths([
+    join(stateRoot, SKILL_ACTIVE_STATE_FILE),
+    sessionId ? join(stateRoot, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE) : undefined,
+  ]).map((target) => resolve(target));
+  const allowedTransitionFiles = new Set(TRACKED_WORKFLOW_MODES.map((mode) => `${mode}-state.json`));
+  const modeFile = `${validateStateModeSegment(operation.mode)}-state.json`;
+  const inventory: PersistedWriteTargetInventory = {
+    modeStatePath: modePath,
+    skillStatePaths: [],
+    transitionSourcePaths: [],
+  };
+
+  for (const target of operation.targets) {
+    const resolvedTarget = resolve(target);
+    if (target !== resolvedTarget || !isPathWithinStateRoot(stateRoot, resolvedTarget)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `prepared state write target escapes the active authority state root: ${target}`,
+      );
+    }
+    const segments = relative(stateRoot, resolvedTarget).split(/[\\/]+/);
+    const rootScoped = segments.length === 1;
+    const sessionScoped = segments.length === 3
+      && segments[0] === 'sessions'
+      && /^[A-Za-z0-9_-]{1,64}$/.test(segments[1]);
+    if (!rootScoped && !sessionScoped) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `prepared state write target is outside the authority state schema: ${target}`,
+      );
+    }
+    const fileName = segments.at(-1)!;
+    if (resolvedTarget === modePath) continue;
+    if (expectedSkillPaths.includes(resolvedTarget)) {
+      inventory.skillStatePaths.push(resolvedTarget);
+      continue;
+    }
+    if (allowedTransitionFiles.has(fileName) && fileName !== modeFile) {
+      const expectedScope = sessionId ? ['sessions', sessionId] : [];
+      if (segments.slice(0, -1).join('/') !== expectedScope.join('/')) {
+        stateReadError(
+          AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+          `prepared transition source target is outside the requested state scope: ${target}`,
+        );
+      }
+      inventory.transitionSourcePaths.push(resolvedTarget);
+      continue;
+    }
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      `prepared state write target is not an allowed state file: ${target}`,
+    );
+  }
+
+  if (!operation.targets.includes(modePath)
+    || inventory.skillStatePaths.length !== expectedSkillPaths.length
+    || !expectedSkillPaths.every((path) => inventory.skillStatePaths.includes(path))) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      'prepared state write target inventory does not include its exact mode and canonical skill-state targets',
+    );
+  }
+  return inventory;
+}
+
+type PersistedClearTargetInventory = {
+  modeStatePaths: string[];
+  skillStatePaths: string[];
+  nativeStopPaths: string[];
+};
+
+function validatePreparedClearTargetInventory(
+  authority: ResolvedStateAuthorityContext,
+  baseStateDir: string,
+  operation: DurableStateOperation,
+): PersistedClearTargetInventory {
+  const stateRoot = resolve(authority.canonical_state_root);
+  if (resolve(baseStateDir) !== stateRoot || resolve(authority.generation.canonical_state_root) !== stateRoot) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      'prepared state clear recovery does not use the active authority state root',
+    );
+  }
+  if (operation.targets.length === 0 || new Set(operation.targets).size !== operation.targets.length) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      'prepared state clear target inventory is empty or contains duplicates',
+    );
+  }
+
+  const modeFile = `${validateStateModeSegment(operation.mode)}-state.json`;
+  const inventory: PersistedClearTargetInventory = {
+    modeStatePaths: [],
+    skillStatePaths: [],
+    nativeStopPaths: [],
+  };
+  for (const target of operation.targets) {
+    const resolvedTarget = resolve(target);
+    if (target !== resolvedTarget || !isPathWithinStateRoot(stateRoot, resolvedTarget)) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `prepared state clear target escapes the active authority state root: ${target}`,
+      );
+    }
+    const segments = relative(stateRoot, resolvedTarget).split(/[\\/]+/);
+    const rootScoped = segments.length === 1;
+    const sessionScoped = segments.length === 3
+      && segments[0] === 'sessions'
+      && /^[A-Za-z0-9_-]{1,64}$/.test(segments[1]);
+    if (!rootScoped && !sessionScoped) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `prepared state clear target is outside the authority state schema: ${target}`,
+      );
+    }
+    const fileName = segments.at(-1)!;
+    if (fileName === modeFile) {
+      inventory.modeStatePaths.push(resolvedTarget);
+    } else if (fileName === SKILL_ACTIVE_STATE_FILE) {
+      inventory.skillStatePaths.push(resolvedTarget);
+    } else if (fileName === 'native-stop-state.json' && !operation.all_sessions) {
+      inventory.nativeStopPaths.push(resolvedTarget);
+    } else {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `prepared state clear target is not an allowed state file: ${target}`,
+      );
+    }
+  }
+
+  if (inventory.modeStatePaths.length === 0 || (operation.all_sessions && !inventory.modeStatePaths.includes(join(stateRoot, modeFile)))) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      'prepared all-session clear target inventory does not include the canonical root mode state',
+    );
+  }
+  return inventory;
+}
+
+async function clearPersistedAllSessionSkillStateTargets(
+  baseStateDir: string,
+  skillStatePaths: string[],
+  mode: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  for (const path of skillStatePaths) {
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'prepared canonical skill state');
+    if (content === null) continue;
+    let state: SkillActiveStateLike;
+    try {
+      state = JSON.parse(content) as SkillActiveStateLike;
+    } catch {
+      throw new Error(`prepared canonical skill state is malformed: ${path}`);
+    }
+    const entries = listActiveSkills(state).filter((entry) => entry.skill !== mode);
+    const primary = entries.find((entry) => entry.skill === stringValue(state.skill).trim()) ?? entries[0];
+    const next: SkillActiveStateLike = {
+      ...state,
+      active: entries.length > 0,
+      skill: primary?.skill ?? (stringValue(state.skill).trim() || mode),
+      phase: primary?.phase ?? (stringValue(state.phase).trim() || undefined),
+
+      updated_at: now,
+      active_skills: entries,
+    };
+    await writeAtomicFile(baseStateDir, path, JSON.stringify(next, null, 2));
+    await fsyncAuthorityDirectory(dirname(path));
+  }
 }
 
 function hasExplicitStateField(
@@ -515,22 +1740,23 @@ function collectCompletedRalplanSessionEntries(
   return [...entries.values()];
 }
 
-async function writeAtomicJson(path: string, value: unknown): Promise<void> {
+async function writeAtomicJson(baseStateDir: string, path: string, value: unknown): Promise<void> {
   const serialized = JSON.stringify(value, null, 2);
   JSON.parse(serialized);
-  await mkdir(dirname(path), { recursive: true });
-  await writeAtomicFile(path, serialized);
+  await writeAtomicFile(baseStateDir, path, serialized);
 }
 
-async function readJsonRecordIfExists(path: string): Promise<Record<string, unknown> | null> {
-  if (!existsSync(path)) return null;
+
+async function readJsonRecordIfExists(baseStateDir: string, path: string): Promise<Record<string, unknown> | null> {
+  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'workflow state');
+  if (content === null) return null;
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
-    return objectRecord(parsed);
+    return objectRecord(JSON.parse(content) as unknown);
   } catch {
     return null;
   }
 }
+
 
 function shouldWriteRootRalplanTerminalState(rootState: Record<string, unknown> | null, sessionId: string | undefined): boolean {
   if (!sessionId) return true;
@@ -545,8 +1771,7 @@ export async function completeRalplanSession(options: {
   requireNativeSubagents?: boolean;
 }): Promise<boolean> {
   if (!isCompleteRalplanTerminalState(options.state)) return false;
-  const writableScope = await resolveWritableStateScope(options.cwd, options.explicitSessionId);
-  const sessionId = writableScope.sessionId;
+  const sessionId = optionalSessionId(options.explicitSessionId);
   const validationError = validateRalplanTerminalConsensus(options.cwd, options.state, sessionId, {
     requireNativeSubagents: options.requireNativeSubagents === true,
   });
@@ -557,37 +1782,46 @@ export async function completeRalplanSession(options: {
 
   const nowIso = new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
-  const rootStatePath = getStatePath('ralplan', options.cwd);
-  const existingRootState = await readJsonRecordIfExists(rootStatePath);
+  const rootStatePath = modeStatePath(options.baseStateDir, 'ralplan');
+  const existingRootState = await readJsonRecordIfExists(options.baseStateDir, rootStatePath);
+
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
 
   if (shouldWriteRootState) {
-    await writeAtomicJson(rootStatePath, rootState);
+    await writeAtomicJson(options.baseStateDir, rootStatePath, rootState);
+
   }
   if (sessionId) {
     await writeAtomicJson(
-      getStatePath('ralplan', options.cwd, sessionId),
+      options.baseStateDir,
+
+      modeStatePath(options.baseStateDir, 'ralplan', sessionId),
       buildRalplanTerminalState(options.state, sessionId, nowIso),
     );
   }
 
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
-  const rootSkillState = await readSkillActiveState(rootPath);
+  const rootSkillState = await readSafeSkillActiveState(options.baseStateDir, rootPath);
+
   const rootEntries = filterCompletedRalplanRootEntries(
     listActiveSkills(rootSkillState ?? {}),
     completedSessionId,
     rootScopeCompletion,
   );
   if (rootEntries.length > 0 || (shouldWriteRootState && rootSkillState !== null)) {
-    await writeAtomicJson(rootPath, buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso));
+    await writeAtomicJson(options.baseStateDir, rootPath, buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso));
+
   } else if (rootSkillState !== null && !isTerminalSkillActiveTombstone(rootSkillState)) {
-    await unlink(rootPath).catch(() => {});
+    await unlinkDurably(options.baseStateDir, rootPath, 'ralplan canonical skill state');
+
   }
   if (sessionPath && sessionId) {
-    const sessionSkillState = await readSkillActiveState(sessionPath);
+    const sessionSkillState = await readSafeSkillActiveState(options.baseStateDir, sessionPath);
+
     const sessionEntries = collectCompletedRalplanSessionEntries(sessionSkillState, rootSkillState, sessionId);
     if (sessionEntries.length > 0 || sessionSkillState !== null) {
       await writeAtomicJson(
+        options.baseStateDir,
         sessionPath,
         sessionEntries.length > 0
           ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
@@ -598,34 +1832,46 @@ export async function completeRalplanSession(options: {
   return true;
 }
 
+type OperationRuntimeScope = ResolvedRuntimeStateScope & {
+  authority?: ResolvedAuthorityRuntimeStateScope['authority'];
+};
+
 export async function listStateStatuses(
-  cwd: string,
-  explicitSessionId?: string,
+  scope: OperationRuntimeScope,
   mode?: string,
   options: { authoritativeActiveDecision?: boolean } = {},
 ): Promise<Record<string, unknown>> {
   const stateDirs = options.authoritativeActiveDecision
-    ? await getAuthoritativeActiveStateDirs(cwd, explicitSessionId)
-    : await getReadScopedStateDirs(cwd, explicitSessionId);
+    ? scope.authoritativeActiveDirs
+    : scope.compatibilityReadDirs;
   const statuses: Record<string, unknown> = {};
   const seenModes = new Set<string>();
 
   for (const stateDir of stateDirs) {
-    if (!existsSync(stateDir)) continue;
+    if (!await assertStateReadDirectoryIfPresent(scope.baseStateDir, stateDir, 'state status directory')) continue;
     const files = await readdir(stateDir);
+    await assertStateReadDirectory(scope.baseStateDir, stateDir, 'state status directory');
     for (const file of files) {
       if (!file.endsWith('-state.json')) continue;
       const currentMode = file.replace('-state.json', '');
       if (!mode && currentMode === SKILL_ACTIVE_STATE_MODE) continue;
       if (mode && currentMode !== mode) continue;
       if (seenModes.has(currentMode)) continue;
+      const path = join(stateDir, file);
+      const content = await readRegularStateFileIfPresent(scope.baseStateDir, path, 'state status file');
+      if (content === null) {
+        throw new StateAuthorityError(
+          AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+          `state status file disappeared during enumeration: ${path}`,
+        );
+      }
       seenModes.add(currentMode);
       try {
-        const data = JSON.parse(await readFile(join(stateDir, file), 'utf-8'));
+        const data = JSON.parse(content);
         statuses[currentMode] = {
           active: data.active,
           phase: data.current_phase,
-          path: join(stateDir, file),
+          path,
           data,
         };
       } catch {
@@ -633,14 +1879,53 @@ export async function listStateStatuses(
       }
     }
   }
+  if (!mode || mode === 'autopilot') {
+    const existingAutopilot = statuses.autopilot as { active?: unknown } | undefined;
+    if (existingAutopilot?.active !== true) {
+      const currentAutopilotPath = join(scope.baseStateDir, 'current-autopilot.json');
+      const content = await readRegularStateFileIfPresent(
+        scope.baseStateDir,
+        currentAutopilotPath,
+        'current autopilot status file',
+      );
+      if (content !== null) {
+        try {
+          const data = JSON.parse(content) as { active?: unknown; current_phase?: unknown };
+          const phase = typeof data.current_phase === 'string' ? data.current_phase.trim() : '';
+          if (data.active === true && phase) {
+            statuses.autopilot = {
+              active: false,
+              phase,
+              displayState: 'STALE',
+              path: currentAutopilotPath,
+              data,
+              source: 'current-autopilot',
+            };
+          }
+        } catch {
+          // Malformed compatibility status is not reportable authority evidence.
+        }
+      }
+    }
+  }
+
+
 
   if (!mode || mode === 'ultragoal') {
-    const ultragoal = await readUltragoalState(cwd).catch(() => null);
-    if (ultragoal && (ultragoal.active || (mode === 'ultragoal' && !seenModes.has('ultragoal')))) {
+    const workspaceRoot = scope.authority?.workspace_identity.canonical_path ?? scope.cwd;
+    const ultragoal = await readUltragoalState(workspaceRoot).catch(() => null);
+    const existingUltragoal = statuses.ultragoal as { active?: unknown } | undefined;
+    if (
+      ultragoal
+      && existingUltragoal?.active !== true
+      && (ultragoal.active || (mode === 'ultragoal' && !seenModes.has('ultragoal')))
+    ) {
+      const failed = ultragoal.status === 'failed';
       statuses.ultragoal = {
-        active: ultragoal.active,
+        active: failed ? false : ultragoal.active,
         phase: ultragoal.status,
-        path: join(cwd, '.omx', 'ultragoal', 'goals.json'),
+        ...(failed ? { displayState: 'FAILED' } : {}),
+        path: join(workspaceRoot, '.omx', 'ultragoal', 'goals.json'),
         data: ultragoal,
         source: 'ultragoal-artifacts',
       };
@@ -650,18 +1935,11 @@ export async function listStateStatuses(
   return statuses;
 }
 
-
-export async function listActiveStateModes(
-  workingDirectory?: string,
-  explicitSessionId?: string,
-): Promise<string[]> {
-  const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const scope = await resolveRuntimeStateScope(cwd, explicitSessionId);
+export async function listActiveStateModes(scope: OperationRuntimeScope): Promise<string[]> {
   const sessionId = scope.sessionId;
-  const statuses = await listStateStatuses(cwd, sessionId, undefined, {
-    authoritativeActiveDecision: true,
-  });
-  const canonicalState = await readVisibleSkillActiveStateForStateDir(getBaseStateDir(cwd), sessionId);
+  const statuses = await listStateStatuses(scope, undefined, { authoritativeActiveDecision: true });
+  const canonicalState = await readVisibleSafeSkillActiveState(scope.baseStateDir, sessionId);
+
   const canonicalActiveModes = new Set(
     listActiveSkills(canonicalState ?? {})
       .filter((entry) => {
@@ -688,7 +1966,8 @@ async function readCanonicalActiveWorkflowModes(
   sessionId?: string,
 ): Promise<TrackedWorkflowMode[]> {
   const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  const canonicalState = await readVisibleSkillActiveStateForStateDir(baseStateDir, sessionId);
+  const canonicalState = await readVisibleSafeSkillActiveState(baseStateDir, sessionId);
+
   const activeModes = listActiveSkills(canonicalState ?? {})
     .filter((entry) => {
       const entrySessionId = typeof entry.session_id === 'string' ? entry.session_id.trim() : '';
@@ -706,26 +1985,27 @@ function isActiveDetailWorkflowState(state: Record<string, unknown>): boolean {
 }
 
 async function readSessionDetailTransitionModes(
-  cwd: string,
+  baseStateDir: string,
   sessionId: string | undefined,
   requestedMode: TrackedWorkflowMode,
 ): Promise<TrackedWorkflowMode[] | undefined> {
   if (!sessionId || requestedMode !== 'ralplan') return undefined;
-  const autopilotPath = getStatePath('autopilot', cwd, sessionId);
-  if (existsSync(autopilotPath)) {
+  const autopilotPath = modeStatePath(baseStateDir, 'autopilot', sessionId);
+  const autopilotContent = await readRegularStateFileIfPresent(baseStateDir, autopilotPath, 'workflow transition state');
+  if (autopilotContent !== null) {
     try {
-      const state = JSON.parse(await readFile(autopilotPath, 'utf-8')) as Record<string, unknown>;
+      const state = JSON.parse(autopilotContent) as Record<string, unknown>;
       if (isActiveDetailWorkflowState(state)) return ['autopilot'];
     } catch {
       return undefined;
     }
   }
 
-  const deepInterviewPath = getStatePath('deep-interview', cwd, sessionId);
-  if (!existsSync(deepInterviewPath)) return undefined;
-
+  const deepInterviewPath = modeStatePath(baseStateDir, 'deep-interview', sessionId);
+  const deepInterviewContent = await readRegularStateFileIfPresent(baseStateDir, deepInterviewPath, 'workflow transition state');
+  if (deepInterviewContent === null) return undefined;
   try {
-    const state = JSON.parse(await readFile(deepInterviewPath, 'utf-8')) as Record<string, unknown>;
+    const state = JSON.parse(deepInterviewContent) as Record<string, unknown>;
     return isActiveDetailWorkflowState(state) ? ['deep-interview'] : undefined;
   } catch {
     return undefined;
@@ -736,12 +2016,49 @@ export async function executeStateOperation(
   name: StateOperationName,
   rawArgs: Record<string, unknown> = {},
 ): Promise<StateOperationResponse> {
+  if (name !== 'state_write' && name !== 'state_clear') {
+    return executeStateOperationInternal(name, rawArgs);
+  }
+
+  try {
+    const cwd = resolveWorkingDirectoryForState(rawArgs.workingDirectory as string | undefined);
+    const workspaceKey = resolveWorkspaceIdentity(cwd).canonical_path;
+    return await withStateMutationAdmission(workspaceKey, () => executeStateOperationInternal(name, rawArgs));
+  } catch (error) {
+    return {
+      payload: { error: (error as Error).message },
+      isError: true,
+    };
+  }
+}
+
+async function executeStateOperationInternal(
+  name: StateOperationName,
+  rawArgs: Record<string, unknown> = {},
+  options: StateOperationExecutionOptions = {},
+): Promise<StateOperationResponse> {
   let cwd: string;
   let explicitSessionId: string | undefined;
+  let scope: OperationRuntimeScope;
 
   try {
     cwd = resolveWorkingDirectoryForState(rawArgs.workingDirectory as string | undefined);
     explicitSessionId = validateSessionId(rawArgs.session_id);
+    try {
+      scope = await resolveAuthorityRuntimeStateScope(cwd, explicitSessionId);
+    } catch (error) {
+      if (!(error instanceof StateAuthorityError) || error.code !== AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) {
+        throw error;
+      }
+      if (name !== 'state_write' && name !== 'state_clear') {
+        scope = await resolveRuntimeStateScope(cwd, explicitSessionId);
+      } else {
+        throw new StateAuthorityError(
+          AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+          'state write/clear requires a committed active authority',
+        );
+      }
+    }
   } catch (error) {
     return {
       payload: { error: (error as Error).message },
@@ -750,26 +2067,53 @@ export async function executeStateOperation(
   }
 
   try {
+    const needsStandaloneRecovery = scope.authority
+      && !options.skipPreparedOperationRecovery
+      && (name !== 'state_write' && name !== 'state_clear');
+    if (needsStandaloneRecovery) {
+      await recoverPreparedDurableStateOperations(scope.authority!);
+    }
+    await assertSessionStateDirectoryForRead(scope.baseStateDir, scope.sessionId);
+  } catch (error) {
+    return {
+      payload: { error: (error as Error).message },
+      isError: true,
+    };
+  }
+
+  try {
+    const execute = async (
+      operationScope: OperationRuntimeScope = scope,
+      transactionLock?: AcquiredStateAuthorityLock,
+    ): Promise<StateOperationResponse> => {
+      const scope = operationScope;
     switch (name) {
       case 'state_read': {
         const mode = validateStrictReadableMode(rawArgs.mode);
-        const paths = await getReadScopedStatePaths(mode, cwd, explicitSessionId);
-        const path = paths.find((candidate) => existsSync(candidate));
-        if (!path) {
-          return { payload: { exists: false, mode } };
+        const paths = scope.compatibilityReadDirs.map((dir) => join(dir, `${mode}-state.json`));
+        for (const path of paths) {
+          const content = await readRegularStateFileIfPresent(scope.baseStateDir, path, 'state read file');
+          if (content === null) continue;
+          return { payload: JSON.parse(content) };
         }
-        const data = JSON.parse(await readFile(path, 'utf-8'));
-        return { payload: data };
+        return { payload: { exists: false, mode } };
+
       }
 
       case 'state_write': {
-        const stateScope = await resolveWritableStateScope(cwd, explicitSessionId);
-        const effectiveSessionId = stateScope.sessionId;
-        const mode = validateStateModeSegment(rawArgs.mode);
-        const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
-        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-        const path = getStatePath(mode, cwd, effectiveSessionId);
+        const authority = scope.authority;
+        if (!authority) throw new Error('state_write requires a committed state authority');
+        const effectiveSessionId = scope.sessionId;
+        const baseStateDir = scope.baseStateDir;
+        await initializeStateEnvironment(
+          baseStateDir,
+          authority.workspace_identity.canonical_path,
+          effectiveSessionId,
+          authority.generation.canonical_omx_root,
+        );
 
+        const mode = validateStateModeSegment(rawArgs.mode);
+        const path = modeStatePath(baseStateDir, mode, effectiveSessionId);
         const {
           mode: _mode,
           workingDirectory: _workingDirectory,
@@ -781,15 +2125,80 @@ export async function executeStateOperation(
         let transitionMessage: string | undefined;
         let ensureRalphArtifacts = false;
 
+        const lock = transactionLock;
+        if (!lock) throw new Error('state_write requires a fenced authority transaction lock');
+        const skillStatePaths = getSkillActiveStatePathsForStateDir(baseStateDir, effectiveSessionId);
+        let plannedTransition: PlannedWorkflowTransition | undefined;
+        if (!options.recoveryOperation && isTrackedWorkflowMode(mode)) {
+          let preflightExisting: Record<string, unknown> = {};
+          const preflightContent = await readRegularStateFileIfPresent(baseStateDir, path, 'state write transition preflight');
+          if (preflightContent !== null) {
+            try {
+              preflightExisting = JSON.parse(preflightContent) as Record<string, unknown>;
+            } catch {
+              // The authoritative mutation path retains the existing parse-fallback behavior.
+            }
+          }
+          const preflightState = {
+            ...preflightExisting,
+            ...fields,
+            ...((customState as Record<string, unknown>) || {}),
+          } as Record<string, unknown>;
+          normalizeCurrentPhaseAliasForWrite(preflightState, fields, customState);
+          if (preflightState.active === true) {
+            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+            const transitionCurrentModes = mode === 'ralplan'
+              ? (
+                activeCanonicalModes.length > 0
+                  ? activeCanonicalModes
+                  : await readSessionDetailTransitionModes(baseStateDir, effectiveSessionId, mode)
+              )
+              : undefined;
+            plannedTransition = await planWorkflowTransition(cwd, mode, {
+              action: 'write',
+              sessionId: effectiveSessionId,
+              source: 'state-operations',
+              baseStateDir,
+              ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
+            });
+          }
+        }
+        const expectedTargets = uniqueStatePaths([
+          path,
+          skillStatePaths.rootPath,
+          skillStatePaths.sessionPath,
+          ...(plannedTransition?.sourceTargets ?? []),
+        ]);
+        const operation = options.recoveryOperation ?? createDurableStateOperation({
+          name: 'state_write',
+          mode,
+          ...(effectiveSessionId ? { session_id: effectiveSessionId } : {}),
+          targets: expectedTargets,
+          recovery_args: createRecoveryArguments(rawArgs, effectiveSessionId),
+        });
+        if (operation.name !== 'state_write' || operation.mode !== mode || operation.session_id !== effectiveSessionId) {
+          throw new Error('prepared state write recovery does not match the requested operation');
+        }
+        if (options.recoveryOperation) {
+          validatePreparedWriteTargetInventory(authority, baseStateDir, operation, path, effectiveSessionId);
+        } else if (
+          operation.targets.length !== expectedTargets.length
+          || operation.targets.some((target, index) => target !== expectedTargets[index])
+        ) {
+          throw new Error('prepared state write recovery does not match the requested operation targets');
+        }
+        await withDurableStateOperation(authority, lock, operation, async (markEffectsStarted) => {
         await withStateWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
-          if (existsSync(path)) {
+          const existingContent = await readRegularStateFileIfPresent(baseStateDir, path, 'state write existing file');
+          if (existingContent !== null) {
             try {
-              existing = JSON.parse(await readFile(path, 'utf-8'));
+              existing = JSON.parse(existingContent);
             } catch (error) {
               process.stderr.write(`[state] Failed to parse state file: ${error}\n`);
             }
           }
+
 
           const mergedRaw = {
             ...existing,
@@ -967,62 +2376,75 @@ export async function executeStateOperation(
           }
 
           if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
-            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
-            const canonicalDecision = evaluateWorkflowTransition(activeCanonicalModes, mode);
-            if (!canonicalDecision.allowed && canonicalDecision.denialReason === 'rollback') {
-              validationError = buildWorkflowTransitionError(activeCanonicalModes, mode, 'write');
-              return;
-            }
-            const transitionCurrentModes = mode === 'ralplan'
-              ? (
-                activeCanonicalModes.length > 0
-                  ? activeCanonicalModes
-                  : await readSessionDetailTransitionModes(cwd, effectiveSessionId, mode)
-              )
-              : undefined;
+            let transitionPlan = plannedTransition;
             try {
-              const transition = await reconcileWorkflowTransition(cwd, mode, {
-                action: 'write',
-                sessionId: effectiveSessionId,
-                source: 'state-operations',
-                baseStateDir,
-                ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
-              });
+              if (options.recoveryOperation) markEffectsStarted();
+
+              if (!transitionPlan) {
+                const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+                const transitionCurrentModes = mode === 'ralplan'
+                  ? (
+                    activeCanonicalModes.length > 0
+                      ? activeCanonicalModes
+                      : await readSessionDetailTransitionModes(baseStateDir, effectiveSessionId, mode)
+                  )
+                  : undefined;
+                transitionPlan = await planWorkflowTransition(cwd, mode, {
+                  action: 'write',
+                  sessionId: effectiveSessionId,
+                  source: 'state-operations',
+                  baseStateDir,
+                  ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
+                });
+              }
+              if (!transitionPlan.decision.allowed) {
+                validationError = buildWorkflowTransitionError(transitionPlan.decision.currentModes, mode, 'write');
+                return;
+              }
+              if (options.recoveryOperation && !transitionPlan.sourceTargets.every((target) => operation.targets.includes(target))) {
+                throw new Error('prepared state write recovery transition targets do not match the accepted transition plan');
+              }
+              if (transitionPlan.autoCompletedModes.length > 0) {
+                markEffectsStarted();
+              }
+              const transition = await applyPlannedWorkflowTransition(cwd, transitionPlan, { action: 'write' });
               transitionMessage ??= transition.transitionMessage;
             } catch (error) {
               validationError = (error as Error).message;
               return;
             }
           }
+          markEffectsStarted();
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
-          await writeAtomicFile(path, JSON.stringify(merged, null, 2));
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
+          await writeAtomicFile(baseStateDir, path, JSON.stringify(merged, null, 2));
+
         });
 
-        if (validationError) {
-          return {
-            payload: { error: validationError },
-            isError: true,
-          };
-        }
+        if (validationError) throw new Error(validationError);
 
         if (mode === SKILL_ACTIVE_STATE_MODE) {
-          const state = await readSkillActiveState(path);
+          const state = await readSafeSkillActiveState(baseStateDir, path);
           if (state) {
             await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
+            await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
           }
         } else {
+
           if (mode === 'ralph' && ensureRalphArtifacts) {
-            await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId);
+            await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId, baseStateDir);
           }
-          const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
+          const data = JSON.parse(await readRegularStateFile(baseStateDir, path, 'written workflow state')) as Record<string, unknown>;
+
           const ralplanCompletionHandled = mode === 'ralplan'
             && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
             && await completeRalplanSession({
               cwd,
               baseStateDir,
               state: data,
-              explicitSessionId,
+              explicitSessionId: effectiveSessionId,
               requireNativeSubagents: true,
             });
 
@@ -1036,8 +2458,10 @@ export async function executeStateOperation(
               sessionId: effectiveSessionId,
               source: 'state-operations',
             });
+            await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
           }
         }
+        }, { preparedAlreadyRecorded: options.recoveryOperation !== undefined });
 
         return {
           payload: {
@@ -1050,30 +2474,126 @@ export async function executeStateOperation(
       }
 
       case 'state_clear': {
+        const authority = scope.authority;
+        if (!authority) throw new Error('state_clear requires a committed state authority');
+        const lock = transactionLock;
+        if (!lock) throw new Error('state_clear requires a fenced authority transaction lock');
+        const effectiveSessionId = scope.sessionId;
+        const baseStateDir = scope.baseStateDir;
+        await initializeStateEnvironment(
+          baseStateDir,
+          authority.workspace_identity.canonical_path,
+          effectiveSessionId,
+          authority.generation.canonical_omx_root,
+        );
+
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
-        const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
+        const path = modeStatePath(baseStateDir, mode, effectiveSessionId);
+        const allSessionDirectories = options.recoveryOperation || !allSessions
+          ? []
+          : await listStateSessionDirectories(baseStateDir);
+        const allSessionIds = allSessionDirectories.map((directory) => basename(directory));
+        const discoveredPaths = options.recoveryOperation
+          ? []
+          : (allSessions
+            ? [
+              join(baseStateDir, `${mode}-state.json`),
+              ...allSessionDirectories.map((directory) => join(directory, `${mode}-state.json`)),
+            ]
+            : [path]);
+        const skillStatePaths = getSkillActiveStatePathsForStateDir(baseStateDir, effectiveSessionId);
+        const operation = options.recoveryOperation ?? createDurableStateOperation({
+          name: 'state_clear',
+          mode,
+          ...(!allSessions && effectiveSessionId ? { session_id: effectiveSessionId } : {}),
+          ...(allSessions ? { all_sessions: true } : {}),
+          targets: uniqueStatePaths([
+            ...discoveredPaths,
+            ...discoveredPaths.map((statePath) => join(dirname(statePath), SKILL_ACTIVE_STATE_FILE)),
+            ...allSessionDirectories.map((directory) => join(directory, SKILL_ACTIVE_STATE_FILE)),
+            ...(!allSessions && mode !== SKILL_ACTIVE_STATE_MODE ? [skillStatePaths.rootPath, skillStatePaths.sessionPath] : []),
+            ...(!allSessions && effectiveSessionId
+              ? [
+                join(baseStateDir, 'native-stop-state.json'),
+                join(baseStateDir, 'sessions', effectiveSessionId, 'native-stop-state.json'),
+              ]
+              : []),
+          ]),
+          recovery_args: createRecoveryArguments(rawArgs, allSessions ? undefined : effectiveSessionId),
+        });
+        if (
+          operation.name !== 'state_clear'
+          || operation.mode !== mode
+          || Boolean(operation.all_sessions) !== allSessions
+          || (!allSessions && operation.session_id !== effectiveSessionId)
+        ) {
+          throw new Error('prepared state clear recovery does not match the requested operation');
+        }
+        const targetInventory = validatePreparedClearTargetInventory(authority, baseStateDir, operation);
+        const paths = targetInventory.modeStatePaths;
+        const expectedPath = resolve(path);
+        if (!allSessions && (paths.length !== 1 || paths[0] !== expectedPath)) {
+          throw new Error(`prepared state clear recovery target does not match the active session scope: expected=${expectedPath} actual=${paths.join(',')}`);
+        }
 
-        if (allSessions) {
-          const removedPaths: string[] = [];
-          const paths = await getAllScopedStatePaths(mode, cwd);
-          for (const path of paths) {
-            if (!existsSync(path)) continue;
-            await unlink(path);
-            removedPaths.push(path);
+
+        return await withDurableStateOperation(authority, lock, operation, async (markEffectsStarted) => {
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
+          markEffectsStarted();
+          if (!allSessions) {
+            if (
+              mode !== SKILL_ACTIVE_STATE_MODE
+              && effectiveSessionId
+              && await readRegularStateFileIfPresent(baseStateDir, modeStatePath(baseStateDir, mode), 'root workflow state') !== null
+            ) {
+              await writeClearedSessionScopedModeState(baseStateDir, path, mode, effectiveSessionId);
+
+            } else {
+              await unlinkDurably(baseStateDir, path, 'session state clear target');
+
+            }
+            const nativeStopCleared = effectiveSessionId
+              ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
+              : [];
+            if (mode !== SKILL_ACTIVE_STATE_MODE) {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: false,
+                sessionId: effectiveSessionId,
+                source: 'state-operations',
+              });
+              await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
+            }
+            return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
           }
-          const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
-            ? []
-            : await getAllScopedStatePaths(SKILL_ACTIVE_STATE_MODE, cwd);
-          if (canonicalPaths.some((path) => existsSync(path))) {
-            await syncCanonicalSkillStateForMode({
-              cwd,
-              baseStateDir,
-              mode,
-              active: false,
-              source: 'state-operations',
-              allSessions: true,
-            });
+
+          const removedPaths: string[] = [];
+          for (const statePath of paths) {
+            if (await unlinkDurably(baseStateDir, statePath, 'all-session state clear target')) {
+              removedPaths.push(statePath);
+              if (removedPaths.length === 1) {
+                injectStateOperationFault('after_first_state_clear_effect');
+              }
+            }
+          }
+          if (mode !== SKILL_ACTIVE_STATE_MODE) {
+            if (options.recoveryOperation) {
+              await clearPersistedAllSessionSkillStateTargets(baseStateDir, targetInventory.skillStatePaths, mode);
+            } else {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: false,
+                source: 'state-operations',
+                allSessions: true,
+                allSessionIds,
+              });
+              await finalizeCanonicalSkillStateDurability(baseStateDir, { allSessions: true, sessionIds: allSessionIds });
+            }
           }
 
           return {
@@ -1086,48 +2606,50 @@ export async function executeStateOperation(
               warning: 'all_sessions clears global and session-scoped state files',
             },
           };
-        }
-
-        const stateScope = await resolveWritableStateScope(cwd, explicitSessionId);
-        const effectiveSessionId = stateScope.sessionId;
-        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-        const path = getStatePath(mode, cwd, effectiveSessionId);
-        if (
-          mode !== SKILL_ACTIVE_STATE_MODE
-          && effectiveSessionId
-          && existsSync(getStatePath(mode, cwd))
-        ) {
-          await writeClearedSessionScopedModeState(path, mode, effectiveSessionId);
-        } else if (existsSync(path)) {
-          await unlink(path);
-        }
-        const nativeStopCleared = effectiveSessionId
-          ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
-          : [];
-        if (mode !== SKILL_ACTIVE_STATE_MODE) {
-          await syncCanonicalSkillStateForMode({
-            cwd,
-            baseStateDir,
-            mode,
-            active: false,
-            sessionId: effectiveSessionId,
-            source: 'state-operations',
-          });
-        }
-        return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        }, { preparedAlreadyRecorded: options.recoveryOperation !== undefined });
       }
 
       case 'state_list_active': {
-        const activeModes = await listActiveStateModes(cwd, explicitSessionId);
+        const activeModes = await listActiveStateModes(scope);
         return { payload: { active_modes: activeModes } };
       }
 
       case 'state_get_status': {
         const mode = typeof rawArgs.mode === 'string' ? rawArgs.mode.trim() : undefined;
-        const statuses = await listStateStatuses(cwd, explicitSessionId, mode || undefined);
+        const statuses = await listStateStatuses(scope, mode || undefined);
         return { payload: { statuses } };
       }
     }
+    };
+    const executeWithAuthorityTransaction = async (
+      refreshedAuthority: ResolvedStateAuthorityContext,
+      lock: AcquiredStateAuthorityLock,
+    ): Promise<StateOperationResponse> => {
+      const refreshedScope = await resolveAuthorityRuntimeStateScope(cwd, explicitSessionId);
+      if (refreshedScope.authority.generation.generation_id !== refreshedAuthority.generation.generation_id) {
+        throw new StateAuthorityError(
+          AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+          'state authority changed while refreshing the operation transaction context',
+        );
+      }
+      return execute({ ...refreshedScope, authority: refreshedAuthority }, lock);
+    };
+    if (options.authorityTransaction) {
+      return await executeWithAuthorityTransaction(
+        options.authorityTransaction.authority,
+        options.authorityTransaction.lock,
+      );
+    }
+    if (scope.authority && !options.skipPreparedOperationRecovery && (name === 'state_write' || name === 'state_clear')) {
+      await awaitStateOperationTestBarrier('before_mutation_transaction');
+      return await withStateAuthorityTransaction(scope.authority, async (refreshedAuthority, lock) => {
+        await replayPreparedDurableStateOperationsUnderTransaction(refreshedAuthority, lock);
+        return executeWithAuthorityTransaction(refreshedAuthority, lock);
+      });
+    }
+    return scope.authority
+      ? await withStateAuthorityTransaction(scope.authority, executeWithAuthorityTransaction)
+      : await execute();
   } catch (error) {
     return {
       payload: { error: (error as Error).message },

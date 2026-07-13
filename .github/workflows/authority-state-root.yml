@@ -1,0 +1,473 @@
+name: Authority State Root
+
+on:
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: Full 40-character commit SHA to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: authority-state-root-${{ github.event.pull_request.number || inputs.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-head:
+    name: Resolve exact head
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve and validate requested head
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          DISPATCH_HEAD_SHA: ${{ inputs.head_sha || '' }}
+          DISPATCH_RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            sha="$PR_HEAD_SHA"
+          else
+            sha="$DISPATCH_HEAD_SHA"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Expected a full 40-character commit SHA."
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == workflow_dispatch && "${sha,,}" != "${DISPATCH_RUN_SHA,,}" ]]; then
+            echo "::error::workflow_dispatch head_sha must equal the commit selected for this run ($DISPATCH_RUN_SHA)."
+            exit 1
+          fi
+          echo "sha=${sha,,}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 1
+      - name: Assert exact checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.resolve.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Write resolver evidence
+        shell: bash
+        run: |
+          mkdir -p authority-evidence
+          git rev-parse HEAD > authority-evidence/tested-sha.txt
+          printf 'resolve-head\n' > authority-evidence/job.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: authority-state-root-resolve-${{ steps.resolve.outputs.sha }}
+          path: authority-evidence/
+          if-no-files-found: error
+
+  authority-matrix:
+    name: Authority (${{ matrix.os }})
+    needs: resolve-head
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            runner: ubuntu-latest
+          - os: macos
+            runner: macos-latest
+          - os: windows
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-head.outputs.sha }}
+          fetch-depth: 1
+      - name: Assert exact checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+      - name: Prepare SHA-named evidence
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p authority-evidence
+          printf '%s\n' "$EXPECTED_SHA" > authority-evidence/tested-sha.txt
+          printf '%s\n' "$MATRIX_OS" > authority-evidence/job.txt
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          writeFileSync('authority-evidence/package-json.sha256', `${createHash('sha256').update(readFileSync('package.json')).digest('hex')}\n`);
+          NODE
+      - name: Install dependencies
+        shell: bash
+        run: npm ci --ignore-scripts
+      - name: Build exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build 2>&1 | tee authority-evidence/build.log
+      - name: Run authority integration suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 \
+            dist/utils/__tests__/git-layout.test.js \
+            dist/state/__tests__/authority.test.js \
+            dist/state/__tests__/authority-callsite-inventory.test.js \
+            dist/state/__tests__/operations.test.js \
+            dist/mcp/__tests__/state-paths.test.js \
+            dist/mcp/__tests__/state-server.test.js \
+            dist/hooks/__tests__/session.test.js \
+            dist/mcp/__tests__/server-lifecycle.test.js \
+            dist/cli/__tests__/state.test.js \
+            dist/cli/__tests__/index.test.js \
+            dist/cli/__tests__/launch-fallback.test.js \
+            dist/cli/__tests__/session-search.test.js \
+            dist/cli/__tests__/team.test.js \
+            dist/cli/__tests__/doctor-team.test.js \
+            dist/cli/__tests__/doctor-artifact-ownership.test.js \
+            dist/cli/__tests__/doctor-context-window-warning.test.js \
+            dist/cli/__tests__/doctor-invalid-config.test.js \
+            dist/cli/__tests__/doctor-spark-routing.test.js \
+            dist/cli/__tests__/auth.test.js \
+            dist/team/__tests__/state-root.test.js \
+            dist/team/__tests__/team-identity.test.js \
+            dist/team/__tests__/worker-runtime-identity.test.js \
+            dist/team/__tests__/runtime-boxed-state.test.js \
+            dist/team/__tests__/runtime-cli.test.js \
+            dist/team/__tests__/tmux-session.test.js \
+            dist/team/__tests__/api-interop.test.js \
+            dist/hud/__tests__/state.test.js \
+            dist/hud/__tests__/reconcile.test.js \
+            dist/scripts/__tests__/codex-native-hook.test.js \
+            2>&1 | tee authority-evidence/authority-integration.log
+      - name: Run doctor copy checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test dist/cli/__tests__/doctor-warning-copy.test.js 2>&1 | tee authority-evidence/doctor-platform.log
+      - name: Run authority recovery, concurrency, and e2e lanes
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 \
+            dist/state/__tests__/authority.test.js \
+            dist/state/__tests__/operations.test.js \
+            dist/cli/__tests__/state.test.js \
+            dist/cli/__tests__/index.test.js \
+            dist/cli/__tests__/launch-fallback.test.js \
+            2>&1 | tee authority-evidence/authority-recovery-concurrency-e2e.log
+      - name: Run hotswap rollover lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 \
+            dist/auth/__tests__/hotswap.test.js \
+            dist/auth/__tests__/quota-rotation.test.js \
+            2>&1 | tee authority-evidence/hotswap-rollover.log
+      - name: Run team and tmux transport lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 \
+            dist/cli/__tests__/team.test.js \
+            dist/cli/__tests__/doctor-team.test.js \
+            dist/team/__tests__/state-root.test.js \
+            dist/team/__tests__/team-identity.test.js \
+            dist/team/__tests__/worker-runtime-identity.test.js \
+            dist/team/__tests__/runtime-boxed-state.test.js \
+            dist/team/__tests__/runtime-cli.test.js \
+            dist/team/__tests__/api-interop.test.js \
+            dist/team/__tests__/tmux-session.test.js \
+            2>&1 | tee authority-evidence/team-tmux-transport.log
+      - name: Verify packed native installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run verify:native-agents 2>&1 | tee authority-evidence/native-agents.log
+          npm run smoke:packed-install 2>&1 | tee authority-evidence/packed-install.log
+      - name: Record capability report
+        if: always()
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+        run: |
+          {
+            echo "expected_sha=$EXPECTED_SHA"
+            echo "actual_sha=$(git rev-parse HEAD)"
+            echo "runner_os=$RUNNER_OS"
+            echo "node=$(node --version)"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              echo "shell_environment=git-bash"
+            else
+              echo "shell_environment=bash"
+            fi
+          } > authority-evidence/capability-report.txt
+      - name: Seal immutable per-OS evidence manifest
+        if: always()
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { join } from 'node:path';
+          import { execFileSync } from 'node:child_process';
+
+          const evidenceDir = 'authority-evidence';
+          const requiredFiles = [
+            'tested-sha.txt',
+            'job.txt',
+            'package-json.sha256',
+            'build.log',
+            'authority-integration.log',
+            'authority-recovery-concurrency-e2e.log',
+            'hotswap-rollover.log',
+            'team-tmux-transport.log',
+            'native-agents.log',
+            'packed-install.log',
+            'doctor-platform.log',
+            'capability-report.txt',
+          ];
+          const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
+          for (const file of requiredFiles) {
+            const path = join(evidenceDir, file);
+            if (!existsSync(path)) throw new Error(`missing required authority evidence: ${file}`);
+          }
+          const testedSha = readFileSync(join(evidenceDir, 'tested-sha.txt'), 'utf8').trim();
+          const actualSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (testedSha !== process.env.EXPECTED_SHA || actualSha !== process.env.EXPECTED_SHA) {
+            throw new Error(`evidence SHA mismatch: tested=${testedSha} actual=${actualSha} expected=${process.env.EXPECTED_SHA}`);
+          }
+          const capability = readFileSync(join(evidenceDir, 'capability-report.txt'), 'utf8');
+          for (const required of [`expected_sha=${process.env.EXPECTED_SHA}`, `actual_sha=${process.env.EXPECTED_SHA}`, 'runner_os=']) {
+            if (!capability.includes(required)) throw new Error(`capability report is missing ${required}`);
+          }
+          const manifest = {
+            schema_version: 1,
+            evidence_kind: 'authority-state-root',
+            expected_sha: process.env.EXPECTED_SHA,
+            actual_sha: actualSha,
+            matrix_os: process.env.MATRIX_OS,
+            required_files: Object.fromEntries(requiredFiles.map((file) => [file, sha256(join(evidenceDir, file))])),
+          };
+          const manifestPath = join(evidenceDir, 'evidence-manifest.json');
+          const manifestDigestPath = join(evidenceDir, 'evidence-manifest.sha256');
+          writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+          writeFileSync(manifestDigestPath, `${sha256(manifestPath)}\n`);
+          chmodSync(manifestPath, 0o444);
+          chmodSync(manifestDigestPath, 0o444);
+          NODE
+      - name: Upload SHA-named matrix evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authority-state-root-${{ matrix.os }}-${{ needs.resolve-head.outputs.sha }}
+          path: authority-evidence/
+          if-no-files-found: error
+          overwrite: false
+
+  aggregate-evidence:
+    name: Aggregate exact-head authority evidence
+    if: always()
+    needs: [resolve-head, authority-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-head.outputs.sha }}
+          fetch-depth: 1
+      - name: Assert exact checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Download all exact-head evidence
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: authority-state-root-*-${{ needs.resolve-head.outputs.sha }}
+          path: authority-evidence-download
+          merge-multiple: false
+      - name: Reject absent or mixed SHA evidence
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+          MATRIX_RESULT: ${{ needs.authority-matrix.result }}
+          DOWNLOAD_RESULT: ${{ steps.download.outcome }}
+        run: |
+          set -euo pipefail
+          test "$MATRIX_RESULT" = success
+          test "$DOWNLOAD_RESULT" = success
+          node --input-type=module <<'NODE'
+          import { existsSync, readdirSync, readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { join } from 'node:path';
+
+          const requiredFiles = [
+            'tested-sha.txt',
+            'job.txt',
+            'package-json.sha256',
+            'build.log',
+            'authority-integration.log',
+            'authority-recovery-concurrency-e2e.log',
+            'hotswap-rollover.log',
+            'team-tmux-transport.log',
+            'native-agents.log',
+            'packed-install.log',
+            'doctor-platform.log',
+            'capability-report.txt',
+          ];
+          const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
+          const evidenceRoot = 'authority-evidence-download';
+          const expectedSha = process.env.EXPECTED_SHA;
+          if (!expectedSha) throw new Error('missing expected SHA');
+          const resolverArtifact = `authority-state-root-resolve-${expectedSha}`;
+          const matrixArtifacts = [
+            { matrixOs: 'ubuntu', runnerOs: 'Linux' },
+            { matrixOs: 'macos', runnerOs: 'macOS' },
+            { matrixOs: 'windows', runnerOs: 'Windows' },
+          ].map((target) => ({
+            ...target,
+            artifactBasename: `authority-state-root-${target.matrixOs}-${expectedSha}`,
+          }));
+          const expectedArtifactBasenames = [resolverArtifact, ...matrixArtifacts.map((target) => target.artifactBasename)];
+
+          const assertExactDirectoryEntries = (directory, expectedNames, label) => {
+            if (!existsSync(directory)) throw new Error(`missing ${label}: ${directory}`);
+            const entries = readdirSync(directory, { withFileTypes: true });
+            const actualNames = entries.map((entry) => entry.name).sort();
+            const sortedExpectedNames = [...expectedNames].sort();
+            if (actualNames.join('\n') !== sortedExpectedNames.join('\n')) {
+              throw new Error(`${label} entries differ: expected ${sortedExpectedNames.join(', ')}, found ${actualNames.join(', ')}`);
+            }
+            for (const entry of entries) {
+              if (!entry.isDirectory()) throw new Error(`${label} entry is not a directory: ${entry.name}`);
+            }
+          };
+          const assertExactFiles = (directory, expectedNames, label) => {
+            if (!existsSync(directory)) throw new Error(`missing ${label}: ${directory}`);
+            const entries = readdirSync(directory, { withFileTypes: true });
+            const actualNames = entries.map((entry) => entry.name).sort();
+            const sortedExpectedNames = [...expectedNames].sort();
+            if (actualNames.join('\n') !== sortedExpectedNames.join('\n')) {
+              throw new Error(`${label} entries differ: expected ${sortedExpectedNames.join(', ')}, found ${actualNames.join(', ')}`);
+            }
+            for (const entry of entries) {
+              if (!entry.isFile()) throw new Error(`${label} entry is not a regular file: ${entry.name}`);
+            }
+          };
+          const exactCapabilityValue = (capability, key, matrixOs) => {
+            const prefix = `${key}=`;
+            const values = capability.split(/\r?\n/).filter((line) => line.startsWith(prefix)).map((line) => line.slice(prefix.length));
+            if (values.length !== 1) throw new Error(`capability report must contain exactly one ${key} entry for ${matrixOs}`);
+            return values[0];
+          };
+
+          assertExactDirectoryEntries(evidenceRoot, expectedArtifactBasenames, 'downloaded authority evidence artifacts');
+
+          const resolverDir = join(evidenceRoot, resolverArtifact);
+          assertExactFiles(resolverDir, ['tested-sha.txt', 'job.txt'], 'resolver evidence artifact');
+          if (readFileSync(join(resolverDir, 'tested-sha.txt'), 'utf8').trim() !== expectedSha) {
+            throw new Error('wrong tested SHA in resolver evidence');
+          }
+          if (readFileSync(join(resolverDir, 'job.txt'), 'utf8').trim() !== 'resolve-head') {
+            throw new Error('wrong job marker in resolver evidence');
+          }
+
+          for (const target of matrixArtifacts) {
+            const evidenceDir = join(evidenceRoot, target.artifactBasename);
+            const expectedEvidenceFiles = [...requiredFiles, 'evidence-manifest.json', 'evidence-manifest.sha256'];
+            assertExactFiles(evidenceDir, expectedEvidenceFiles, `${target.matrixOs} evidence artifact`);
+
+            const manifestPath = join(evidenceDir, 'evidence-manifest.json');
+            const manifestDigestPath = join(evidenceDir, 'evidence-manifest.sha256');
+            const expectedManifestDigest = readFileSync(manifestDigestPath, 'utf8').trim();
+            const actualManifestDigest = sha256(manifestPath);
+            if (expectedManifestDigest !== actualManifestDigest) {
+              throw new Error(`sealed manifest digest mismatch for ${target.matrixOs}`);
+            }
+            let manifest;
+            try {
+              manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+            } catch (error) {
+              throw new Error(`malformed evidence manifest for ${target.matrixOs}: ${error}`);
+            }
+            if (
+              !manifest
+              || manifest.schema_version !== 1
+              || manifest.evidence_kind !== 'authority-state-root'
+              || manifest.expected_sha !== expectedSha
+              || manifest.actual_sha !== expectedSha
+              || manifest.matrix_os !== target.matrixOs
+              || !manifest.required_files
+              || typeof manifest.required_files !== 'object'
+            ) {
+              throw new Error(`invalid immutable evidence manifest for ${target.matrixOs}`);
+            }
+            const manifestFiles = Object.keys(manifest.required_files).sort();
+            if (manifestFiles.join('\n') !== [...requiredFiles].sort().join('\n')) {
+              throw new Error(`required evidence manifest drift for ${target.matrixOs}`);
+            }
+            for (const file of requiredFiles) {
+              const path = join(evidenceDir, file);
+              if (manifest.required_files[file] !== sha256(path)) {
+                throw new Error(`manifested evidence hash mismatch: ${target.matrixOs}/${file}`);
+              }
+            }
+            if (readFileSync(join(evidenceDir, 'tested-sha.txt'), 'utf8').trim() !== expectedSha) {
+              throw new Error(`wrong tested SHA in ${target.matrixOs} evidence`);
+            }
+            if (readFileSync(join(evidenceDir, 'job.txt'), 'utf8').trim() !== target.matrixOs) {
+              throw new Error(`job marker and matrix OS differ for ${target.matrixOs}`);
+            }
+            if (readFileSync(join(evidenceDir, 'package-json.sha256'), 'utf8').trim() !== sha256('package.json')) {
+              throw new Error(`package hash does not match exact checkout for ${target.matrixOs}`);
+            }
+            const capability = readFileSync(join(evidenceDir, 'capability-report.txt'), 'utf8');
+            for (const [key, value] of Object.entries({
+              expected_sha: expectedSha,
+              actual_sha: expectedSha,
+              runner_os: target.runnerOs,
+              shell_environment: target.matrixOs === 'windows' ? 'git-bash' : 'bash',
+            })) {
+              if (exactCapabilityValue(capability, key, target.matrixOs) !== value) {
+                throw new Error(`capability report ${key} does not match ${target.matrixOs} evidence`);
+              }
+            }
+          }
+          NODE
+      - name: Publish exact-head evidence summary
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve-head.outputs.sha }}
+        run: |
+          {
+            echo '## Authority state-root exact-head evidence'
+            echo
+            echo "- SHA: \`$EXPECTED_SHA\`"
+            echo "- resolver artifact: \`authority-state-root-resolve-$EXPECTED_SHA\`"
+            echo "- platform artifacts: \`authority-state-root-{ubuntu,macos,windows}-$EXPECTED_SHA\`"
+            echo "- jobs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -9,7 +9,7 @@ import {
 } from "../doctor.js";
 
 describe("repo artifact ownership doctor check", () => {
-	it("reports root-owned files under .omx/plans with exact remediation guidance", async () => {
+	it("reports root-owned files under .omx/plans with exact remediation guidance", { skip: process.platform === "win32" }, async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-artifacts-"));
 		try {
 			const artifact = join(wd, ".omx", "plans", "root-owned.md");
@@ -77,7 +77,7 @@ describe("repo artifact ownership doctor check", () => {
 		}
 	});
 
-	it("reports owner-mismatched files for non-root doctor runs", async () => {
+	it("reports owner-mismatched files for non-root doctor runs", { skip: process.platform === "win32" }, async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-artifacts-"));
 		try {
 			const artifact = join(wd, ".beads", "state.json");
@@ -108,7 +108,7 @@ describe("repo artifact ownership doctor check", () => {
 		}
 	});
 
-	it("reports non-writable files under repo-local artifact directories", async () => {
+	it("reports non-writable files under repo-local artifact directories", { skip: process.platform === "win32" }, async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-artifacts-"));
 		try {
 			const artifact = join(wd, ".beads", "state.json");
@@ -140,7 +140,7 @@ describe("repo artifact ownership doctor check", () => {
 		}
 	});
 
-	it("repairs only when the repo root is owned by the current user", async () => {
+	it("repairs only when the repo root is owned by the current user", { skip: process.platform === "win32" }, async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-artifacts-"));
 		try {
 			const artifact = join(wd, ".omx", "plans", "root-owned.md");

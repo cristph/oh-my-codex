@@ -4,7 +4,46 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { executeStateOperation } from '../operations.js';
+import {
+  executeStateOperation as executeStateOperationRaw,
+  type StateOperationName,
+  type StateOperationResponse,
+} from '../operations.js';
+import { initializeStateAuthority } from '../authority.js';
+
+const ralphPhaseAuthorityInitByWorkspace = new Map<string, Promise<void>>();
+
+async function ensureTestRalphPhaseAuthority(workingDirectory: string): Promise<void> {
+  const existing = ralphPhaseAuthorityInitByWorkspace.get(workingDirectory);
+  if (existing) return existing;
+  const initializing = initializeStateAuthority({
+    startup_cwd: workingDirectory,
+    launch_id: `ralph-phase-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    session_binding: {
+      canonical_session_id: `ralph-phase-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    },
+  }).then(() => undefined);
+  ralphPhaseAuthorityInitByWorkspace.set(workingDirectory, initializing);
+  try {
+    await initializing;
+  } catch (error) {
+    ralphPhaseAuthorityInitByWorkspace.delete(workingDirectory);
+    throw error;
+  }
+}
+
+async function executeStateOperation(
+  name: StateOperationName,
+  rawArgs: Record<string, unknown>,
+): Promise<StateOperationResponse> {
+  if (name === 'state_write' || name === 'state_clear') {
+    const workingDirectory = typeof rawArgs.workingDirectory === 'string'
+      ? rawArgs.workingDirectory
+      : process.cwd();
+    await ensureTestRalphPhaseAuthority(workingDirectory);
+  }
+  return executeStateOperationRaw(name, rawArgs);
+}
 
 describe('state operations Ralph phase contract', () => {
   it('normalizes legacy Ralph phase aliases on state_write', async () => {

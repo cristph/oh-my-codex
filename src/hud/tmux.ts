@@ -611,12 +611,16 @@ export function createHudWatchPane(
     heightLines?: number;
     fullWidth?: boolean;
     targetPaneId?: string;
+    envKeys?: readonly string[];
   } = {},
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): string | null {
   const heightLines = Number.isFinite(options.heightLines) && (options.heightLines ?? 0) > 0
     ? Math.floor(options.heightLines ?? HUD_TMUX_HEIGHT_LINES)
     : HUD_TMUX_HEIGHT_LINES;
+  const envKeys = [...new Set(
+    (options.envKeys ?? []).filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)),
+  )];
   const args = [
     'split-window',
     '-v',
@@ -627,6 +631,7 @@ export function createHudWatchPane(
     ...(options.targetPaneId ? ['-t', options.targetPaneId] : []),
     '-c',
     cwd,
+    ...envKeys.flatMap((key) => ['-e', key]),
     '-P',
     '-F',
     '#{pane_id}',

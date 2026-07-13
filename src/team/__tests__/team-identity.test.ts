@@ -132,6 +132,26 @@ describe('team identity', () => {
     }
   });
 
+  it('keeps a retained terminal pane bound instead of selecting another active team', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-terminal-pane-'));
+    try {
+      await initTeamState('demo-terminal-current', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-current' }, {
+        display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
+      });
+      await initTeamState('demo-active-other', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-other' }, {
+        display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
+      });
+      await writePhase(cwd, 'demo-terminal-current', 'complete', '2026-01-01T00:00:00.000Z');
+
+      assert.equal(
+        resolveTeamNameForCurrentContext('demo', cwd, { OMX_SESSION_ID: 'session-current' }),
+        'demo-terminal-current',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('resolves the latest retained terminal display-name state only when unambiguous', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-latest-terminal-'));
     try {

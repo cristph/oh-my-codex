@@ -94,8 +94,8 @@ function omxDir(cwd = process.cwd()): string {
   return omxRoot(cwd);
 }
 
-function tmuxHookConfigPath(cwd = process.cwd()): string {
-  return join(omxDir(cwd), 'tmux-hook.json');
+function tmuxHookConfigPath(cwd = process.cwd(), authoritativeOmxRoot?: string): string {
+  return join(authoritativeOmxRoot ?? omxDir(cwd), 'tmux-hook.json');
 }
 
 function tmuxHookStatePath(cwd = process.cwd()): string {
@@ -328,11 +328,11 @@ function detectInitialTarget(): InitialTargetDetection | null {
   return null;
 }
 
-async function initTmuxHookConfig(opts?: { silent?: boolean; cwd?: string }): Promise<InitConfigResult> {
+async function initTmuxHookConfig(opts?: { silent?: boolean; cwd?: string; authoritativeOmxRoot?: string }): Promise<InitConfigResult> {
   const cwd = opts?.cwd ?? process.cwd();
   const silent = opts?.silent ?? false;
-  const configPath = tmuxHookConfigPath(cwd);
-  await mkdir(omxDir(cwd), { recursive: true });
+  const configPath = tmuxHookConfigPath(cwd, opts?.authoritativeOmxRoot);
+  await mkdir(opts?.authoritativeOmxRoot ?? omxDir(cwd), { recursive: true });
 
   if (existsSync(configPath)) {
     if (!silent) {
@@ -372,9 +372,12 @@ async function initTmuxHookConfig(opts?: { silent?: boolean; cwd?: string }): Pr
   return result;
 }
 
-export async function ensureTmuxHookInitialized(cwd = process.cwd()): Promise<void> {
+export async function ensureTmuxHookInitialized(
+  cwd = process.cwd(),
+  authoritativeOmxRoot?: string,
+): Promise<void> {
   try {
-    await initTmuxHookConfig({ silent: true, cwd });
+    await initTmuxHookConfig({ silent: true, cwd, authoritativeOmxRoot });
   } catch {
     // Best-effort only: state tools must remain available even without tmux.
   }
