@@ -459,8 +459,8 @@ export async function scaleUp(
   const sanitized = sanitizeTeamName(teamName);
   const leaderCwd = resolve(cwd);
 
-  return await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-    return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleUpResult | ScaleError> => {
+  return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleUpResult | ScaleError> => {
+    return await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
     const config = await readTeamConfig(sanitized, leaderCwd);
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };

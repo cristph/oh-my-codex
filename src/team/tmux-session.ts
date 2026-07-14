@@ -71,8 +71,10 @@ export class CreateTeamSessionPartialError extends Error {
     readonly partialSession: TeamSession,
     readonly proofUnavailable: Array<Extract<ExactPaneProof, { status: 'unavailable' }>>,
     readonly originalError: unknown,
+    /** Cleanup commands that failed after resources were created and must be retried. */
+    readonly cleanupErrors: string[] = [],
   ) {
-    super('create_team_session_pane_proof_unavailable');
+    super('create_team_session_cleanup_incomplete');
     this.name = 'CreateTeamSessionPartialError';
   }
 }
@@ -198,18 +200,25 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
  * Kill only a pane that a fresh global snapshot proves live. Callers treat
  * gone/dead rows as already cleaned and unavailable snapshots as fail-closed.
  */
-function requireLiveExactPaneSync(paneId: string): string {
+function requireLiveExactPaneSync(paneId: string, expectedPid?: number): string {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
   if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${paneId}`);
+  if (expectedPid !== undefined && proof.pid !== expectedPid) {
+    throw new Error(`tmux pane identity changed: ${paneId}`);
+  }
   return proof.paneId;
 }
 
-function killExactPaneSync(paneId: string): void {
+function killExactPaneSync(paneId: string, expectedPid?: number): void {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
   if (proof.status === 'gone') return;
-  runTmux(['kill-pane', '-t', proof.paneId]);
+  if (expectedPid !== undefined && proof.pid !== expectedPid) {
+    throw new Error(`tmux pane identity changed: ${paneId}`);
+  }
+  const result = runTmux(['kill-pane', '-t', proof.paneId]);
+  if (!result.ok) throw new Error(`failed to kill tmux pane ${proof.paneId}: ${result.stderr}`);
 }
 
 function appendNoUnderlineStyleFlags(style: string): string {
@@ -1919,12 +1928,14 @@ export function createTeamSession(
       teamPaneOwnerId,
     };
   } catch (error) {
+    const cleanupErrors: string[] = [];
     if (registeredClientAttachedHook) {
       const unregistered = runTmux(buildUnregisterClientAttachedReconcileArgs(
         registeredClientAttachedHook.target,
         registeredClientAttachedHook.name,
       ));
       if (unregistered.ok) registeredClientAttachedHook = null;
+      else cleanupErrors.push(`failed to unregister tmux client-attached hook ${registeredClientAttachedHook.name}: ${unregistered.stderr}`);
     }
     if (registeredResizeHook) {
       const unregistered = runTmux(buildUnregisterResizeHookArgs(
@@ -1932,43 +1943,50 @@ export function createTeamSession(
         registeredResizeHook.name,
       ));
       if (unregistered.ok) registeredResizeHook = null;
+      else cleanupErrors.push(`failed to unregister tmux resize hook ${registeredResizeHook.name}: ${unregistered.stderr}`);
     }
 
     const proofUnavailable: Array<Extract<ExactPaneProof, { status: 'unavailable' }>> = [];
     if (error instanceof ExactPaneProofUnavailableError) proofUnavailable.push(error.proof);
+    const unresolvedPaneIds = new Set(rollbackPaneIds);
     for (const paneId of rollbackPaneIds) {
-      if (proofUnavailable.length > 0) break;
       try {
         killExactPaneSync(paneId);
+        unresolvedPaneIds.delete(paneId);
       } catch (cleanupError) {
         if (cleanupError instanceof ExactPaneProofUnavailableError) {
           proofUnavailable.push(cleanupError.proof);
           break;
+        } else {
+          cleanupErrors.push(cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
         }
-        throw cleanupError;
       }
     }
 
-    const hasRecoverablePartialArtifact = partialWorkerPaneIds.length > 0
-      || partialHudPaneId !== null
+    const unresolvedWorkerPaneIds = partialWorkerPaneIds.filter((paneId) => unresolvedPaneIds.has(paneId));
+    const unresolvedHudPaneId = partialHudPaneId && unresolvedPaneIds.has(partialHudPaneId)
+      ? partialHudPaneId
+      : null;
+    const hasRecoverablePartialArtifact = unresolvedPaneIds.size > 0
       || registeredResizeHook !== null
       || registeredClientAttachedHook !== null;
 
-    if (proofUnavailable.length > 0 && hasRecoverablePartialArtifact && partialTeamTarget && partialLeaderPaneId) {
+    if (hasRecoverablePartialArtifact && partialTeamTarget && partialLeaderPaneId) {
       throw new CreateTeamSessionPartialError(
         {
           name: partialTeamTarget,
           workerCount,
           cwd,
-          workerPaneIds: partialWorkerPaneIds,
+          workerPaneIds: unresolvedWorkerPaneIds,
           leaderPaneId: partialLeaderPaneId,
-          hudPaneId: partialHudPaneId,
+          hudPaneId: unresolvedHudPaneId,
           resizeHookName: registeredResizeHook?.name ?? null,
           resizeHookTarget: registeredResizeHook?.target ?? null,
           teamPaneOwnerId: partialTeamPaneOwnerId,
         },
         proofUnavailable,
         error,
+        cleanupErrors,
       );
     }
     throw error;
@@ -1986,21 +2004,39 @@ export function restoreStandaloneHudPane(
   const omxEntry = resolveOmxCliEntryPath();
   if (!omxEntry || omxEntry.trim() === '') return null;
 
+  const leaderPanePid = (() => {
+    const proof = readExactPaneProofSync(normalizedLeaderPaneId);
+    if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+    if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${normalizedLeaderPaneId}`);
+    return proof.pid;
+  })();
   const [existingHudPaneId, ...duplicateHudPaneIds] = findOwnedHudPaneIds(
     normalizedLeaderPaneId,
     normalizedLeaderPaneId,
   );
+  const ownedHudPanePids = new Map<string, number>();
+  for (const paneId of [existingHudPaneId, ...duplicateHudPaneIds]) {
+    if (!paneId) continue;
+    const proof = readExactPaneProofSync(paneId);
+    if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+    if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${paneId}`);
+    ownedHudPanePids.set(paneId, proof.pid);
+  }
   for (const paneId of duplicateHudPaneIds) {
-    killExactPaneSync(paneId);
+    killExactPaneSync(paneId, ownedHudPanePids.get(paneId));
   }
   if (existingHudPaneId) {
     if (isNativeWindows()) {
-      runTmux(buildHudResizeArgs(existingHudPaneId));
+      const reconcile = runTmux(buildHudResizeArgs(requireLiveExactPaneSync(
+        existingHudPaneId,
+        ownedHudPanePids.get(existingHudPaneId),
+      )));
+      if (!reconcile.ok) throw new Error(`failed to reconcile standalone HUD resize: ${reconcile.stderr}`);
     } else {
       runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId));
       runTmux(buildReconcileHudResizeArgs(existingHudPaneId));
     }
-    runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
+    runTmux(['select-pane', '-t', requireLiveExactPaneSync(normalizedLeaderPaneId, leaderPanePid)]);
     return existingHudPaneId;
   }
 
@@ -2017,7 +2053,7 @@ export function restoreStandaloneHudPane(
       '-l',
       String(HUD_TMUX_TEAM_HEIGHT_LINES),
       '-t',
-      normalizedLeaderPaneId,
+      requireLiveExactPaneSync(normalizedLeaderPaneId, leaderPanePid),
       '-d',
       '-P',
       '-F',
@@ -2037,12 +2073,13 @@ export function restoreStandaloneHudPane(
   if (!paneId.startsWith('%')) return null;
 
   if (isNativeWindows()) {
-    runTmux(buildHudResizeArgs(paneId));
+    const reconcile = runTmux(buildHudResizeArgs(requireLiveExactPaneSync(paneId)));
+    if (!reconcile.ok) throw new Error(`failed to reconcile standalone HUD resize: ${reconcile.stderr}`);
   } else {
     runTmux(buildScheduleDelayedHudResizeArgs(paneId));
     runTmux(buildReconcileHudResizeArgs(paneId));
   }
-  runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
+  runTmux(['select-pane', '-t', requireLiveExactPaneSync(normalizedLeaderPaneId, leaderPanePid)]);
   return paneId;
 }
 

@@ -547,4 +547,34 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('stops before input effects when authoritative exact-pane query fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-proof-fail-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash\nprintf '[%s]' "$@" >> "${tmuxLogPath}"\nprintf '\\n' >> "${tmuxLogPath}"\nexit 1\n`);
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+      const result = runSendPaneInputInChild({
+        fakeBinDir,
+        moduleUrl,
+        paneTarget: '%42',
+        exactPaneId: '%42',
+        prompt: 'must not be sent',
+        submitKeyPresses: 2,
+        typePrompt: true,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.ok, false);
+      assert.equal(parsed.reason, 'exact_pane_unavailable');
+      const log = await readFile(tmuxLogPath, 'utf8');
+      assert.match(log, /\[list-panes\]\[-a\]\[-F\]/);
+      assert.doesNotMatch(log, /set-buffer|paste-buffer|send-keys|delete-buffer/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

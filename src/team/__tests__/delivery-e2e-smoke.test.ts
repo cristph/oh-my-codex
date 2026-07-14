@@ -151,6 +151,11 @@ const mailboxPath = path.join(dir, 'mailbox.json');
 const dispatch = readJson(dispatchPath, { records: [] });
 const mailbox = readJson(mailboxPath, { records: [] });
 const timestamp = nowIso();
+  if (command.command === 'CaptureSnapshot') {
+    writeJson(dispatchPath, dispatch);
+    process.stdout.write(JSON.stringify({ event: 'SnapshotCaptured' }) + '\\n');
+    process.exit(0);
+  }
 switch (command.command) {
   case 'QueueDispatch':
     dispatch.records.push({ request_id: command.request_id, target: command.target, status: 'pending', created_at: timestamp, notified_at: null, delivered_at: null, failed_at: null, reason: null, metadata: command.metadata ?? null });

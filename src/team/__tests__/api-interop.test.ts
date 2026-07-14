@@ -112,6 +112,12 @@ if (argv[0] === 'schema') {
 if (argv[0] !== 'exec') process.exit(1);
 const command = JSON.parse(argv[1] || '{}');
 const dir = stateDir();
+if (command.command === 'CaptureSnapshot') {
+  const dispatchPath = path.join(dir, 'dispatch.json');
+  writeJson(dispatchPath, readJson(dispatchPath, { records: [] }));
+  process.stdout.write(JSON.stringify({ event: 'SnapshotCaptured' }) + '\\n');
+  process.exit(0);
+}
 if (command.command === 'CreateMailboxMessage') {
   writeJson(path.join(dir, 'mailbox.json'), readJson(path.join(dir, 'mailbox.json'), { records: [] }));
   process.stdout.write(JSON.stringify({ event: 'MailboxMessageCreated', message_id: command.message_id, from_worker: command.from_worker, to_worker: command.to_worker }) + '\\n');

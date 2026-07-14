@@ -375,6 +375,16 @@ export interface TaskApprovalRecord {
 }
 
 let renameForAtomicWrite: typeof rename = rename;
+let openForAtomicWrite: typeof open = open;
+
+export function setWriteAtomicOpenForTests(fn: typeof open): void {
+  openForAtomicWrite = fn;
+}
+
+export function resetWriteAtomicOpenForTests(): void {
+  openForAtomicWrite = open;
+}
+
 
 export function setWriteAtomicRenameForTests(fn: typeof rename): void {
   renameForAtomicWrite = fn;
@@ -753,10 +763,24 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
 }
 
 // Atomic write: write to {path}.tmp.{pid}, fsync it, rename, then fsync parent.
+function isUnsupportedParentDirectorySyncError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'EPERM' || code === 'EINVAL' || code === 'ENOTSUP' || code === 'EISDIR';
+}
+
 async function syncParentDirectory(path: string): Promise<void> {
-  const handle = await open(dirname(path), 'r');
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await openForAtomicWrite(dirname(path), 'r');
+  } catch (error) {
+    if (isUnsupportedParentDirectorySyncError(error)) return;
+    throw error;
+  }
+
   try {
     await handle.sync();
+  } catch (error) {
+    if (!isUnsupportedParentDirectorySyncError(error)) throw error;
   } finally {
     await handle.close();
   }
@@ -773,7 +797,7 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
 
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
-  const handle = await open(tmpPath, 'r');
+  const handle = await openForAtomicWrite(tmpPath, 'r');
   try {
     await handle.sync();
   } finally {
@@ -1433,7 +1457,8 @@ export async function writeWorkerStatus(
   await writeAtomic(p, JSON.stringify(status, null, 2));
 }
 
-// File-based scaling lock to prevent concurrent scale_up/scale_down operations
+// File-based scaling lock kept outside the deletable team root. Operations that
+// also mutate membership acquire this lock before the membership barrier.
 export async function withScalingLock<T>(
   teamName: string,
   cwd: string,
@@ -1471,8 +1496,9 @@ async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<
 }
 
 /**
- * Serializes membership snapshots with task creation and claims. Lock order is
- * this barrier first, then task claim locks; scale-down follows the same order.
+ * Serializes membership snapshots with task creation and claims. The global
+ * lock order is scaling, membership, then task claim locks. Operations that do
+ * not scale acquire only this barrier (and then any task claim lock).
  */
 export async function withTeamTaskBarrier<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
   const key = taskMembershipBarrierKey(teamName, cwd);
@@ -2529,7 +2555,13 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string): Promise<v
   await writeConfig(config, cwd);
 }
 
-// Delete team state directory
+// Delete team state only after excluding both scaling and membership mutations.
+// The scaling lock lives outside the deletable team root, so waiters cannot
+// recreate a deleted team merely by acquiring their lock.
 export async function cleanupTeamState(teamName: string, cwd: string): Promise<void> {
-  await rm(teamDir(teamName, cwd), { recursive: true, force: true });
+  await withScalingLock(teamName, cwd, async () => {
+    await withTeamTaskBarrier(teamName, cwd, async () => {
+      await rm(teamDir(teamName, cwd), { recursive: true, force: true });
+    });
+  });
 }

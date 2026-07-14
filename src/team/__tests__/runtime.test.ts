@@ -8020,6 +8020,7 @@ case "$1" in
     case "$*" in
       *"-a -F #{pane_id}"*)
         printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8035,6 +8036,7 @@ case "$1" in
     esac
     ;;
   split-window)
+    : > "${tmuxLogPath}.hud-created"
     printf '%%44\\n'
     exit 0
     ;;

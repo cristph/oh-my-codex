@@ -534,7 +534,7 @@ describe('withScalingLock', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-lock-'));
     try {
       await initTeamState('lock-test', 'task', 'executor', 1, cwd);
-      const lockDir = join(cwd, '.omx', 'state', 'team', 'lock-test', '.lock.scaling');
+      const lockDir = join(cwd, '.omx', 'state', '.team-locks', 'lock-test.scaling');
 
       const result = await withScalingLock('lock-test', cwd, async () => {
         // Lock should exist during execution
@@ -554,7 +554,7 @@ describe('withScalingLock', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-lock-err-'));
     try {
       await initTeamState('lock-err', 'task', 'executor', 1, cwd);
-      const lockDir = join(cwd, '.omx', 'state', 'team', 'lock-err', '.lock.scaling');
+      const lockDir = join(cwd, '.omx', 'state', '.team-locks', 'lock-err.scaling');
 
       await assert.rejects(
         withScalingLock('lock-err', cwd, async () => {
@@ -2641,6 +2641,14 @@ esac
       assert.equal(await readTask('rollback-kill-fail', '1', cwd), null);
       assert.equal(await readTask('rollback-kill-fail', '2', cwd), null);
       assert.equal(await readTask('rollback-kill-fail', '3', cwd), null);
+      for (const workerName of ['worker-2', 'worker-3']) {
+        const workerDir = join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', workerName);
+        assert.equal(existsSync(workerDir), true, `${workerName} state must remain retryable`);
+        assert.equal(existsSync(join(workerDir, 'identity.json')), true, `${workerName} identity must remain`);
+        assert.equal(existsSync(join(workerDir, 'inbox.md')), true, `${workerName} inbox must remain`);
+        assert.equal(existsSync(workerStartupScriptPath(cwd, 'rollback-kill-fail', workerName)), true, `${workerName} startup script must remain`);
+        assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', workerName)), true, `${workerName} worktree must remain`);
+      }
       // P2: retry execution of recorded cleanup debt is intentionally a follow-up surface.
       const tmuxCommands: string[] = await readScaleUpTmuxLogCommands(tmuxLogPath);
       const mutationCommands = tmuxCommands
@@ -3166,6 +3174,16 @@ exit 0
       assert.ok(config);
       if (!config) return;
       config.workers[1]!.pane_id = '%13';
+      const worktreePath = join(cwd, '.omx', 'team', 'kill-fail', 'worktrees', 'worker-2');
+      await mkdir(worktreePath, { recursive: true });
+      await writeFile(join(worktreePath, 'keep.txt'), 'retryable worktree');
+      config.workers[1]!.worktree_path = worktreePath;
+      const workerDir = join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2');
+      await writeFile(join(workerDir, 'identity.json'), '{"worker":"worker-2"}');
+      await writeFile(join(workerDir, 'inbox.md'), 'retryable inbox');
+      await mkdir(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'runtime'), { recursive: true });
+      const startupScriptPath = workerStartupScriptPath(cwd, 'kill-fail', 'worker-2');
+      await writeFile(startupScriptPath, '#!/bin/sh\n');
       await saveTeamConfig(config, cwd);
 
       const priorStatus = {
@@ -3187,6 +3205,11 @@ exit 0
       const committed = await readTeamConfig('kill-fail', cwd);
       assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), true);
+      assert.equal(await readFile(join(workerDir, 'identity.json'), 'utf8'), '{"worker":"worker-2"}');
+      assert.equal(await readFile(join(workerDir, 'inbox.md'), 'utf8'), 'retryable inbox');
+      assert.equal(await readFile(join(worktreePath, 'keep.txt'), 'utf8'), 'retryable worktree');
+      assert.equal(await readFile(startupScriptPath, 'utf8'), '#!/bin/sh\n');
+      assert.deepEqual(await readWorkerStatus('kill-fail', 'worker-2', cwd), priorStatus);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
