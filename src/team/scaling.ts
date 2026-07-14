@@ -43,6 +43,7 @@ import {
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
   teamListTasks as listTasks,
+  teamUpdateTask as updateTask,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
@@ -439,6 +440,9 @@ export async function scaleUp(
     const createdWorkerDirectories: string[] = [];
     const provisionedWorktrees: EnsureWorktreeResult[] = [];
     const createdStartupScriptPaths: string[] = [];
+    const preparedWorkerDirectoryOwner = new Map<string, string>();
+    const preparedStartupScriptOwner = new Map<string, string>();
+    const preparedWorktreeOwner = new Map<string, string>();
     const runtimeDirectoryPath = join(teamStateRoot, 'team', sanitized, 'runtime');
     const runtimeDirectoryExisted = existsSync(runtimeDirectoryPath);
     const rollbackScaleUp = async (
@@ -502,6 +506,39 @@ export async function scaleUp(
       const unresolvedWorkerNames = new Set(unresolvedWorkers.map((worker) => worker.name));
       if (failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
         await cleanupSafelyRemovedWorkers();
+        const preparedOwners = new Set([
+          ...preparedWorkerDirectoryOwner.values(),
+          ...preparedStartupScriptOwner.values(),
+          ...preparedWorktreeOwner.values(),
+        ]);
+        const removablePreparedOwners = new Set(
+          [...preparedOwners].filter((owner) => !unresolvedWorkerNames.has(owner)),
+        );
+        for (const worktree of provisionedWorktrees) {
+          const owner = preparedWorktreeOwner.get(worktree.worktreePath);
+          if (!owner || !removablePreparedOwners.has(owner)) continue;
+          await removeWorkerWorktreeRootAgentsFile(
+            sanitized,
+            owner,
+            teamStateRoot,
+            worktree.worktreePath,
+          ).catch(() => {});
+        }
+        const removableWorktrees = provisionedWorktrees.filter((worktree) => {
+          const owner = preparedWorktreeOwner.get(worktree.worktreePath);
+          return Boolean(owner && removablePreparedOwners.has(owner) && !safelyRemovedWorktreePaths.has(worktree.worktreePath));
+        });
+        if (removableWorktrees.length > 0) await rollbackProvisionedWorktrees(removableWorktrees);
+        await Promise.all(createdWorkerDirectories.map(async (workerDirPath) => {
+          const owner = preparedWorkerDirectoryOwner.get(workerDirPath);
+          if (owner && removablePreparedOwners.has(owner)) {
+            await rm(workerDirPath, { recursive: true, force: true });
+          }
+        }));
+        await Promise.all(createdStartupScriptPaths.map(async (startupScriptPath) => {
+          const owner = preparedStartupScriptOwner.get(startupScriptPath);
+          if (owner && removablePreparedOwners.has(owner)) await rm(startupScriptPath, { force: true });
+        }));
         for (const taskId of createdTaskIds) {
           if (unresolvedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
           await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
@@ -606,6 +643,7 @@ export async function scaleUp(
       const workerDirPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'workers', workerName);
       await mkdir(workerDirPath, { recursive: true });
       createdWorkerDirectories.push(workerDirPath);
+      preparedWorkerDirectoryOwner.set(workerDirPath, workerName);
 
       const worktreeMode = effectiveWorktreeMode;
       const workerWorkspaceResult = worktreeMode.enabled
@@ -619,6 +657,7 @@ export async function scaleUp(
         : { enabled: false } as const;
       const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
       if (workerWorkspace) provisionedWorktrees.push(workerWorkspace);
+      if (workerWorkspace) preparedWorktreeOwner.set(workerWorkspace.worktreePath, workerName);
       const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
 
       // Build startup command and create tmux pane
@@ -667,13 +706,15 @@ export async function scaleUp(
         runtimeRole,
       );
       if (startupCommand) {
-        createdStartupScriptPaths.push(join(
+        const startupScriptPath = join(
           teamStateRoot,
           'team',
           sanitized,
           'runtime',
           `worker-${workerIndex}-startup.sh`,
-        ));
+        );
+        createdStartupScriptPaths.push(startupScriptPath);
+        preparedStartupScriptOwner.set(startupScriptPath, workerName);
       }
       const cmd = startupCommand ?? buildWorkerStartupCommand(
         sanitized,
@@ -1139,6 +1180,14 @@ export async function scaleDown(
     }
 
     removedNames.push(...removedWorkers.map((worker) => worker.name));
+    const resolvedWorkerNames = new Set(removedWorkers.map((worker) => worker.name));
+    const tasksAfterTeardown = await listTasks(sanitized, leaderCwd);
+    for (const task of tasksAfterTeardown) {
+      if (task.status === 'completed' || task.status === 'failed') continue;
+      const claimedBy = task.claim?.owner;
+      if (!resolvedWorkerNames.has(task.owner ?? '') && !(claimedBy && resolvedWorkerNames.has(claimedBy))) continue;
+      await updateTask(sanitized, task.id, { owner: undefined, claim: undefined }, leaderCwd);
+    }
     const removedSet = new Set(removedNames);
     config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
     config.worker_count = config.workers.length;

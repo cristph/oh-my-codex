@@ -2573,6 +2573,8 @@ esac
       assert.equal((await readTask('rollback-kill-fail', '2', cwd))?.owner, 'worker-3');
       assert.equal(config?.workers.some((candidate) => candidate.name === 'worker-4'), false);
       assert.equal(await readTask('rollback-kill-fail', '3', cwd), null);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-4')), false);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'runtime', 'worker-4-startup.sh')), false);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-2', 'identity.json')), true);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'identity.json')), true);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
@@ -2967,6 +2969,12 @@ esac
       config.workers[1]!.pane_id = '%13';
       config.workers[2]!.pane_id = '%14';
       await saveTeamConfig(config, cwd);
+      const resolvedTask = await createTask('success-proof-loss', {
+        subject: 'resolved owner task', description: 'must be reclaimed', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const unresolvedTask = await createTask('success-proof-loss', {
+        subject: 'unresolved owner task', description: 'must be preserved', status: 'pending', owner: 'worker-3',
+      }, cwd);
       const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-3', 'status.json');
       const worker3Raw = '{"reason":"three",\n"updated_at":"2026-07-14T00:00:01.000Z", "state":"idle"}\n';
@@ -2984,6 +2992,8 @@ esac
       assert.equal(existsSync(worker2StatusPath), false);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-2')), false);
       assert.equal(await readFile(worker3StatusPath, 'utf-8'), worker3Raw);
+      assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, undefined);
+      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, 'worker-3');
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
@@ -3024,6 +3034,12 @@ esac
       config.workers[1]!.pane_id = '%13';
       config.workers[2]!.pane_id = '%14';
       await saveTeamConfig(config, cwd);
+      const resolvedTask = await createTask('gone-kill-fail', {
+        subject: 'gone owner task', description: 'must be reclaimed', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const unresolvedTask = await createTask('gone-kill-fail', {
+        subject: 'failed owner task', description: 'must be preserved', status: 'pending', owner: 'worker-3',
+      }, cwd);
       const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-3', 'status.json');
       const worker3Raw = '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n';
@@ -3040,6 +3056,8 @@ esac
       assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-3']);
       assert.equal(existsSync(worker2StatusPath), false);
       assert.equal(await readFile(worker3StatusPath, 'utf-8'), worker3Raw);
+      assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, undefined);
+      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, 'worker-3');
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
