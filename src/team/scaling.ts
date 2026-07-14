@@ -541,7 +541,7 @@ export async function scaleUp(
         }));
         for (const taskId of createdTaskIds) {
           if (unresolvedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
-          await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+          await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
         }
         for (const worker of unresolvedWorkers) {
           if (!config.workers.some((candidate) => candidate.name === worker.name)) {
@@ -599,7 +599,7 @@ export async function scaleUp(
       }
 
       for (const taskId of createdTaskIds) {
-        await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+        await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
 
       config.worker_count = config.workers.length;
@@ -1186,7 +1186,11 @@ export async function scaleDown(
       if (task.status === 'completed' || task.status === 'failed') continue;
       const claimedBy = task.claim?.owner;
       if (!resolvedWorkerNames.has(task.owner ?? '') && !(claimedBy && resolvedWorkerNames.has(claimedBy))) continue;
-      await updateTask(sanitized, task.id, { owner: undefined, claim: undefined }, leaderCwd);
+      await updateTask(sanitized, task.id, {
+        owner: undefined,
+        claim: undefined,
+        status: task.status === 'in_progress' ? 'pending' : task.status,
+      }, leaderCwd);
     }
     const removedSet = new Set(removedNames);
     config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));

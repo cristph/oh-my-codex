@@ -2481,7 +2481,7 @@ exit 0
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-rollback-kill-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
-    const rollbackPhasePath = join(fakeBinDir, 'rollback-phase');
+    const proofLossUsedPath = join(fakeBinDir, 'proof-loss-used');
     const splitCountPath = join(fakeBinDir, 'split-count');
     const previousPath = process.env.PATH;
     try {
@@ -2493,9 +2493,13 @@ printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   -V) echo 'tmux 3.2a' ;;
   list-panes)
-    if [ -f "${rollbackPhasePath}" ]; then
-      exit 1
-    fi
+    config_path="${join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'config.json')}"
+    config_text=''; [ ! -f "$config_path" ] || config_text=$(cat "$config_path")
+    case "$config_text" in
+      *'worker-3'*)
+        if [ ! -f "${proofLossUsedPath}" ]; then : > "${proofLossUsedPath}"; exit 1; fi
+        ;;
+    esac
     split_count=0; [ ! -f "${splitCountPath}" ] || split_count=$(cat "${splitCountPath}")
     if [ "$split_count" -ge 2 ]; then
       printf '%s\t%s\t%s\n' '%21' '0' '42421'
@@ -2514,7 +2518,6 @@ case "\${1:-}" in
     if [ "$split_count" -eq 1 ]; then
       echo '%31'
     else
-      : > "${rollbackPhasePath}"
       echo '%32'
     fi
     ;;
@@ -2547,7 +2550,7 @@ esac
 
       assert.deepEqual(result, {
         ok: false,
-        error: 'scale_up_rollback_pane_proof_unavailable:%31:query_failed',
+        error: 'scale_up_rollback_pane_teardown_failed:%31,%32',
       });
       assert.equal(await readFile(splitCountPath, 'utf-8'), '2');
       const config = await readTeamConfig('rollback-kill-fail', cwd);
@@ -2584,6 +2587,8 @@ esac
       assert.deepEqual(mutationCommands, [
         'split-window -v -t %21 -d -P -F #{pane_id}',
         'split-window -v -t %31 -d -P -F #{pane_id}',
+        'kill-pane -t %31',
+        'kill-pane -t %32',
       ]);
       for (const splitCommand of mutationCommands) {
         const splitIndex = tmuxCommands.findIndex((command) => command.startsWith(splitCommand));
