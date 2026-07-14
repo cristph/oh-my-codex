@@ -461,6 +461,10 @@ export async function scaleUp(
       return { ok: false, error: `Team ${sanitized} not found` };
     }
     const originalConfig = JSON.parse(JSON.stringify(config)) as TeamConfig;
+    const configPath = join(resolveCanonicalTeamStateRoot(leaderCwd), 'team', sanitized, 'config.json');
+    const manifestPath = join(resolveCanonicalTeamStateRoot(leaderCwd), 'team', sanitized, 'manifest.v2.json');
+    const originalConfigBytes = await readFile(configPath, 'utf8');
+    const originalManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
 
     const maxWorkers = config.max_workers;
     const currentCount = config.workers.length;
@@ -564,10 +568,31 @@ export async function scaleUp(
       // Restore and verify original config/manifest membership before any worker
       // artifact deletion. Subsequent failures are retryable cleanup debt only.
       try {
-        await saveTeamConfig(originalConfig, leaderCwd);
-        const committed = await readTeamConfig(sanitized, leaderCwd);
-        if (!committed || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))) {
-          throw new Error('canonical_scale_up_rollback_config_verification_failed');
+        await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+          const currentConfigBytes = await readFile(configPath, 'utf8');
+          const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
+          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+            tasks: [],
+            config: { oldBytes: currentConfigBytes, newBytes: originalConfigBytes },
+            manifest: { oldBytes: currentManifestBytes, newBytes: originalManifestBytes },
+          });
+        });
+        const [committed, committedManifest] = await Promise.all([
+          readTeamConfig(sanitized, leaderCwd),
+          readTeamManifestV2(sanitized, leaderCwd),
+        ]);
+        const rawConfig = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
+        const rawManifest = existsSync(manifestPath)
+          ? JSON.parse(await readFile(manifestPath, 'utf8')) as { workers?: WorkerInfo[] }
+          : null;
+        if (
+          !committed
+          || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))
+          || (committedManifest !== null && committedManifest.workers.some((worker) => rollbackWorkerNames.has(worker.name)))
+          || rawConfig.workers.some((worker) => rollbackWorkerNames.has(worker.name))
+          || (rawManifest?.workers?.some((worker) => rollbackWorkerNames.has(worker.name)) ?? false)
+        ) {
+          throw new Error('canonical_scale_up_rollback_membership_verification_failed');
         }
         Object.assign(config, originalConfig);
       } catch (rollbackError) {
@@ -575,6 +600,11 @@ export async function scaleUp(
       }
 
       const cleanupDebt: string[] = [];
+      try {
+        await removeDispatchRequestsForWorkers(sanitized, [...rollbackWorkerNames], leaderCwd);
+      } catch (rollbackError) {
+        return { ok: false, error: `scale_up_rollback_cleanup_debt:authoritative_dispatch_cleanup_failed:${String(rollbackError)}` };
+      }
       try {
         for (const taskId of createdTaskIds) {
           await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
@@ -585,7 +615,6 @@ export async function scaleUp(
         ].filter((workerName): workerName is string => Boolean(workerName)))].map(async (workerName) => {
           await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
         }));
-        await removeDispatchRequestsForWorkers(sanitized, [...rollbackWorkerNames], leaderCwd);
         for (const taskId of createdTaskIds) {
           if (await readTask(sanitized, taskId, leaderCwd)) {
             throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);

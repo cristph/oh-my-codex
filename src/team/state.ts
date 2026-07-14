@@ -1,7 +1,8 @@
-import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
+import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir, open } from 'fs/promises';
 import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
 import { readUsableSessionState } from '../hooks/session.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
@@ -751,16 +752,37 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
   return true;
 }
 
-// Atomic write: write to {path}.tmp.{pid}, then rename
+// Atomic write: write to {path}.tmp.{pid}, fsync it, rename, then fsync parent.
+async function syncParentDirectory(path: string): Promise<void> {
+  const handle = await open(dirname(path), 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function removeAndSync(path: string): Promise<void> {
+  await rm(path, { force: true });
+  await syncParentDirectory(path);
+}
+
 export async function writeAtomic(filePath: string, data: string): Promise<void> {
   const parent = dirname(filePath);
   await mkdir(parent, { recursive: true });
 
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
+  const handle = await open(tmpPath, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 
   try {
     await renameForAtomicWrite(tmpPath, filePath);
+    await syncParentDirectory(filePath);
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'ENOENT' && existsSync(filePath)) {
@@ -802,7 +824,7 @@ function membershipTransactionPath(teamName: string, cwd: string): string {
 async function applyMembershipTransactionFiles(files: readonly MembershipTransactionFile[], useNewBytes: boolean): Promise<void> {
   for (const file of files) {
     const bytes = useNewBytes ? file.newBytes : file.oldBytes;
-    if (bytes === null) await rm(file.path, { force: true });
+    if (bytes === null) await removeAndSync(file.path);
     else await writeAtomic(file.path, bytes);
   }
 }
@@ -824,7 +846,7 @@ export async function recoverTeamMembershipTaskTransaction(teamName: string, cwd
     throw new Error(`Invalid membership transaction journal for ${teamName}`);
   }
   await applyMembershipTransactionFiles(journal.files, journal.phase === 'committed');
-  await rm(journalPath, { force: true });
+  await removeAndSync(journalPath);
 }
 
 /**
@@ -870,7 +892,7 @@ export async function commitTeamMembershipTaskTransaction(
     await applyMembershipTransactionFiles(files, true);
     journal.phase = 'committed';
     await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
-    await rm(journalPath, { force: true });
+    await removeAndSync(journalPath);
   } catch (error) {
     if (
       (error instanceof Error && error.message === 'injected_scale_down_interruption:after-first-task-write')
@@ -880,7 +902,7 @@ export async function commitTeamMembershipTaskTransaction(
     // recovery will retry until the state has converged to the old generation.
     try {
       await applyMembershipTransactionFiles(files, false);
-      await rm(journalPath, { force: true });
+      await removeAndSync(journalPath);
     } catch {
       // The prepared journal is the durable recovery authority.
     }
@@ -1176,7 +1198,7 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
   );
 }
 
-export async function readTeamManifestV2(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
+async function readTeamManifestV2Raw(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
   try {
     const p = teamManifestV2Path(teamName, cwd);
     if (!existsSync(p)) return null;
@@ -1211,6 +1233,13 @@ export async function readTeamManifestV2(teamName: string, cwd: string): Promise
   } catch {
     return null;
   }
+}
+
+export async function readTeamManifestV2(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await readTeamManifestV2Raw(teamName, cwd);
+  });
 }
 
 // Idempotent migration; keeps config.json untouched.
@@ -1267,8 +1296,8 @@ async function computeNextTaskIdFromDisk(teamName: string, cwd: string): Promise
 }
 
 // Read team config
-export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
-  const v2 = await readTeamManifestV2(teamName, cwd);
+async function readTeamConfigRaw(teamName: string, cwd: string): Promise<TeamConfig | null> {
+  const v2 = await readTeamManifestV2Raw(teamName, cwd);
   if (v2) return teamConfigFromManifest(v2);
 
   // Attempt idempotent migration on first read.
@@ -1285,6 +1314,13 @@ export async function readTeamConfig(teamName: string, cwd: string): Promise<Tea
   } catch {
     return null;
   }
+}
+
+export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await readTeamConfigRaw(teamName, cwd);
+  });
 }
 
 // Write worker identity file
@@ -1381,6 +1417,12 @@ function taskFilePath(teamName: string, taskId: string, cwd: string): string {
   return p;
 }
 
+const taskMembershipBarrierContext = new AsyncLocalStorage<Set<string>>();
+
+function taskMembershipBarrierKey(teamName: string, cwd: string): string {
+  return `${resolve(cwd)}\0${teamName}`;
+}
+
 async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
   return await withTeamLockImpl(teamName, cwd, LOCK_STALE_MS, { teamDir, taskClaimLockDir, mailboxLockDir }, fn);
 }
@@ -1390,7 +1432,13 @@ async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<
  * this barrier first, then task claim locks; scale-down follows the same order.
  */
 export async function withTeamTaskBarrier<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
-  return await withTeamLock(teamName, cwd, fn);
+  const key = taskMembershipBarrierKey(teamName, cwd);
+  if (taskMembershipBarrierContext.getStore()?.has(key)) return await fn();
+  return await withTeamLock(teamName, cwd, async () => {
+    const held = new Set<string>(taskMembershipBarrierContext.getStore() ?? []);
+    held.add(key);
+    return await taskMembershipBarrierContext.run(held, fn);
+  });
 }
 
 async function withTaskClaimLock<T>(
@@ -1451,7 +1499,7 @@ export async function createTask(
 }
 
 // Read a task (returns null on missing/malformed)
-export async function readTask(teamName: string, taskId: string, cwd: string): Promise<TeamTask | null> {
+async function readTaskRaw(teamName: string, taskId: string, cwd: string): Promise<TeamTask | null> {
   try {
     const p = taskFilePath(teamName, taskId, cwd);
     if (!existsSync(p)) return null;
@@ -1463,6 +1511,13 @@ export async function readTask(teamName: string, taskId: string, cwd: string): P
   }
 }
 
+export async function readTask(teamName: string, taskId: string, cwd: string): Promise<TeamTask | null> {
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await readTaskRaw(teamName, taskId, cwd);
+  });
+}
+
 // Update a task (merge updates, atomic write)
 export async function updateTask(
   teamName: string,
@@ -1470,41 +1525,43 @@ export async function updateTask(
   updates: Partial<TeamTask>,
   cwd: string
 ): Promise<TeamTask | null> {
-  const lock = await withTaskClaimLock(teamName, taskId, cwd, async () => {
-    const existing = await readTask(teamName, taskId, cwd);
-    if (!existing) return null;
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    const lock = await withTaskClaimLock(teamName, taskId, cwd, async () => {
+      const existing = await readTaskRaw(teamName, taskId, cwd);
+      if (!existing) return null;
 
-    if (updates.status !== undefined && !['pending', 'blocked', 'in_progress', 'completed', 'failed'].includes(updates.status)) {
-      throw new Error(`Invalid task status: ${updates.status}`);
-    }
+      if (updates.status !== undefined && !['pending', 'blocked', 'in_progress', 'completed', 'failed'].includes(updates.status)) {
+        throw new Error(`Invalid task status: ${updates.status}`);
+      }
 
-    const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
-    const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
-
-    const merged = normalizeTask({
-      ...normalizeTask(existing),
-      ...updates,
-      id: existing.id,
-      created_at: existing.created_at,
-      depends_on: normalizedDeps,
-      version: Math.max(1, existing.version ?? 1) + 1,
+      const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
+      const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
+      const merged = normalizeTask({
+        ...normalizeTask(existing),
+        ...updates,
+        id: existing.id,
+        created_at: existing.created_at,
+        depends_on: normalizedDeps,
+        version: Math.max(1, existing.version ?? 1) + 1,
+      });
+      await writeAtomic(taskFilePath(teamName, taskId, cwd), JSON.stringify(merged, null, 2));
+      return merged;
     });
-
-    await writeAtomic(taskFilePath(teamName, taskId, cwd), JSON.stringify(merged, null, 2));
-    return merged;
+    if (!lock.ok) throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
+    return lock.value;
   });
-  if (!lock.ok) {
-    throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
-  }
-  return lock.value;
 }
 
 // List all tasks sorted by numeric ID
 export async function listTasks(teamName: string, cwd: string): Promise<TeamTask[]> {
-  return await listTasksImpl(teamName, cwd, {
-    teamDir,
-    isTeamTask,
-    normalizeTask,
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await listTasksImpl(teamName, cwd, {
+      teamDir,
+      isTeamTask,
+      normalizeTask,
+    });
   });
 }
 
@@ -1544,20 +1601,23 @@ export async function transitionTaskStatus(
   cwd: string,
   terminalData?: { result?: string; error?: string },
 ): Promise<TransitionTaskResult> {
-  return await transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    canTransitionTaskStatus,
-    taskFilePath,
-    writeAtomic,
-    appendTeamEvent,
-    readMonitorSnapshot,
-    writeMonitorSnapshot,
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      canTransitionTaskStatus,
+      taskFilePath,
+      writeAtomic,
+      appendTeamEvent,
+      readMonitorSnapshot,
+      writeMonitorSnapshot,
+    });
   });
 }
 
@@ -1568,16 +1628,19 @@ export async function releaseTaskClaim(
   workerName: string,
   cwd: string
 ): Promise<ReleaseTaskClaimResult> {
-  return await releaseTaskClaimImpl(taskId, claimToken, workerName, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await releaseTaskClaimImpl(taskId, claimToken, workerName, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 
@@ -1586,16 +1649,19 @@ export async function reclaimExpiredTaskClaim(
   taskId: string,
   cwd: string
 ): Promise<ReclaimTaskResult> {
-  return await reclaimExpiredTaskClaimImpl(taskId, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await reclaimExpiredTaskClaimImpl(taskId, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 

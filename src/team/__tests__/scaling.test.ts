@@ -18,6 +18,8 @@ import {
   withScalingLock,
   recoverTeamMembershipTaskTransaction,
   DEFAULT_MAX_WORKERS,
+  listDispatchRequests,
+  readTeamManifestV2,
 } from '../state.js';
 import { isScalingEnabled, scaleUp, scaleDown } from '../scaling.js';
 import { resolveCanonicalTeamStateRoot } from '../state-root.js';
@@ -999,6 +1001,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const previousPath = process.env.PATH;
+    const previousBridge = process.env.OMX_RUNTIME_BRIDGE;
 
     try {
       await writeFile(
@@ -1046,6 +1049,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       await chmod(tmuxStubPath, 0o755);
       await writeFile(tmuxLogPath, '');
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      process.env.OMX_RUNTIME_BRIDGE = '1';
 
       await initTeamState('scale-up-owner-tag-rollback', 'task', 'executor', 1, cwd);
       await configureScaleUpTeamForDirectDispatch('scale-up-owner-tag-rollback', cwd);
@@ -1077,6 +1081,7 @@ printf '%s\\n' "$@" > '${capturePath}'
         'utf8',
       )) as Array<{ to_worker?: string }>;
       assert.equal(dispatch.some((request) => request.to_worker === 'worker-2'), false);
+      assert.equal((await listDispatchRequests('scale-up-owner-tag-rollback', cwd, { to_worker: 'worker-2' })).length, 0);
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
@@ -1086,6 +1091,8 @@ printf '%s\\n' "$@" > '${capturePath}'
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
+      if (typeof previousBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
       await rm(cwd, { recursive: true, force: true });
       await rm(fakeBinDir, { recursive: true, force: true });
     }
@@ -2856,6 +2863,35 @@ describe('scaleDown', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('blocks post-snapshot task creation and null-version claims until removed membership is committed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-create-claim-boundary-'));
+    try {
+      await initTeamState('create-claim-boundary', 'task', 'executor', 2, cwd);
+      const seed = await createTask('create-claim-boundary', {
+        subject: 'snapshot marker', description: 'holds the canonical task lock', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const down = scaleDown('create-claim-boundary', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+        OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS: '100',
+      });
+      const lockPath = join(cwd, '.omx', 'state', 'team', 'create-claim-boundary', 'claims', `task-${seed.id}.lock`);
+      for (let attempt = 0; attempt < 50 && !existsSync(lockPath); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(lockPath), true);
+      const created = createTask('create-claim-boundary', {
+        subject: 'created after snapshot', description: 'must not restore removed membership', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      assert.deepEqual(await down, { ok: true, removedWorkers: ['worker-2'], newWorkerCount: 1 });
+      const task = await created;
+      const claim = await claimTask('create-claim-boundary', task.id, 'worker-2', null, cwd);
+      assert.deepEqual(claim, { ok: false, error: 'worker_not_found' });
+      assert.deepEqual((await readTeamConfig('create-claim-boundary', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 
@@ -3234,6 +3270,40 @@ esac
         && recoveredFirst?.owner === undefined
         && recoveredSecond?.owner === undefined;
       assert.equal(convergedOld || convergedNew, true);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers rollback-persistence failure through public config reads with config, manifest, and tasks converged', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-rollback-recovery-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-rollback-recovery-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, "#!/bin/sh\n[ \"$1\" = list-panes ] && { printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'; exit 0; }\nexit 0\n");
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('rollback-recovery', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('rollback-recovery', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%13';
+      await saveTeamConfig(config, cwd);
+      const task = await createTask('rollback-recovery', { subject: 'owned', description: 'owned', status: 'pending', owner: 'worker-2' }, cwd);
+      const failed = await scaleDown('rollback-recovery', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SCALE_DOWN_INJECT_FAILURE: 'rollback-persistence-failure',
+      });
+      assert.match(failed.ok ? '' : failed.error, /rollback-persistence-failure/);
+      const recoveredConfig = await readTeamConfig('rollback-recovery', cwd);
+      const recoveredManifest = await readTeamManifestV2('rollback-recovery', cwd);
+      const recoveredTask = await readTask('rollback-recovery', task.id, cwd);
+      assert.equal(recoveredConfig?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal(recoveredManifest?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal(recoveredTask?.owner, 'worker-2');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
