@@ -316,19 +316,33 @@ function baseSessionName(target: string): string {
   return target.split(':')[0] || target;
 }
 
-function listPanes(target: string): TmuxPaneInfo[] {
-  const result = runTmux(['list-panes', '-t', target, '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}']);
-  if (!result.ok) return [];
-  return result.stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const [paneId = '', currentCommand = '', startCommand = ''] = line.split('\t');
-      return { paneId, currentCommand, startCommand };
-    })
-    .filter((pane) => pane.paneId.startsWith('%'));
+interface PaneListResult {
+  panes: TmuxPaneInfo[];
+  error: string | null;
 }
+
+function listPanes(target: string): TmuxPaneInfo[] {
+  return listPanesResult(target).panes;
+}
+
+
+function listPanesResult(target: string): PaneListResult {
+  const result = runTmux(['list-panes', '-t', target, '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}']);
+  if (!result.ok) return { panes: [], error: result.stderr };
+  return {
+    panes: result.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const [paneId = '', currentCommand = '', startCommand = ''] = line.split('\t');
+        return { paneId, currentCommand, startCommand };
+      })
+      .filter((pane) => pane.paneId.startsWith('%')),
+    error: null,
+  };
+}
+
 
 export function listPaneIds(target: string): string[] {
   return listPanes(target).map((pane) => pane.paneId);
@@ -1907,7 +1921,12 @@ export function createTeamSession(
       }
     }
 
-    if (proofUnavailable.length > 0 && partialTeamTarget && partialLeaderPaneId) {
+    const hasRecoverablePartialArtifact = partialWorkerPaneIds.length > 0
+      || partialHudPaneId !== null
+      || registeredResizeHook !== null
+      || registeredClientAttachedHook !== null;
+
+    if (proofUnavailable.length > 0 && hasRecoverablePartialArtifact && partialTeamTarget && partialLeaderPaneId) {
       throw new CreateTeamSessionPartialError(
         {
           name: partialTeamTarget,
@@ -2842,13 +2861,20 @@ export interface PaneTeardownOptions {
   graceMs?: number;
 }
 
-export interface SharedSessionShutdownTopology {
-  livePaneIds: string[];
-  teamWorkerPaneIds: string[];
-  leaderPaneId: string | null;
-  hudPaneIds: string[];
-  leaderOwnedHudPaneIds: string[];
-}
+export type SharedSessionShutdownTopology =
+  | {
+    status: 'available';
+    livePaneIds: string[];
+    teamWorkerPaneIds: string[];
+    leaderPaneId: string | null;
+    hudPaneIds: string[];
+    leaderOwnedHudPaneIds: string[];
+  }
+  | {
+    status: 'unavailable';
+    detail: string;
+  };
+
 
 function normalizePaneTarget(value: string | null | undefined): string | null {
   if (typeof value !== 'string') return null;
@@ -2894,7 +2920,10 @@ export function resolveSharedSessionShutdownTopology(
   preferredLeaderPaneId?: string | null,
   teamName?: string | null,
 ): SharedSessionShutdownTopology {
-  const panes = listPanes(sessionName);
+  const paneList = listPanesResult(sessionName);
+  if (paneList.error !== null) return { status: 'unavailable', detail: paneList.error };
+  const panes = paneList.panes;
+
   const livePaneIds = panes
     .map((pane) => normalizePaneTarget(pane.paneId))
     .filter((paneId): paneId is string => Boolean(paneId));
@@ -2902,6 +2931,8 @@ export function resolveSharedSessionShutdownTopology(
   if (panes.length === 0) {
     return {
       livePaneIds,
+      status: 'available',
+
       teamWorkerPaneIds: [],
       leaderPaneId: fallbackLeaderPaneId,
       hudPaneIds: [],
@@ -2938,6 +2969,7 @@ export function resolveSharedSessionShutdownTopology(
 
   return {
     livePaneIds,
+    status: 'available',
     teamWorkerPaneIds: normalizedTeamWorkerPaneIds,
     leaderPaneId: resolvedLeaderPaneId,
     hudPaneIds,

@@ -142,7 +142,8 @@ function assertFreshExactProofBeforePaneEffects(tmuxLog: string, paneId: string)
   const effects = commands
     .map((command, index) => ({ command, index }))
     .filter(({ command }) => (
-      command.startsWith(`paste-buffer -t ${paneId} `)
+      command.startsWith('set-buffer -b omx-pane-input-')
+      || command.startsWith(`paste-buffer -t ${paneId} `)
       || command.startsWith(`kill-pane -t ${paneId} `)
       || (command.startsWith(`send-keys -t ${paneId} `) && !command.includes(' -l '))
     ));

@@ -60,7 +60,9 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  for pane in $(seq 1 200); do
+    printf '%%%s\t0\t%s\n' "$pane" "$((12000 + pane))"
+  done
   exit 0
 fi
 exit 0
@@ -339,7 +341,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%181\t0\t12181\n'
   exit 0
 fi
 exit 0
@@ -460,7 +462,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%182\t0\t12182\n'
   exit 0
 fi
 exit 0

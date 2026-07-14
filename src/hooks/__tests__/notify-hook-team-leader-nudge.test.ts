@@ -218,8 +218,9 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
-  echo "%2 12346"
+  for pane in $(seq 1 200); do
+    printf '%%%s\t0\t%s\n' "$pane" "$((12000 + pane))"
+  done
   exit 0
 fi
 exit 0
@@ -637,7 +638,7 @@ describe('notify-hook team leader nudge', () => {
         });
       }
 
-      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%10 12345', '%11 12346']));
+      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%96\t0\t12096', '%10\t0\t12010', '%11\t0\t12011']));
       await chmod(fakeTmuxPath, 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, {
@@ -705,7 +706,7 @@ describe('notify-hook team leader nudge', () => {
         });
       }
 
-      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%10 12345', '%11 12346']));
+      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%97\t0\t12097', '%10\t0\t12010', '%11\t0\t12011']));
       await chmod(fakeTmuxPath, 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, {
@@ -773,7 +774,7 @@ describe('notify-hook team leader nudge', () => {
         });
       }
 
-      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%98 12349']));
+      await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, ['%98\t0\t12098']));
       await chmod(fakeTmuxPath, 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir);
@@ -1133,7 +1134,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%11 12345"
+  printf '%%91\t0\t12091\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1505,7 +1506,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%93\t0\t12093\n'
   exit 0
 fi
 exit 0
@@ -1835,7 +1836,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%71\t0\t12071\n'
   exit 0
 fi
 exit 0
@@ -1956,7 +1957,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%73\t0\t12073\n'
   exit 0
 fi
 exit 0
@@ -2084,7 +2085,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%74\t0\t12074\n'
   exit 0
 fi
 exit 0
@@ -2207,7 +2208,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%75\t0\t12075\n'
   exit 0
 fi
 exit 0
@@ -2333,7 +2334,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%72\t0\t12072\n'
   exit 0
 fi
 exit 0

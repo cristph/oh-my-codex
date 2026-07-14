@@ -3980,6 +3980,93 @@ esac
     }
   });
 
+  it('startTeam cleans state when create-session proof loss has no created resource', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-no-resource-create-proof-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousEntryPath = process.env.OMX_ENTRY_PATH;
+    const previousArgv = process.argv;
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-no-resource-create-proof-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*) printf 'not-a-pane-snapshot\\n' ;;
+      *"pane_current_command"*) printf '%s\n' "%1\tnode\tcodex" "%2\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%1 node /omx.js hud --watch" ;;
+      *) printf "%%1\\n%%2\\n" ;;
+    esac
+    exit 0
+    ;;
+  set-option)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: fakeCodexNodeScript('process.stdin.resume();\n') }],
+        },
+        async ({ tmuxLogPath }) => {
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_ENTRY_PATH = join(cwd, 'omx.js');
+          process.argv = [previousArgv[0] || 'node', join(cwd, 'omx.js')];
+
+          await assert.rejects(
+            () => withoutTeamWorkerEnv(() => startTeam(
+              'team-no-resource-create-proof',
+              'target and leader identity alone must not persist startup state',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+            )),
+            /exact_pane_proof_unavailable:%2:malformed_snapshot/,
+          );
+
+          const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-no-resource-create-proof');
+          assert.equal(await readTeamConfig(runtimeTeamName, cwd), null);
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, /split-window/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousEntryPath === 'string') process.env.OMX_ENTRY_PATH = previousEntryPath;
+      else delete process.env.OMX_ENTRY_PATH;
+      process.argv = previousArgv;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it(
     'startTeam materializes all worker identity/inbox files before worker-1 startup evidence can block later workers',
     { skip: skipSlowLifecycleUnderCoverage },
@@ -7169,6 +7256,58 @@ esac
           assert.doesNotMatch(tmuxLog, /kill-pane -t %22/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\{pane_id\}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam preserves shared-session state when topology cannot be queried', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-topology-unavailable-'));
+    const teamName = 'team-topology-unavailable';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-topology-unavailable-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    ;;
+  list-panes)
+    echo "topology query failed" >&2
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          await initTeamState(teamName, 'shutdown topology unavailable test', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) return;
+          config.tmux_session = 'leader:0';
+          config.leader_pane_id = '%10';
+          config.hud_pane_id = '%12';
+          config.workers[0]!.pane_id = '%13';
+          await saveTeamConfig(config, cwd);
+
+          await assert.rejects(
+            () => shutdownTeam(teamName, cwd, { force: true }),
+            /shutdown_shared_session_topology_unavailable:topology query failed/,
+          );
+
+          assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+          assert.deepEqual(await readTeamConfig(teamName, cwd), config);
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.match(tmuxLog, /list-panes -t leader:0 -F #\{pane_id\}/);
+          assert.doesNotMatch(tmuxLog, /kill-pane|split-window|resize-pane|select-pane|show-option|kill-session/);
         },
       );
     } finally {

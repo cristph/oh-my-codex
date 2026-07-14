@@ -14,8 +14,7 @@ import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
 import { safeString, asNumber, isTerminalPhase } from './utils.js';
 import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
-import { evaluatePaneInjectionReadiness, sendPaneInput } from './team-tmux-guard.js';
-import { resolvePaneTarget } from './tmux-injection.js';
+import { evaluatePaneInjectionReadiness, normalizeExactPaneId, sendPaneInput } from './team-tmux-guard.js';
 import { readTeamWorkersForIdleCheck } from './team-worker.js';
 
 const STOP_NUDGE_COOLDOWN_MS = 30_000;
@@ -134,17 +133,8 @@ function resolveWorkerStopCooldownMs() {
   return STOP_NUDGE_COOLDOWN_MS;
 }
 
-async function resolveCanonicalLeaderPaneId(leaderPaneId) {
-  const normalizedLeaderPaneId = safeString(leaderPaneId).trim();
-  if (!normalizedLeaderPaneId) return '';
-  try {
-    const resolved = await resolvePaneTarget({ type: 'pane', value: normalizedLeaderPaneId }, '', '', '', {});
-    const paneTarget = safeString(resolved?.paneTarget).trim();
-    if (paneTarget) return paneTarget;
-  } catch {
-    // Fall back to the recorded pane id; readiness guard remains authoritative.
-  }
-  return normalizedLeaderPaneId;
+function resolveCanonicalLeaderPaneId(leaderPaneId) {
+  return normalizeExactPaneId(leaderPaneId);
 }
 
 async function recordSuppressedWorkerStopNudge({
@@ -330,6 +320,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
     requireRunningAgent: true,
     requireReady: false,
     requireIdle: false,
+    exactPaneId: tmuxTarget,
   });
   if (!paneGuard.ok) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
@@ -367,6 +358,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
       prompt,
       submitKeyPresses: 2,
       submitDelayMs: 100,
+      exactPaneId: tmuxTarget,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
     const deliveryMode = leaderHasActiveTask ? 'steered' : 'sent';

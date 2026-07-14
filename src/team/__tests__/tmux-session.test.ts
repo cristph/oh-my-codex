@@ -4500,6 +4500,81 @@ esac
     }
   });
 
+  it('does not report partial session metadata when proof loss occurs before a worker pane exists', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-no-resource-proof-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousEntryPath = process.env[OMX_ENTRY_PATH_ENV];
+    const previousArgv = process.argv;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-no-resource-proof-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*) printf 'not-a-pane-snapshot\\n' ;;
+      *"pane_current_command"*) printf '%s\n' "%1\tnode\tcodex" "%2\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%1 node /omx.js hud --watch" ;;
+      *) printf "%%1\\n%%2\\n" ;;
+    esac
+    exit 0
+    ;;
+  set-option)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          process.env[OMX_ENTRY_PATH_ENV] = join(cwd, 'omx.js');
+          process.argv = [previousArgv[0] || 'node', join(cwd, 'omx.js')];
+
+          let caught: unknown;
+          try {
+            createTeamSession('No Resource Proof Loss', 1, cwd);
+          } catch (error) {
+            caught = error;
+          }
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.equal((caught as Error).message, 'exact_pane_proof_unavailable:%2:malformed_snapshot', tmuxLog);
+          assert.ok(!(caught instanceof CreateTeamSessionPartialError));
+          assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/);
+          assert.doesNotMatch(tmuxLog, /split-window/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = previousEntryPath;
+      else delete process.env[OMX_ENTRY_PATH_ENV];
+      process.argv = previousArgv;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('guards duplicate standalone HUD removal with a fresh global pane proof', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-duplicate-hud-global-proof-'));
     try {
@@ -5868,6 +5943,34 @@ exit 1
         }
       },
     );
+  });
+
+  it('treats malformed PIDs in dead and unrelated global rows as malformed snapshots', async () => {
+    const proofStatePath = join(tmpdir(), `omx-exact-pane-invalid-pid-${process.pid}-${Date.now()}`);
+    await withMockTmuxFixture(
+      'omx-exact-pane-invalid-pid-',
+      () => `#!/bin/sh
+set -eu
+if [ "$1" = "list-panes" ]; then
+  if [ -f "${proofStatePath}" ]; then
+    printf '%%1\t0\t2000000001\n%%99\t0\tnot-a-pid\n'
+  else
+    : > "${proofStatePath}"
+    printf '%%1\t0\t2000000001\n%%99\t1\tnot-a-pid\n'
+  fi
+fi
+`,
+      async () => {
+        const deadRow = readExactPaneProofSync('%1');
+        assert.equal(deadRow.status, 'unavailable');
+        if (deadRow.status === 'unavailable') assert.equal(deadRow.reason, 'malformed_snapshot');
+
+        const unrelatedRow = await readExactPaneProof('%1');
+        assert.equal(unrelatedRow.status, 'unavailable');
+        if (unrelatedRow.status === 'unavailable') assert.equal(unrelatedRow.reason, 'malformed_snapshot');
+      },
+    );
+    await rm(proofStatePath, { force: true });
   });
 
   it('does not fall back to a session target or issue effects for an unproven explicit ID', async () => {

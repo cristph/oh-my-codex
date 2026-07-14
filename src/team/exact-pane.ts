@@ -51,7 +51,7 @@ function parseExactPaneProof(paneId: string, stdout: string): ExactPaneProof {
     if (paneDead !== '0' && paneDead !== '1') {
       return unavailable(paneId, 'malformed_snapshot');
     }
-    if (paneDead === '0' && parsePositiveSafeInteger(pid) === null) {
+    if (parsePositiveSafeInteger(pid) === null) {
       return unavailable(paneId, 'malformed_snapshot');
     }
 

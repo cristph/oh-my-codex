@@ -241,6 +241,10 @@ if [[ "$cmd" == "display-message" ]]; then
   esac
   exit 0
 fi
+if [[ "$cmd" == "list-panes" ]]; then
+  printf '%%42\t0\t12345\n'
+  exit 0
+fi
 if [[ "$cmd" == "capture-pane" ]]; then
   ${removePathOnCapture ? `rm -rf ${removePathOnCapture}` : ""}
   printf '%s\\n' ${captureText}

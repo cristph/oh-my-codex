@@ -4081,7 +4081,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     const sharedSessionTopology = sessionName.includes(':')
       ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
       : null;
-    const effectiveLeaderPaneId = sharedSessionTopology ? sharedSessionTopology.leaderPaneId : leaderPaneId;
+    if (sharedSessionTopology?.status === 'unavailable') {
+      throw new Error(`shutdown_shared_session_topology_unavailable:${sharedSessionTopology.detail}`);
+    }
+    const effectiveLeaderPaneId = sharedSessionTopology?.status === 'available'
+      ? sharedSessionTopology.leaderPaneId
+      : leaderPaneId;
+
     const tmuxPaneOwnerId = typeof config.tmux_pane_owner_id === 'string' ? config.tmux_pane_owner_id.trim() : '';
     const legacyPersistedWorkerPaneIds = new Set(
       config.workers
@@ -4176,15 +4182,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
     shutdownPaneIds = collectShutdownPaneIds({
       config,
-      candidatePaneIds: sessionName.includes(':')
+      candidatePaneIds: sharedSessionTopology
         ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
-          resolveSharedSessionShutdownTopology(sessionName, effectiveLeaderPaneId, sanitized).teamWorkerPaneIds,
+          sharedSessionTopology.teamWorkerPaneIds,
           tmuxPaneOwnerId,
           legacyPersistedWorkerPaneIds,
           (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
         )
         : listPaneIds(sessionName),
-      includePersistedWorkerPaneIds: !sessionName.includes(':'),
+      includePersistedWorkerPaneIds: !sharedSessionTopology,
       restoredStandaloneHudPaneId: restoredHudPaneId,
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,

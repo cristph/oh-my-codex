@@ -11,8 +11,7 @@ import { asNumber, safeString, isTerminalPhase } from './utils.js';
 import { readJsonIfExists, getScopedStateDirsForCurrentSession } from './state-io.js';
 import { runProcess } from './process-runner.js';
 import { logTmuxHookEvent } from './log.js';
-import { evaluatePaneInjectionReadiness, queuePaneInput, sendPaneInput } from './team-tmux-guard.js';
-import { resolvePaneTarget } from './tmux-injection.js';
+import { evaluatePaneInjectionReadiness, normalizeExactPaneId, queuePaneInput, sendPaneInput } from './team-tmux-guard.js';
 import { listNotifyCanonicalActiveTeams } from './active-team.js';
 import {
   classifyLeaderActionState,
@@ -761,23 +760,9 @@ export async function maybeNudgeTeamLeader({
     const workerPaneIds = Array.isArray(workers)
       ? workers.map((w) => safeString(w && w.pane_id ? w.pane_id : '')).filter(Boolean)
       : [];
-    const canonicalLeaderPaneId = safeString(leaderPaneId).trim();
+    const canonicalLeaderPaneId = normalizeExactPaneId(leaderPaneId);
     if (!tmuxSession && !canonicalLeaderPaneId) continue;
-    let tmuxTarget = canonicalLeaderPaneId;
-    if (canonicalLeaderPaneId) {
-      const resolvedLeaderTarget = await resolvePaneTarget(
-        { type: 'pane', value: canonicalLeaderPaneId },
-        '',
-        canonicalLeaderPaneId,
-        '',
-        {},
-      ).catch(() => null);
-      if (resolvedLeaderTarget?.paneTarget) {
-        tmuxTarget = safeString(resolvedLeaderTarget.paneTarget).trim();
-      } else if (resolvedLeaderTarget && ['target_is_hud_pane', 'pane_cwd_mismatch'].includes(safeString(resolvedLeaderTarget.reason).trim())) {
-        tmuxTarget = '';
-      }
-    }
+    const tmuxTarget = canonicalLeaderPaneId;
     const paneStatus = tmuxSession
       ? await checkWorkerPanesAlive(tmuxSession, workerPaneIds)
       : { alive: false, paneCount: 0 };
@@ -1087,6 +1072,7 @@ export async function maybeNudgeTeamLeader({
       requireRunningAgent: true,
       requireReady: false,
       requireIdle: false,
+      exactPaneId: canonicalLeaderPaneId,
     });
     if (!paneGuard.ok) {
       const deferredReason = paneGuard.reason === 'pane_running_shell'
@@ -1191,6 +1177,7 @@ export async function maybeNudgeTeamLeader({
         const sendResult = await queuePaneInput({
           paneTarget: tmuxTarget,
           prompt: markedText,
+          exactPaneId: canonicalLeaderPaneId,
         });
         if (!sendResult.ok) {
           throw new Error(sendResult.error || sendResult.reason);
@@ -1202,6 +1189,7 @@ export async function maybeNudgeTeamLeader({
           prompt: markedText,
           submitKeyPresses: 2,
           submitDelayMs: 100,
+          exactPaneId: canonicalLeaderPaneId,
         });
         if (!sendResult.ok) {
           throw new Error(sendResult.error || sendResult.reason);
