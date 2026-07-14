@@ -129,8 +129,9 @@ export { withTeamTaskBarrier as teamWithTaskMembershipBarrier } from './state.js
 export {
   recoverTeamMembershipTaskTransaction,
   commitTeamMembershipTaskTransaction,
-  type TeamMembershipTaskTransaction,
+  finalizeTeamMembershipTaskTransaction,
 } from './state.js';
+export type { TeamMembershipTaskTransaction } from './state.js';
 
 // === Dispatch lock helpers ===
 export { resolveDispatchLockTimeoutMs } from './state.js';

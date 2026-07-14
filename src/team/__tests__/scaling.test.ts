@@ -2671,6 +2671,54 @@ esac
     }
   });
 
+  for (const rollbackFailurePhase of ['rollback-membership-config-persistence', 'rollback-membership-manifest-persistence'] as const) {
+    it(`recovers and raw-verifies original membership after public scaleUp ${rollbackFailurePhase}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-scale-up-${rollbackFailurePhase}-`));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), `omx-scale-up-${rollbackFailurePhase}-bin-`));
+      const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+      const previousPath = process.env.PATH;
+      const teamName = `scale-up-${rollbackFailurePhase.replace('rollback-membership-', '').replace('-persistence', '')}`;
+      try {
+        await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+        const teamDir = join(cwd, '.omx', 'state', 'team', teamName);
+        const configPath = join(teamDir, 'config.json');
+        const manifestPath = join(teamDir, 'manifest.v2.json');
+        const originalConfigBytes = await readFile(configPath, 'utf8');
+        const originalManifestBytes = await readFile(manifestPath, 'utf8');
+
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'public rollback recovery', description: 'must be removed', owner: 'worker-2' }],
+          cwd,
+          {
+            OMX_TEAM_SCALING_ENABLED: '1',
+            OMX_TEAM_SKIP_READY_WAIT: '1',
+            OMX_TEAM_SCALE_UP_INJECT_FAILURE: `finalization,${rollbackFailurePhase}`,
+          },
+        );
+
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.match(result.error, /scale_up_worker_materialization_failed:worker-2:.*finalization/);
+        assert.equal(await readFile(configPath, 'utf8'), originalConfigBytes);
+        assert.equal(await readFile(manifestPath, 'utf8'), originalManifestBytes);
+        assert.equal(existsSync(join(teamDir, '.membership-task-transaction.json')), false);
+        assert.equal(await readTask(teamName, '1', cwd), null);
+        assert.deepEqual(await listDispatchRequests(teamName, cwd), []);
+        assert.equal(existsSync(join(teamDir, 'workers', 'worker-2')), false);
+        assert.equal(existsSync(workerStartupScriptPath(cwd, teamName, 'worker-2')), false);
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
+    });
+  }
   for (const phase of ['identity', 'inbox', 'config'] as const) {
     it(`rolls back live pane and materialized state when ${phase} materialization fails`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), `omx-scale-up-${phase}-failure-`));

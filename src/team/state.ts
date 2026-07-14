@@ -819,6 +819,8 @@ export type TeamMembershipTaskTransaction = {
   failRollbackPersistenceAfter?: 'config' | 'manifest';
   /** Recovery must complete the new generation rather than restore old bytes. */
   recoverToNewOnFailure?: boolean;
+  /** Keep the committed journal until the caller verifies raw canonical membership. */
+  retainJournalOnSuccess?: boolean;
 };
 
 function membershipTransactionPath(teamName: string, cwd: string): string {
@@ -837,7 +839,11 @@ async function applyMembershipTransactionFiles(files: readonly MembershipTransac
  * Resolve an interrupted membership/task commit before a reader or writer observes
  * its files. Prepared transactions roll back; committed transactions roll forward.
  */
-export async function recoverTeamMembershipTaskTransaction(teamName: string, cwd: string): Promise<void> {
+export async function recoverTeamMembershipTaskTransaction(
+  teamName: string,
+  cwd: string,
+  options: { retainJournal?: boolean } = {},
+): Promise<void> {
   const journalPath = membershipTransactionPath(teamName, cwd);
   let journal: MembershipTransactionJournal;
   try {
@@ -850,6 +856,16 @@ export async function recoverTeamMembershipTaskTransaction(teamName: string, cwd
     throw new Error(`Invalid membership transaction journal for ${teamName}`);
   }
   await applyMembershipTransactionFiles(journal.files, journal.phase === 'committed');
+  if (!options.retainJournal) await removeAndSync(journalPath);
+}
+
+/** Finalize a previously committed membership transaction after caller verification. */
+export async function finalizeTeamMembershipTaskTransaction(teamName: string, cwd: string): Promise<void> {
+  const journalPath = membershipTransactionPath(teamName, cwd);
+  const journal = JSON.parse(await readFile(journalPath, 'utf8')) as MembershipTransactionJournal;
+  if (journal.schemaVersion !== 1 || journal.phase !== 'committed' || !Array.isArray(journal.files)) {
+    throw new Error(`Cannot finalize non-committed membership transaction for ${teamName}`);
+  }
   await removeAndSync(journalPath);
 }
 
@@ -905,7 +921,7 @@ export async function commitTeamMembershipTaskTransaction(
     }
     journal.phase = 'committed';
     await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
-    await removeAndSync(journalPath);
+    if (!transaction.retainJournalOnSuccess) await removeAndSync(journalPath);
   } catch (error) {
     if (error instanceof Error && error.message === 'injected_scale_down_interruption:after-first-task-write') throw error;
     if (transaction.failRollbackPersistence || transaction.failRollbackPersistenceAfter) {
@@ -1789,6 +1805,22 @@ async function readDispatchRequests(teamName: string, cwd: string): Promise<Team
   }
 }
 
+/** Read only the target team's canonical legacy request file for rollback scoping. */
+async function readLegacyDispatchRequestsForRollback(teamName: string, cwd: string): Promise<TeamDispatchRequest[]> {
+  const path = dispatchRequestsPath(teamName, cwd);
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!Array.isArray(raw)) return [];
+    const nowIso = new Date().toISOString();
+    return raw
+      .map((entry) => normalizeDispatchRequestImpl(teamName, (entry ?? {}) as Partial<TeamDispatchRequest>, nowIso))
+      .filter((entry): entry is TeamDispatchRequest => entry !== null);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
 async function writeDispatchRequests(teamName: string, requests: TeamDispatchRequest[], cwd: string): Promise<void> {
   await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(requests, null, 2));
   await writeBridgeDispatchCompat(teamName, requests, cwd);
@@ -1855,13 +1887,32 @@ export async function removeDispatchRequestsForWorkers(
 ): Promise<void> {
   const names = new Set(workerNames);
   await withDispatchLock(teamName, cwd, async () => {
-    const requests = await readDispatchRequests(teamName, cwd);
-    const removedRequestIds = requests
+    // Do not derive rollback IDs from bridge-normalized root records: unscoped
+    // and other-team records can share a target worker name. This team's legacy
+    // file is the canonical rollback scope.
+    const requests = await readLegacyDispatchRequestsForRollback(teamName, cwd);
+    const legacyRequestIds = requests
       .filter((request) => names.has(request.to_worker))
       .map((request) => request.request_id);
-    if (isBridgeEnabled() && removedRequestIds.length > 0) {
+    let removedRequestIds = legacyRequestIds;
+    if (isBridgeEnabled()) {
       const stateDir = resolveBridgeStateDir(cwd);
       const bridge = getDefaultBridge(stateDir);
+      const snapshot = bridge.execCommand({ command: 'CaptureSnapshot' });
+      if (snapshot.event !== 'SnapshotCaptured') {
+        throw new Error(`authoritative_dispatch_rollback_discovery_failed:${[...names].join(',')}`);
+      }
+      const scopedAuthoritativeIds = bridge.readDispatchRecords()
+        .filter((record) => {
+          const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
+          return metadataTeam === teamName && names.has(record.target);
+        })
+        .map((record) => record.request_id);
+      removedRequestIds = [...new Set([...legacyRequestIds, ...scopedAuthoritativeIds])];
+      if (removedRequestIds.length === 0) {
+        await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(requests, null, 2));
+        return;
+      }
       const removal = bridge.removeDispatchRecords(removedRequestIds);
       if (
         removal.event !== 'DispatchRecordsRemoved'
@@ -1869,8 +1920,18 @@ export async function removeDispatchRequestsForWorkers(
       ) {
         throw new Error(`authoritative_dispatch_rollback_command_failed:${[...names].join(',')}`);
       }
-      const remainingAuthoritative = bridge.readDispatchRecords();
-      if (remainingAuthoritative.some((record) => removedRequestIds.includes(record.request_id))) {
+      // Force a separate runtime command after mutation. The removal event is
+      // the authoritative acknowledgement; TS must not inspect or rewrite the
+      // shared root dispatch.json as a substitute for runtime verification.
+      const verificationSnapshot = bridge.execCommand({ command: 'CaptureSnapshot' });
+      if (verificationSnapshot.event !== 'SnapshotCaptured') {
+        throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
+      }
+      const remainingScoped = bridge.readDispatchRecords().some((record) => {
+        const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
+        return metadataTeam === teamName && names.has(record.target);
+      });
+      if (remainingScoped) {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
     }
@@ -1879,10 +1940,6 @@ export async function removeDispatchRequestsForWorkers(
     // the shared bridge dispatch.json from a local snapshot during rollback.
     const retained = requests.filter((request) => !names.has(request.to_worker));
     await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(retained, null, 2));
-    const remaining = await readDispatchRequests(teamName, cwd);
-    if (remaining.some((request) => names.has(request.to_worker))) {
-      throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
-    }
   });
 }
 

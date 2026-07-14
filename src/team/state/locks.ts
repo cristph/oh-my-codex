@@ -84,10 +84,12 @@ export async function withTeamLock<T>(
   deps: TeamPathDeps,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockDir = join(deps.teamDir(teamName, cwd), '.lock.create-task');
+  const stateRoot = dirname(dirname(deps.teamDir(teamName, cwd)));
+  const lockDir = join(stateRoot, '.team-locks', `${teamName}.membership`);
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + 5000;
+  await mkdir(dirname(lockDir), { recursive: true });
   while (true) {
     try {
       await mkdir(lockDir);
