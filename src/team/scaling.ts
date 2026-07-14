@@ -459,7 +459,8 @@ export async function scaleUp(
   const sanitized = sanitizeTeamName(teamName);
   const leaderCwd = resolve(cwd);
 
-  return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleUpResult | ScaleError> => {
+  return await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+    return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleUpResult | ScaleError> => {
     const config = await readTeamConfig(sanitized, leaderCwd);
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
@@ -636,14 +637,46 @@ export async function scaleUp(
       } catch (rollbackError) {
         return { ok: false, error: `scale_up_rollback_cleanup_debt:authoritative_dispatch_cleanup_failed:${String(rollbackError)}` };
       }
+      const rollbackPaneIds = [
+        ...rollbackWorkers.map((worker) => worker.pane_id),
+        context.paneId,
+      ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
+      const resolvedPaneIds = new Set<string>();
+      const unresolvedPaneIds = new Set<string>();
+      try {
+        const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
+          leaderPaneId: config.leader_pane_id,
+          hudPaneId: config.hud_pane_id,
+        });
+        for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
+        for (const paneId of paneTeardown.kill.failedPaneIds) unresolvedPaneIds.add(paneId);
+        for (const proof of paneTeardown.proofUnavailable) unresolvedPaneIds.add(proof.paneId);
+        if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
+        if (paneTeardown.proofUnavailable.length > 0) {
+          cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
+        }
+      } catch (cleanupError) {
+        for (const paneId of rollbackPaneIds) unresolvedPaneIds.add(paneId);
+        cleanupDebt.push(`pane_cleanup_exception:${String(cleanupError)}`);
+      }
+
+      const unresolvedWorkerNames = new Set(rollbackWorkers
+        .filter((worker) => typeof worker.pane_id === 'string' && unresolvedPaneIds.has(worker.pane_id))
+        .map((worker) => worker.name));
+      if (context.workerName && context.paneId && unresolvedPaneIds.has(context.paneId)) {
+        unresolvedWorkerNames.add(context.workerName);
+      }
+      const cleanupWorkerNames = new Set([
+        ...rollbackWorkers
+          .filter((worker) => typeof worker.pane_id !== 'string' || resolvedPaneIds.has(worker.pane_id))
+          .map((worker) => worker.name),
+        ...(context.workerName && !unresolvedWorkerNames.has(context.workerName) ? [context.workerName] : []),
+      ]);
       try {
         for (const taskId of createdTaskIds) {
           await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
         }
-        await Promise.all([...new Set([
-          ...rollbackWorkers.map((worker) => worker.name),
-          context.workerName,
-        ].filter((workerName): workerName is string => Boolean(workerName)))].map(async (workerName) => {
+        await Promise.all([...cleanupWorkerNames].map(async (workerName) => {
           await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
         }));
         for (const taskId of createdTaskIds) {
@@ -651,7 +684,7 @@ export async function scaleUp(
             throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
           }
         }
-        for (const workerName of rollbackWorkerNames) {
+        for (const workerName of cleanupWorkerNames) {
           if (existsSync(join(teamStateRoot, 'team', sanitized, 'workers', workerName))) {
             throw new Error(`canonical_scale_up_rollback_worker_verification_failed:${workerName}`);
           }
@@ -660,36 +693,27 @@ export async function scaleUp(
         cleanupDebt.push(`canonical_cleanup_failed:${String(rollbackError)}`);
       }
 
-      const rollbackPaneIds = [
-        ...rollbackWorkers.map((worker) => worker.pane_id),
-        context.paneId,
-      ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
-      try {
-        const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
-          leaderPaneId: config.leader_pane_id,
-          hudPaneId: config.hud_pane_id,
-        });
-        if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
-        if (paneTeardown.proofUnavailable.length > 0) {
-          cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
-        }
-      } catch (cleanupError) {
-        cleanupDebt.push(`pane_cleanup_exception:${String(cleanupError)}`);
-      }
       try {
         const contextWorkerName = context.worker?.name ?? context.workerName;
         const contextWorktreePath = context.worker?.worktree_path ?? context.worktreePath;
-        if (contextWorkerName && contextWorktreePath) {
+        if (contextWorkerName && contextWorktreePath && !unresolvedWorkerNames.has(contextWorkerName)) {
           await removeWorkerWorktreeRootAgentsFile(sanitized, contextWorkerName, teamStateRoot, contextWorktreePath);
         }
-        await rollbackProvisionedWorktrees(provisionedWorktrees);
-        await Promise.all([...preparedWorkerDirectoryOwner.keys()].map(async (workerDirPath) => {
-          await rm(workerDirPath, { recursive: true, force: true });
-        }));
-        await Promise.all([...preparedStartupScriptOwner.keys()].map(async (startupScriptPath) => {
-          await rm(startupScriptPath, { force: true });
-        }));
-        if (!runtimeDirectoryExisted) await rm(runtimeDirectoryPath, { recursive: true, force: true });
+        const unresolvedWorktreePaths = new Set(rollbackWorkers
+          .filter((worker) => unresolvedWorkerNames.has(worker.name) && typeof worker.worktree_path === 'string')
+          .map((worker) => resolve(worker.worktree_path as string)));
+        await rollbackProvisionedWorktrees(provisionedWorktrees.filter((worktree) => !unresolvedWorktreePaths.has(resolve(worktree.worktreePath))));
+        await Promise.all([...preparedWorkerDirectoryOwner.entries()]
+          .filter(([, workerName]) => !unresolvedWorkerNames.has(workerName))
+          .map(async ([workerDirPath]) => {
+            await rm(workerDirPath, { recursive: true, force: true });
+          }));
+        await Promise.all([...preparedStartupScriptOwner.entries()]
+          .filter(([, workerName]) => !unresolvedWorkerNames.has(workerName))
+          .map(async ([startupScriptPath]) => {
+            await rm(startupScriptPath, { force: true });
+          }));
+        if (!runtimeDirectoryExisted && unresolvedWorkerNames.size === 0) await rm(runtimeDirectoryPath, { recursive: true, force: true });
       } catch (cleanupError) {
         cleanupDebt.push(`resource_cleanup_failed:${String(cleanupError)}`);
       }
@@ -1123,6 +1147,7 @@ export async function scaleUp(
       newWorkerCount: config.worker_count,
       nextWorkerIndex: nextIndex,
     };
+    });
   });
 }
 
@@ -1375,11 +1400,13 @@ export async function scaleDown(
     const targetPaneIds = targetWorkers
       .map((worker) => worker.pane_id)
       .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
+    const resolvedPaneIds = new Set<string>();
     try {
       const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
         leaderPaneId: config.leader_pane_id,
         hudPaneId: config.hud_pane_id,
       });
+      for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
       if (paneTeardown.kill.failedPaneIds.length > 0) {
         cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
       }
@@ -1389,7 +1416,12 @@ export async function scaleDown(
     } catch (error) {
       cleanupDebt.push(`pane_cleanup_exception:${String(error)}`);
     }
-    const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
+    const cleanupWorkers = targetWorkers.filter((worker) => (
+      typeof worker.pane_id !== 'string' || resolvedPaneIds.has(worker.pane_id)
+    ));
+    const unresolvedCleanupWorkers = targetWorkers.filter((worker) => !cleanupWorkers.includes(worker));
+    if (unresolvedCleanupWorkers.length > 0) await restorePriorWorkerStatuses(unresolvedCleanupWorkers);
+    const detachedWorktreesToRollback: EnsureWorktreeResult[] = cleanupWorkers
       .filter((worker) => worker.worktree_created === true && worker.worktree_detached === true
         && typeof worker.worktree_repo_root === 'string' && typeof worker.worktree_path === 'string')
       .map((worker) => ({
@@ -1404,7 +1436,7 @@ export async function scaleDown(
       }));
     try {
       if (detachedWorktreesToRollback.length > 0) await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
-      await Promise.all(targetWorkers.map(async (worker) => {
+      await Promise.all(cleanupWorkers.map(async (worker) => {
         if (worker.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(
             sanitized,

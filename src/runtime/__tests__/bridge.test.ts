@@ -123,6 +123,24 @@ describe('RuntimeBridge.readCompatFile (parse guard)', () => {
   });
 });
 
+describe('RuntimeBridge.readDispatchRecordsStrict', () => {
+  it('fails closed for missing, malformed, and invalid-shaped dispatch compatibility output', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'omx-bridge-dispatch-strict-'));
+    const bridge = new RuntimeBridge({ stateDir, binaryPath: '/nonexistent-binary' });
+    try {
+      assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
+      writeFileSync(join(stateDir, 'dispatch.json'), '{');
+      assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
+      writeFileSync(join(stateDir, 'dispatch.json'), JSON.stringify({ records: [{}] }));
+      assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
+      writeFileSync(join(stateDir, 'dispatch.json'), JSON.stringify({ records: [] }));
+      assert.deepEqual(bridge.readDispatchRecordsStrict(), []);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('RuntimeBridge.execCommand / readSnapshot (parse guard)', () => {
   // The bridge's `validateSchemaOnce` is a module-level singleton: a single
   // fake-binary that returns the same string regardless of subcommand would

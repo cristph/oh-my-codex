@@ -1902,7 +1902,7 @@ export async function removeDispatchRequestsForWorkers(
       if (snapshot.event !== 'SnapshotCaptured') {
         throw new Error(`authoritative_dispatch_rollback_discovery_failed:${[...names].join(',')}`);
       }
-      const scopedAuthoritativeIds = bridge.readDispatchRecords()
+      const scopedAuthoritativeIds = bridge.readDispatchRecordsStrict()
         .filter((record) => {
           const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
           return metadataTeam === teamName && names.has(record.target);
@@ -1927,7 +1927,7 @@ export async function removeDispatchRequestsForWorkers(
       if (verificationSnapshot.event !== 'SnapshotCaptured') {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
-      const remainingScoped = bridge.readDispatchRecords().some((record) => {
+      const remainingScoped = bridge.readDispatchRecordsStrict().some((record) => {
         const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
         return metadataTeam === teamName && names.has(record.target);
       });

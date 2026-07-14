@@ -411,6 +411,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   target=""
   while (($#)); do
     case "$1" in
@@ -569,6 +570,7 @@ if [[ "$cmd" == "list-sessions" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   target=""
   while (($#)); do
     case "$1" in
@@ -822,6 +824,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   target=""
   while (($#)); do
     case "$1" in
@@ -1060,6 +1063,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   all=false
   target=""
   while (($#)); do
@@ -1240,6 +1244,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   target=""
   while (($#)); do
     case "$1" in
@@ -1378,6 +1383,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   echo "can't find session" >&2
   exit 1
 fi
@@ -1817,6 +1823,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   echo "can't find session" >&2
   exit 1
 fi
@@ -1949,6 +1956,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242' '%77' '0' '4277' '%99' '0' '4299'; exit 0; fi
   echo "can't find session" >&2
   exit 1
 fi
@@ -2045,6 +2053,10 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "list-panes" && " $* " == *" -a "* ]]; then
+  printf '%s\t%s\t%s\n' '%42' '0' '4242'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""

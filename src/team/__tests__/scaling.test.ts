@@ -3186,7 +3186,7 @@ exit 0
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
       const committed = await readTeamConfig('kill-fail', cwd);
       assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1']);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), false);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), true);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
@@ -3470,7 +3470,8 @@ esac
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_proof_unavailable:%14:query_failed/);
       assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker2StatusPath), false);
-      assert.equal(existsSync(worker3StatusPath), false);
+      assert.equal(existsSync(worker3StatusPath), true);
+      assert.equal(await readFile(worker3StatusPath, 'utf8'), worker3Raw);
       assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, undefined);
       assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, undefined);
       const reclaimedTask = await readTask('success-proof-loss', resolvedTask.id, cwd);
@@ -3541,7 +3542,8 @@ esac
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%14/);
       assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker2StatusPath), false);
-      assert.equal(existsSync(worker3StatusPath), false);
+      assert.equal(existsSync(worker3StatusPath), true);
+      assert.equal(await readFile(worker3StatusPath, 'utf8'), '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n');
       assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, undefined);
       assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, undefined);
       const reclaimedTask = await readTask('gone-kill-fail', resolvedTask.id, cwd);
@@ -3605,7 +3607,8 @@ esac
         );
         assert.equal(result.ok, false);
         if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
-        assert.equal(existsSync(statusPath), false);
+        assert.equal(existsSync(statusPath), priorRaw !== undefined);
+        if (priorRaw !== undefined) assert.equal(await readFile(statusPath, 'utf8'), priorRaw);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;

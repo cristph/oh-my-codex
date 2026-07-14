@@ -69,6 +69,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then printf '%s\t%s\t%s\n' '%42' '0' '4242'; exit 0; fi
   echo "%42 1"
   exit 0
 fi

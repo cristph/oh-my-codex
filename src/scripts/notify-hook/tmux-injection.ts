@@ -690,6 +690,7 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
   try {
     const paneGuard = await evaluatePaneInjectionReadiness(paneTarget, {
       skipIfScrolling: config.skip_if_scrolling,
+      exactPaneId: paneTarget,
     });
     if (!paneGuard.ok) {
       const reason = mapPaneInjectionReadinessReason(paneGuard.reason);
@@ -706,8 +707,17 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
       });
       return;
     }
-  } catch {
-    // Non-fatal: if querying pane state fails, proceed with injection.
+  } catch (error) {
+    const reason = `pane_proof_unavailable:${error instanceof Error ? error.message : String(error)}`;
+    updateStateForAttempt(false, reason);
+    await writeFile(hookStatePath, JSON.stringify(state, null, 2)).catch(() => {});
+    await logTmuxHookEvent(logsDir, {
+      ...baseLog,
+      event: 'injection_skipped',
+      reason,
+      pane_target: paneTarget,
+    });
+    return;
   }
 
   if (config.dry_run) {
@@ -727,6 +737,7 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
     const sendResult = await sendPaneInput({
       paneTarget,
       prompt,
+      exactPaneId: paneTarget,
       submitKeyPresses: argv.submitArgv.length,
       submitDelayMs: 25,
     });

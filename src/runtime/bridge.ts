@@ -278,6 +278,33 @@ export class RuntimeBridge {
     return raw.records;
   }
 
+  /** Read authoritative dispatch compatibility output, failing closed on unavailable or malformed state. */
+  readDispatchRecordsStrict(): DispatchRecord[] {
+    if (!this.stateDir) throw new RuntimeBridgeError('dispatch compatibility state directory is unavailable', { command: 'dispatch-read' });
+    const filePath = join(this.stateDir, 'dispatch.json');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as unknown;
+    } catch (cause) {
+      throw new RuntimeBridgeError('dispatch compatibility output is unavailable or malformed', { command: 'dispatch-read', cause });
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { records?: unknown }).records)) {
+      throw new RuntimeBridgeError('dispatch compatibility output has an invalid shape', { command: 'dispatch-read' });
+    }
+    const records = (parsed as { records: unknown[] }).records;
+    if (records.some((record) => {
+      if (!record || typeof record !== 'object') return true;
+      const value = record as Partial<DispatchRecord>;
+      return typeof value.request_id !== 'string'
+        || typeof value.target !== 'string'
+        || !['pending', 'notified', 'delivered', 'failed'].includes(String(value.status))
+        || (value.metadata !== null && value.metadata !== undefined && typeof value.metadata !== 'object');
+    })) {
+      throw new RuntimeBridgeError('dispatch compatibility output contains an invalid record', { command: 'dispatch-read' });
+    }
+    return records as DispatchRecord[];
+  }
+
   /** Read mailbox records from compatibility file. */
   readMailboxRecords(): MailboxRecord[] {
     const raw = this.readCompatFile<{ records: MailboxRecord[] }>('mailbox.json');

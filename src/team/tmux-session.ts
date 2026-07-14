@@ -2874,6 +2874,7 @@ export interface PaneTeardownSummary {
     invalid: number;
   };
   provenGonePaneIds: string[];
+  killedPaneIds: string[];
   proofUnavailable: Array<Extract<ExactPaneProof, { status: 'unavailable' }>>;
   kill: {
     attempted: number;
@@ -3157,6 +3158,7 @@ export async function teardownWorkerPanes(
     attemptedPaneIds: killablePaneIds,
     excluded,
     provenGonePaneIds: [],
+    killedPaneIds: [],
     proofUnavailable: [],
     kill: {
       attempted: 0,
@@ -3181,6 +3183,7 @@ export async function teardownWorkerPanes(
     const result = await runTmuxAsync(['kill-pane', '-t', proof.paneId]);
     if (result.ok) {
       summary.kill.succeeded += 1;
+      summary.killedPaneIds.push(proof.paneId);
     } else {
       summary.kill.failed += 1;
       summary.kill.failedPaneIds.push(proof.paneId);
