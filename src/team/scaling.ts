@@ -622,9 +622,16 @@ export async function scaleUp(
         ? (config.workers[config.workers.length - 1]?.pane_id ?? config.leader_pane_id ?? '')
         : (config.leader_pane_id ?? '');
       const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
+      const splitTargetProof = readExactPaneProofSync(splitTarget);
+      if (splitTargetProof.status !== 'live') {
+        return await rollbackScaleUp(
+          `scale_up_split_target_proof_unavailable:${splitTarget}:${splitTargetProof.reason}`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
+      }
 
       const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
+        'split-window', splitDirection, '-t', splitTargetProof.paneId, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
       ], { encoding: 'utf-8' });
 
       if (result.status !== 0) {
@@ -982,6 +989,12 @@ export async function scaleDown(
         .map((proof) => `${proof.paneId}:${proof.reason}`)
         .join(',');
       return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
+    }
+    if (paneTeardown.kill.failedPaneIds.length > 0) {
+      return {
+        ok: false,
+        error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
+      };
     }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>

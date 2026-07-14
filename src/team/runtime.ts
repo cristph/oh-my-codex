@@ -3994,6 +3994,12 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   const sessionName = config.tmux_session;
+  const sharedSessionTopology = config.worker_launch_mode === 'interactive' && sessionName.includes(':')
+    ? resolveSharedSessionShutdownTopology(sessionName, config.leader_pane_id, sanitized)
+    : null;
+  if (sharedSessionTopology?.status === 'unavailable') {
+    throw new Error(`shutdown_shared_session_topology_unavailable:${sharedSessionTopology.detail}`);
+  }
   const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
   const shutdownRequestTimes = new Map<string, string>();
 
@@ -4078,12 +4084,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const leaderPaneId = config.leader_pane_id;
   const hudPaneId = config.hud_pane_id;
   if (config.worker_launch_mode === 'interactive') {
-    const sharedSessionTopology = sessionName.includes(':')
-      ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
-      : null;
-    if (sharedSessionTopology?.status === 'unavailable') {
-      throw new Error(`shutdown_shared_session_topology_unavailable:${sharedSessionTopology.detail}`);
-    }
+
     const effectiveLeaderPaneId = sharedSessionTopology?.status === 'available'
       ? sharedSessionTopology.leaderPaneId
       : leaderPaneId;
@@ -4168,6 +4169,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         leaderPaneId: effectiveLeaderPaneId,
       });
       assertPaneTeardownProofsAvailable('shutdown', hudTeardown.proofUnavailable);
+      if (hudTeardown.kill.failed > 0) {
+        throw new Error(`shutdown_pane_teardown_failed:${hudTeardown.kill.failedPaneIds.join(',')}`);
+      }
+
       if (sessionName.includes(':')) {
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
           sessionId: leaderSessionId,
@@ -4200,6 +4205,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       hudPaneId: restoredHudPaneId ?? effectiveHudPaneId,
     });
     assertPaneTeardownProofsAvailable('shutdown', workerTeardown.proofUnavailable);
+    if (workerTeardown.kill.failed > 0) {
+      throw new Error(`shutdown_pane_teardown_failed:${workerTeardown.kill.failedPaneIds.join(',')}`);
+    }
     config.resize_hook_name = null;
     config.resize_hook_target = null;
     await saveTeamConfig(config, cwd);

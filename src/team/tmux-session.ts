@@ -198,6 +198,13 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
  * Kill only a pane that a fresh global snapshot proves live. Callers treat
  * gone/dead rows as already cleaned and unavailable snapshots as fail-closed.
  */
+function requireLiveExactPaneSync(paneId: string): string {
+  const proof = readExactPaneProofSync(paneId);
+  if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+  if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${paneId}`);
+  return proof.paneId;
+}
+
 function killExactPaneSync(paneId: string): void {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
@@ -235,9 +242,10 @@ function tagPaneInstance(paneTarget: string, instanceId: string): void {
   const target = paneTarget.trim();
   const sanitized = instanceId.trim();
   if (!target || !sanitized) return;
-  const result = runTmux(['set-option', '-p', '-t', target, OMX_PANE_INSTANCE_OPTION, sanitized]);
+  const provenTarget = requireLiveExactPaneSync(target);
+  const result = runTmux(['set-option', '-p', '-t', provenTarget, OMX_PANE_INSTANCE_OPTION, sanitized]);
   if (!result.ok) {
-    throw new Error(`failed to tag tmux pane ${target}: ${result.stderr}`);
+    throw new Error(`failed to tag tmux pane ${provenTarget}: ${result.stderr}`);
   }
 }
 
@@ -245,9 +253,10 @@ export function tagPaneTeamOwner(paneTarget: string, teamOwnerId: string): void 
   const target = paneTarget.trim();
   const sanitized = teamOwnerId.trim();
   if (!target || !sanitized) return;
-  const result = runTmux(['set-option', '-p', '-t', target, OMX_TEAM_PANE_OWNER_OPTION, sanitized]);
+  const provenTarget = requireLiveExactPaneSync(target);
+  const result = runTmux(['set-option', '-p', '-t', provenTarget, OMX_TEAM_PANE_OWNER_OPTION, sanitized]);
   if (!result.ok) {
-    throw new Error(`failed to tag tmux pane ${target}: ${result.stderr}`);
+    throw new Error(`failed to tag tmux pane ${provenTarget}: ${result.stderr}`);
   }
 }
 
@@ -342,6 +351,9 @@ function listPanesResult(target: string): PaneListResult {
       return { panes: [], error: 'malformed pane topology' };
     }
 
+    if (panes.some((pane) => pane.paneId === paneId)) {
+      return { panes: [], error: 'malformed pane topology' };
+    }
     panes.push({
       paneId,
       currentCommand: line.slice(firstSeparator + 1, secondSeparator),
@@ -726,6 +738,17 @@ function buildBestEffortShellCommand(command: string): string {
   return `${command} >/dev/null 2>&1 || true`;
 }
 
+function buildAuthoritativeHudResizeShellCommand(
+  hudPaneId: string,
+  heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+): string {
+  const target = buildHudPaneTarget(hudPaneId);
+  const snapshot = buildNestedTmuxShellCommand("list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}'");
+  const resize = buildNestedTmuxShellCommand(buildHudResizeCommand(target, heightLines));
+  const proof = `awk -F '\\t' -v pane='${target}' '$1 !~ /^%[0-9]+$/ || ($2 != "0" && $2 != "1") || $3 !~ /^[1-9][0-9]*$/ || length($3) > 16 || (length($3) == 16 && ("x" $3) > "x9007199254740991") || seen[$1]++ { bad = 1 } $1 == pane && $2 == "0" { live = 1 } END { exit bad || !live }'`;
+  return `if snapshot=$(${snapshot}); then printf '%s\\n' "$snapshot" | ${proof} && ${resize}; fi`;
+}
+
 /** Upper bound for tmux hook indices (signed 32-bit max). */
 const TMUX_HOOK_INDEX_MAX = 2147483647;
 
@@ -751,7 +774,7 @@ export function buildRegisterResizeHookArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
-  const resizeCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
+  const resizeCommand = buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines));
   const hookCommand = shellQuoteSingle(
     `${resizeCommand}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeCommand}`,
   );
@@ -785,7 +808,7 @@ export function buildRegisterClientAttachedReconcileArgs(
 ): string[] {
   const hookSlot = buildClientAttachedHookSlot(hookName);
   const oneShotCommand = shellQuoteSingle(
-    `${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
+    `${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
   );
   return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}`];
 }
@@ -805,14 +828,14 @@ export function buildScheduleDelayedHudResizeArgs(
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
   const delay = Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : HUD_RESIZE_RECONCILE_DELAY_SECONDS;
-  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}`];
+  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))}`];
 }
 
 export function buildReconcileHudResizeArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
-  return ['run-shell', buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))];
+  return ['run-shell', buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))];
 }
 
 function redrawLeaderPaneAfterTeamLayout(leaderPaneId: string): void {
@@ -1695,14 +1718,15 @@ export function createTeamSession(
     const ownerSessionId = (options.ownerSessionId ?? process.env.OMX_SESSION_ID ?? '').trim();
     const teamPaneOwnerId = (options.teamPaneOwnerId ?? `team:${safeTeamName}`).trim();
     partialTeamPaneOwnerId = teamPaneOwnerId;
+    const paneListResult = listPanesResult(teamTarget);
+    if (paneListResult.error) throw new Error(`failed to read tmux pane topology: ${paneListResult.error}`);
     if (ownerSessionId) {
       const tagResult = runTmux(['set-option', '-t', sessionName, OMX_INSTANCE_OPTION, ownerSessionId]);
       if (!tagResult.ok) {
         throw new Error(`failed to tag tmux session ${sessionName}: ${tagResult.stderr}`);
       }
     }
-    const panes = listPanes(teamTarget);
-    const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
+    const leaderPaneId = chooseTeamLeaderPaneId(paneListResult.panes, detectedLeaderPaneId);
     partialLeaderPaneId = leaderPaneId;
     tagPaneInstance(leaderPaneId, ownerSessionId);
     tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId);
@@ -1748,7 +1772,7 @@ export function createTeamSession(
       );
       // First split creates the right side from leader. Remaining splits stack on the right.
       const splitDirection = i === 1 ? '-h' : '-v';
-      const splitTarget = i === 1 ? leaderPaneId : (rightStackRootPaneId ?? leaderPaneId);
+      const splitTarget = requireLiveExactPaneSync(i === 1 ? leaderPaneId : (rightStackRootPaneId ?? leaderPaneId));
       const split = runTmux([
         'split-window',
         splitDirection,
@@ -1804,8 +1828,9 @@ export function createTeamSession(
     if (canRecreateTeamHud && omxEntry) {
       const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: ownerSessionId, leaderPaneId })} node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
       const hudCwd = translatePathForMsys(cwd);
+      const hudSplitTarget = requireLiveExactPaneSync(leaderPaneId);
       const hudResult = runTmux([
-        'split-window', '-v', '-f', '-l', String(HUD_TMUX_TEAM_HEIGHT_LINES), '-t', teamTarget, '-d', '-P', '-F', '#{pane_id}', '-c', hudCwd, hudCmd,
+        'split-window', '-v', '-f', '-l', String(HUD_TMUX_TEAM_HEIGHT_LINES), '-t', hudSplitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', hudCwd, hudCmd,
       ]);
       if (hudResult.ok) {
         const id = hudResult.stdout.split('\n')[0]?.trim() ?? '';
@@ -1820,9 +1845,8 @@ export function createTeamSession(
           hudPaneId = id;
 
           if (isNativeWindows()) {
-            // Native Windows tmux support may flow through psmux; issuing a
-            // direct control-plane resize avoids nested run-shell PATH drift.
-            const reconcile = runTmux(buildHudResizeArgs(hudPaneId));
+            const provenHudPaneId = requireLiveExactPaneSync(hudPaneId);
+            const reconcile = runTmux(buildHudResizeArgs(provenHudPaneId));
             if (!reconcile.ok) {
               throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
             }
@@ -1841,12 +1865,6 @@ export function createTeamSession(
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
             } else {
-              // tmux versions/builds that reject indexed client-resized hooks should not
-              // abort madmax/team startup after panes were successfully created. Keep the
-              // fallback narrow: skip only the long-lived resize hook metadata, then
-              // still try the one-shot client-attached reconcile plus the explicit
-              // delayed/direct resize checks below so real tmux/run-shell failures
-              // still surface.
               console.warn(
                 `[omx] tmux resize hook unavailable for ${hookTarget} (${hookName}): ${registerHook.stderr}; `
                   + 'continuing with best-effort HUD resize fallback.',
@@ -1877,7 +1895,7 @@ export function createTeamSession(
       }
     }
 
-    runTmux(['select-pane', '-t', leaderPaneId]);
+    runTmux(['select-pane', '-t', requireLiveExactPaneSync(leaderPaneId)]);
     redrawLeaderPaneAfterTeamLayout(leaderPaneId);
     sleepSeconds(0.5);
 
@@ -1902,16 +1920,17 @@ export function createTeamSession(
     };
   } catch (error) {
     if (registeredClientAttachedHook) {
-      const unregistered = runTmux(
-        buildUnregisterClientAttachedReconcileArgs(
-          registeredClientAttachedHook.target,
-          registeredClientAttachedHook.name,
-        ),
-      );
+      const unregistered = runTmux(buildUnregisterClientAttachedReconcileArgs(
+        registeredClientAttachedHook.target,
+        registeredClientAttachedHook.name,
+      ));
       if (unregistered.ok) registeredClientAttachedHook = null;
     }
     if (registeredResizeHook) {
-      const unregistered = runTmux(buildUnregisterResizeHookArgs(registeredResizeHook.target, registeredResizeHook.name));
+      const unregistered = runTmux(buildUnregisterResizeHookArgs(
+        registeredResizeHook.target,
+        registeredResizeHook.name,
+      ));
       if (unregistered.ok) registeredResizeHook = null;
     }
 

@@ -229,10 +229,9 @@ describe('HUD resize hook command builders', () => {
     assert.equal(args[1], '-t');
     assert.equal(args[2], 'my-session:0');
     assert.match(args[3] ?? '', /^client-resized\[\d+\]$/);
-    assert.equal(
-      args[4],
-      `run-shell -b 'tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true'`,
-    );
+    assert.match(args[4] ?? '', /list-panes -a -F/);
+    assert.match(args[4] ?? '', /awk -F/);
+    assert.match(args[4] ?? '', new RegExp(`resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
   });
 
   it('buildUnregisterResizeHookArgs removes the exact numeric hook slot', () => {
@@ -252,10 +251,10 @@ describe('HUD resize hook command builders', () => {
     assert.equal(args[1], '-t');
     assert.equal(args[2], 'my-session:0');
     assert.match(args[3] ?? '', /^client-attached\[\d+\]$/);
-    assert.match(
-      args[4] ?? '',
-      /^run-shell -b 'tmux resize-pane -t %1 -y \d+ >\/dev\/null 2>&1 \|\| true; tmux set-hook -u -t my-session:0 client-attached\[\d+\]'$/,
-    );
+    assert.match(args[4] ?? '', /list-panes -a -F/);
+    assert.match(args[4] ?? '', /awk -F/);
+    assert.match(args[4] ?? '', /resize-pane -t %1 -y \d+/);
+    assert.match(args[4] ?? '', /set-hook -u -t my-session:0 client-attached\[\d+\]/);
   });
 
   it('buildUnregisterClientAttachedReconcileArgs removes the exact numeric client-attached slot', () => {
@@ -294,20 +293,23 @@ describe('HUD resize hook command builders', () => {
     assert.equal(c[3], d[3]);
   });
 
-  it('buildScheduleDelayedHudResizeArgs schedules tmux-side delayed reconcile', () => {
-    assert.deepEqual(
-      buildScheduleDelayedHudResizeArgs('%1'),
-      ['run-shell', '-b', `sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
-    );
+  it('buildScheduleDelayedHudResizeArgs schedules a proof-bearing tmux-side delayed reconcile', () => {
+    const args = buildScheduleDelayedHudResizeArgs('%1');
+    assert.equal(args[0], 'run-shell');
+    assert.equal(args[1], '-b');
+    assert.match(args[2] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS};`));
+    assert.match(args[2] ?? '', /list-panes -a -F/);
+    assert.match(args[2] ?? '', /awk -F/);
+    assert.match(args[2] ?? '', new RegExp(`resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
   });
 
-  it('buildReconcileHudResizeArgs executes a best-effort quiet resize command', () => {
+  it('buildReconcileHudResizeArgs executes only after a global exact-pane proof', () => {
     const args = buildReconcileHudResizeArgs('%7');
     assert.equal(args.join(' ').includes('split-window'), false);
-    assert.deepEqual(
-      args,
-      ['run-shell', `tmux resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
-    );
+    assert.equal(args[0], 'run-shell');
+    assert.match(args[1] ?? '', /list-panes -a -F/);
+    assert.match(args[1] ?? '', /awk -F/);
+    assert.match(args[1] ?? '', new RegExp(`resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
   });
 
   it('resolves the tmux executable for win32 hook shell snippets', async () => {
@@ -356,7 +358,7 @@ describe('HUD resize hook command builders', () => {
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
       const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
-      assert.equal(matches.length, 2, 'client-attached hook should resolve tmux for both resize and unregister commands');
+      assert.equal(matches.length, 3, 'client-attached hook should resolve tmux for proof, resize, and unregister commands');
       assert.doesNotMatch(args[4] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
@@ -4012,10 +4014,13 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        if [ -f "${proofStatePath}" ]; then
+        proof_count=0
+        if [ -f "${proofStatePath}" ]; then proof_count=$(cat "${proofStatePath}"); fi
+        proof_count=$((proof_count + 1))
+        printf '%s' "$proof_count" > "${proofStatePath}"
+        if [ "$proof_count" -eq 14 ]; then
           printf 'not-a-pane-snapshot\n'
         else
-          : > "${proofStatePath}"
           printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n%%3\t0\t2000000003\n"
         fi
         ;;
@@ -4069,7 +4074,7 @@ esac
           const commands = tmuxLog.trim().split('\n').filter(Boolean);
           assert.match(tmuxLog, /select-layout -t leader:0 main-vertical/);
           assert.match(tmuxLog, /set-window-option -t leader:0 main-pane-width 60/);
-          assert.match(tmuxLog, /split-window -v -f -l 3 -t leader:0 -d -P -F #\{pane_id\}/);
+          assert.match(tmuxLog, /split-window -v -f -l 3 -t %1 -d -P -F #\{pane_id\}/);
           const redrawIndices = commands
             .map((command, index) => command === 'send-keys -t %1 C-l' ? index : -1)
             .filter((index) => index >= 0);
@@ -4181,6 +4186,16 @@ esac
           assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /exec env OMX_SESSION_ID='omx-pane-scope' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
+          const commands = tmuxLog.trim().split('\n').filter(Boolean);
+          const exactPaneEffects = /^(set-option -p -t %|split-window .* -t %|resize-pane -t %|select-pane -t %|send-keys -t %)/;
+          for (const [index, command] of commands.entries()) {
+            if (!exactPaneEffects.test(command)) continue;
+            assert.match(
+              commands[index - 1] ?? '',
+              /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/,
+              `exact-pane effect must be immediately preceded by global proof: ${command}`,
+            );
+          }
         },
       );
     } finally {
@@ -4329,7 +4344,7 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%1\\t0\\t2000000001\\n%%2\\t0\\t2000000002\\n%%7\\t0\\t2000000007\\n%%8\\t0\\t2000000008\\n"
+        printf "%%1\\t0\\t2000000001\\n%%2\\t0\\t2000000002\\n%%3\\t0\\t2000000003\\n%%4\\t0\\t2000000004\\n%%7\\t0\\t2000000007\\n%%8\\t0\\t2000000008\\n"
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -4383,7 +4398,7 @@ esac
           assert.ok(initialHudKill > 0);
           assert.match(commands[initialHudKill - 1] ?? '', /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %8/);
-          assert.match(tmuxLog, /split-window -v -f -l 3 -t shared:0 -d -P -F #\{pane_id\}/);
+          assert.match(tmuxLog, /split-window -v -f -l 3 -t %1 -d -P -F #\{pane_id\}/);
         },
       );
     } finally {
@@ -4425,7 +4440,11 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf 'not-a-pane-snapshot\\n'
+        proof_count=0
+        if [ -f "${logPath}.proof-count" ]; then proof_count=$(cat "${logPath}.proof-count"); fi
+        proof_count=$((proof_count + 1))
+        printf '%s' "$proof_count" > "${logPath}.proof-count"
+        if [ "$proof_count" -gt 4 ]; then printf 'not-a-pane-snapshot\n'; else printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n"; fi
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -4527,7 +4546,13 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-a -F #{pane_id}"*) printf 'not-a-pane-snapshot\\n' ;;
+      *"-a -F #{pane_id}"*)
+        proof_count=0
+        if [ -f "${logPath}.proof-count" ]; then proof_count=$(cat "${logPath}.proof-count"); fi
+        proof_count=$((proof_count + 1))
+        printf '%s' "$proof_count" > "${logPath}.proof-count"
+        if [ "$proof_count" -eq 1 ]; then printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n"; else printf 'not-a-pane-snapshot\n'; fi
+        ;;
       *"pane_current_command"*) printf '%s\n' "%1\tnode\tcodex" "%2\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%1 node /omx.js hud --watch" ;;
       *) printf "%%1\\n%%2\\n" ;;
     esac
@@ -4561,7 +4586,7 @@ esac
           assert.equal((caught as Error).message, 'exact_pane_proof_unavailable:%2:malformed_snapshot', tmuxLog);
           assert.ok(!(caught instanceof CreateTeamSessionPartialError));
           assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/);
-          assert.doesNotMatch(tmuxLog, /split-window/);
+          assert.doesNotMatch(tmuxLog, /split-window|resize-pane|select-pane|send-keys/);
         },
       );
     } finally {
@@ -4574,6 +4599,56 @@ esac
       if (typeof previousEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = previousEntryPath;
       else delete process.env[OMX_ENTRY_PATH_ENV];
       process.argv = previousArgv;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects duplicate pane IDs in successful create topology before mutation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-duplicate-topology-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-duplicate-topology-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) echo "tmux 3.4" ;;
+  display-message) echo "leader:0 %1" ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf '%%1\\tnode\\tcodex\\n%%1\\tnode\\tcodex\\n' ;;
+      *) printf '%%1\\n' ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          const geminiPath = join(dirname(logPath), 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          assert.throws(
+            () => createTeamSession('Duplicate topology', 1, cwd),
+            /failed to read tmux pane topology: malformed pane topology/,
+          );
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, /set-option|split-window|resize-pane|select-pane|send-keys/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
       await rm(cwd, { recursive: true, force: true });
     }
   });
