@@ -400,7 +400,7 @@ describe('team state', () => {
 set -eu
 printf '%s\n' "$*" >> "${runtimeLogPath}"
 if [[ "\${1:-}" == "schema" ]]; then
-  printf '{"schema_version":1,"commands":["acquire-authority","renew-authority","queue-dispatch","mark-notified","mark-delivered","mark-failed","request-replay","capture-snapshot"],"events":[],"transport":"tmux"}\n'
+  printf '{"schema_version":1,"commands":["acquire-authority","renew-authority","queue-dispatch","mark-notified","mark-delivered","mark-failed","remove-dispatch-records","request-replay","capture-snapshot"],"events":[],"transport":"tmux"}\n'
   exit 0
 fi
 if [[ "\${1:-}" == "exec" ]]; then

@@ -2871,23 +2871,32 @@ describe('scaleDown', () => {
       const seed = await createTask('create-claim-boundary', {
         subject: 'snapshot marker', description: 'holds the canonical task lock', status: 'pending', owner: 'worker-2',
       }, cwd);
+      const postSnapshotMarker = join(cwd, 'post-snapshot-held');
       const down = scaleDown('create-claim-boundary', cwd, { workerNames: ['worker-2'], force: true }, {
         OMX_TEAM_SCALING_ENABLED: '1',
-        OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS: '100',
+        OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS: '250',
+        OMX_TEAM_SCALE_DOWN_POST_SNAPSHOT_MARKER: postSnapshotMarker,
       });
-      const lockPath = join(cwd, '.omx', 'state', 'team', 'create-claim-boundary', 'claims', `task-${seed.id}.lock`);
-      for (let attempt = 0; attempt < 50 && !existsSync(lockPath); attempt += 1) {
+      for (let attempt = 0; attempt < 50 && !existsSync(postSnapshotMarker); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      assert.equal(existsSync(lockPath), true);
+      assert.equal(existsSync(postSnapshotMarker), true);
+      let createSettled = false;
+      let claimSettled = false;
       const created = createTask('create-claim-boundary', {
         subject: 'created after snapshot', description: 'must not restore removed membership', status: 'pending', owner: 'worker-2',
-      }, cwd);
+      }, cwd).finally(() => { createSettled = true; });
+      const claim = claimTask('create-claim-boundary', seed.id, 'worker-2', null, cwd)
+        .finally(() => { claimSettled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(createSettled, false);
+      assert.equal(claimSettled, false);
       assert.deepEqual(await down, { ok: true, removedWorkers: ['worker-2'], newWorkerCount: 1 });
+      assert.deepEqual(await claim, { ok: false, error: 'worker_not_found' });
       const task = await created;
-      const claim = await claimTask('create-claim-boundary', task.id, 'worker-2', null, cwd);
-      assert.deepEqual(claim, { ok: false, error: 'worker_not_found' });
+      assert.equal(task.owner, 'worker-2');
       assert.deepEqual((await readTeamConfig('create-claim-boundary', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.equal((await readTask('create-claim-boundary', task.id, cwd))?.owner, 'worker-2');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -567,37 +567,60 @@ export async function scaleUp(
 
       // Restore and verify original config/manifest membership before any worker
       // artifact deletion. Subsequent failures are retryable cleanup debt only.
-      try {
-        await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-          const currentConfigBytes = await readFile(configPath, 'utf8');
-          const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
-          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
-            tasks: [],
-            config: { oldBytes: currentConfigBytes, newBytes: originalConfigBytes },
-            manifest: { oldBytes: currentManifestBytes, newBytes: originalManifestBytes },
+      let membershipRollbackError: unknown;
+      let membershipRestored = false;
+      for (let attempt = 0; attempt < 2 && !membershipRestored; attempt += 1) {
+        try {
+          await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+            await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+            const currentConfigBytes = await readFile(configPath, 'utf8');
+            const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
+            await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+              tasks: [],
+              config: { oldBytes: currentConfigBytes, newBytes: originalConfigBytes },
+              manifest: { oldBytes: currentManifestBytes, newBytes: originalManifestBytes },
+              // A failed rollback must recover toward the original membership,
+              // never back to the just-added workers.
+              recoverToNewOnFailure: true,
+              failRollbackPersistence: attempt === 0 && env.OMX_TEAM_SCALE_UP_INJECT_FAILURE === 'rollback-membership-persistence',
+            });
           });
-        });
-        const [committed, committedManifest] = await Promise.all([
-          readTeamConfig(sanitized, leaderCwd),
-          readTeamManifestV2(sanitized, leaderCwd),
-        ]);
-        const rawConfig = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
-        const rawManifest = existsSync(manifestPath)
-          ? JSON.parse(await readFile(manifestPath, 'utf8')) as { workers?: WorkerInfo[] }
-          : null;
-        if (
-          !committed
-          || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))
-          || (committedManifest !== null && committedManifest.workers.some((worker) => rollbackWorkerNames.has(worker.name)))
-          || rawConfig.workers.some((worker) => rollbackWorkerNames.has(worker.name))
-          || (rawManifest?.workers?.some((worker) => rollbackWorkerNames.has(worker.name)) ?? false)
-        ) {
-          throw new Error('canonical_scale_up_rollback_membership_verification_failed');
+          const [committed, committedManifest] = await Promise.all([
+            readTeamConfig(sanitized, leaderCwd),
+            readTeamManifestV2(sanitized, leaderCwd),
+          ]);
+          const rawConfig = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
+          const rawManifest = existsSync(manifestPath)
+            ? JSON.parse(await readFile(manifestPath, 'utf8')) as { workers?: WorkerInfo[] }
+            : null;
+          if (
+            !committed
+            || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))
+            || (committedManifest !== null && committedManifest.workers.some((worker) => rollbackWorkerNames.has(worker.name)))
+            || rawConfig.workers.some((worker) => rollbackWorkerNames.has(worker.name))
+            || (rawManifest?.workers?.some((worker) => rollbackWorkerNames.has(worker.name)) ?? false)
+          ) {
+            throw new Error('canonical_scale_up_rollback_membership_verification_failed');
+          }
+          membershipRestored = true;
+        } catch (rollbackError) {
+          membershipRollbackError = rollbackError;
+          try {
+            // A committed-direction rollback journal is a durable recovery
+            // authority. Retry entry recovery before declaring persistence
+            // failure, while all worker artifacts remain intact.
+            await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+              await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+            });
+          } catch (recoveryError) {
+            membershipRollbackError = recoveryError;
+          }
         }
-        Object.assign(config, originalConfig);
-      } catch (rollbackError) {
-        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(rollbackError)}` };
       }
+      if (!membershipRestored) {
+        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(membershipRollbackError)}` };
+      }
+      Object.assign(config, originalConfig);
 
       const cleanupDebt: string[] = [];
       try {
@@ -1269,6 +1292,8 @@ export async function scaleDown(
         for (const task of reconciledTasks) {
           taskSnapshots.set(task.id, await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`)));
         }
+        const postSnapshotMarker = env.OMX_TEAM_SCALE_DOWN_POST_SNAPSHOT_MARKER;
+        if (postSnapshotMarker) await writeFile(postSnapshotMarker, 'snapshot-held\n');
         const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
         if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
         const currentConfig = JSON.parse(configSnapshot.toString('utf8')) as TeamConfig;

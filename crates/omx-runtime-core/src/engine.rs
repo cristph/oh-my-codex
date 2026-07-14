@@ -156,6 +156,17 @@ impl RuntimeEngine {
                 self.dispatch.mark_failed(&request_id, &reason)?;
                 RuntimeEvent::DispatchFailed { request_id, reason }
             }
+            RuntimeCommand::RemoveDispatchRecords { request_ids } => {
+                let request_id_set: std::collections::HashSet<&str> =
+                    request_ids.iter().map(String::as_str).collect();
+                self.event_log
+                    .retain(|event| !dispatch_event_matches_request_ids(event, &request_id_set));
+                self.dispatch = DispatchLog::new();
+                for event in &self.event_log {
+                    replay_dispatch_event(&mut self.dispatch, event);
+                }
+                RuntimeEvent::DispatchRecordsRemoved { request_ids }
+            }
             RuntimeCommand::RequestReplay { cursor } => {
                 self.replay.request_replay(cursor.clone());
                 RuntimeEvent::ReplayRequested { cursor }
@@ -246,6 +257,8 @@ impl RuntimeEngine {
 
         let mailbox_json = serde_json::to_string_pretty(&self.mailbox)?;
         std::fs::write(dir.join("mailbox.json"), mailbox_json)?;
+        let dispatch_json = serde_json::to_string_pretty(&self.dispatch)?;
+        std::fs::write(dir.join("dispatch.json"), dispatch_json)?;
 
         drop(lock_file);
         Ok(())
@@ -344,6 +357,44 @@ impl Default for RuntimeEngine {
     }
 }
 
+fn dispatch_event_matches_request_ids(
+    event: &RuntimeEvent,
+    request_ids: &std::collections::HashSet<&str>,
+) -> bool {
+    match event {
+        RuntimeEvent::DispatchQueued { request_id, .. }
+        | RuntimeEvent::DispatchNotified { request_id, .. }
+        | RuntimeEvent::DispatchDelivered { request_id }
+        | RuntimeEvent::DispatchFailed { request_id, .. } => {
+            request_ids.contains(request_id.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn replay_dispatch_event(dispatch: &mut DispatchLog, event: &RuntimeEvent) {
+    match event {
+        RuntimeEvent::DispatchQueued {
+            request_id,
+            target,
+            metadata,
+        } => dispatch.queue(request_id, target, metadata.clone()),
+        RuntimeEvent::DispatchNotified {
+            request_id,
+            channel,
+        } => {
+            let _ = dispatch.mark_notified(request_id, channel);
+        }
+        RuntimeEvent::DispatchDelivered { request_id } => {
+            let _ = dispatch.mark_delivered(request_id);
+        }
+        RuntimeEvent::DispatchFailed { request_id, reason } => {
+            let _ = dispatch.mark_failed(request_id, reason);
+        }
+        _ => {}
+    }
+}
+
 fn replay_event(engine: &mut RuntimeEngine, event: &RuntimeEvent) {
     match event {
         RuntimeEvent::AuthorityAcquired {
@@ -379,6 +430,7 @@ fn replay_event(engine: &mut RuntimeEngine, event: &RuntimeEvent) {
         RuntimeEvent::DispatchFailed { request_id, reason } => {
             let _ = engine.dispatch.mark_failed(request_id, reason);
         }
+        RuntimeEvent::DispatchRecordsRemoved { .. } => {}
         RuntimeEvent::ReplayRequested { cursor } => {
             engine.replay.request_replay(cursor.clone());
         }
@@ -784,6 +836,62 @@ mod tests {
         if let Some(RuntimeEvent::DispatchQueued { metadata, .. }) = queued_event {
             assert_eq!(*metadata, Some(meta));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_dispatch_records_persists_unrelated_records_and_survives_reload() {
+        let dir = std::env::temp_dir().join("omx-runtime-test-remove-dispatch-records");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut engine = RuntimeEngine::new().with_state_dir(&dir);
+        for (request_id, target) in [
+            ("req-removed", "worker-removed"),
+            ("req-kept", "worker-kept"),
+        ] {
+            engine
+                .process(RuntimeCommand::QueueDispatch {
+                    request_id: request_id.into(),
+                    target: target.into(),
+                    metadata: None,
+                })
+                .unwrap();
+        }
+        engine.persist().unwrap();
+        let removed = engine
+            .process(RuntimeCommand::RemoveDispatchRecords {
+                request_ids: vec!["req-removed".into()],
+            })
+            .unwrap();
+        assert_eq!(
+            removed,
+            RuntimeEvent::DispatchRecordsRemoved {
+                request_ids: vec!["req-removed".into()],
+            }
+        );
+        engine.persist().unwrap();
+
+        let dispatch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("dispatch.json")).unwrap())
+                .unwrap();
+        assert_eq!(dispatch["records"].as_array().unwrap().len(), 1);
+        assert_eq!(dispatch["records"][0]["request_id"], "req-kept");
+        assert!(engine.event_log().iter().all(|event| {
+            !dispatch_event_matches_request_ids(
+                event,
+                &std::collections::HashSet::from(["req-removed"]),
+            )
+        }));
+
+        let loaded = RuntimeEngine::load(&dir).unwrap();
+        assert_eq!(loaded.snapshot().backlog.pending, 1);
+        loaded.persist().unwrap();
+        let reloaded_dispatch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("dispatch.json")).unwrap())
+                .unwrap();
+        assert_eq!(reloaded_dispatch["records"].as_array().unwrap().len(), 1);
+        assert_eq!(reloaded_dispatch["records"][0]["request_id"], "req-kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

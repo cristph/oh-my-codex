@@ -62,6 +62,7 @@ export type RuntimeCommand =
   | { command: 'MarkNotified'; request_id: string; channel: string }
   | { command: 'MarkDelivered'; request_id: string }
   | { command: 'MarkFailed'; request_id: string; reason: string }
+  | { command: 'RemoveDispatchRecords'; request_ids: string[] }
   | { command: 'RequestReplay'; cursor?: string }
   | { command: 'CaptureSnapshot' }
   | { command: 'CreateMailboxMessage'; message_id: string; from_worker: string; to_worker: string; body: string }
@@ -76,6 +77,7 @@ export type RuntimeEvent =
   | { event: 'DispatchNotified'; request_id: string; channel: string }
   | { event: 'DispatchDelivered'; request_id: string }
   | { event: 'DispatchFailed'; request_id: string; reason: string }
+  | { event: 'DispatchRecordsRemoved'; request_ids: string[] }
   | { event: 'ReplayRequested'; cursor?: string }
   | { event: 'SnapshotCaptured' }
   | { event: 'MailboxMessageCreated'; message_id: string; from_worker: string; to_worker: string; body?: string }
@@ -195,6 +197,17 @@ export class RuntimeBridge {
     }
   }
 
+  /** Remove dispatch records through the authoritative events-backed runtime store. */
+  removeDispatchRecords(requestIds: readonly string[]): Extract<RuntimeEvent, { event: 'DispatchRecordsRemoved' }> {
+    const event = this.execCommand({ command: 'RemoveDispatchRecords', request_ids: [...requestIds] });
+    if (event.event !== 'DispatchRecordsRemoved') {
+      throw new RuntimeBridgeError('omx-runtime returned an unexpected dispatch removal event', {
+        command: 'RemoveDispatchRecords',
+      });
+    }
+    return event;
+  }
+
   /** Read the current RuntimeSnapshot. */
   readSnapshot(): RuntimeSnapshot {
     const args = ['snapshot', '--json'];
@@ -283,7 +296,7 @@ export class RuntimeBridge {
       const schema = JSON.parse(stdout);
       const expectedCommands = [
         'acquire-authority', 'renew-authority', 'queue-dispatch',
-        'mark-notified', 'mark-delivered', 'mark-failed',
+        'mark-notified', 'mark-delivered', 'mark-failed', 'remove-dispatch-records',
         'request-replay', 'capture-snapshot',
       ];
       const missing = expectedCommands.filter(

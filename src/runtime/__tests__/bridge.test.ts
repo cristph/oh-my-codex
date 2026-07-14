@@ -131,7 +131,7 @@ describe('RuntimeBridge.execCommand / readSnapshot (parse guard)', () => {
   const validSchema = JSON.stringify({
     commands: [
       'acquire-authority', 'renew-authority', 'queue-dispatch',
-      'mark-notified', 'mark-delivered', 'mark-failed',
+      'mark-notified', 'mark-delivered', 'mark-failed', 'remove-dispatch-records',
       'request-replay', 'capture-snapshot',
     ],
   });
@@ -195,6 +195,22 @@ esac
         leased_until: '2026-01-01T00:00:00Z',
       });
       assert.deepEqual(actual, event);
+    });
+  });
+
+  it('accepts the authoritative dispatch removal command', () => {
+    const event = {
+      event: 'DispatchRecordsRemoved',
+      request_ids: ['req-removed'],
+    };
+    withFakeBinary(JSON.stringify(event), (bridge) => {
+      assert.deepEqual(
+        bridge.execCommand({
+          command: 'RemoveDispatchRecords',
+          request_ids: ['req-removed'],
+        }),
+        event,
+      );
     });
   });
 
