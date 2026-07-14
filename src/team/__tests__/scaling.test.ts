@@ -2477,8 +2477,69 @@ exit 0
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+  it('rolls back pre-split worker preparation when worktree-root instructions cannot materialize', async () => {
+    const cwd = await initRepo();
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-pre-split-root-failure-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    const teamName = 'pre-split-root-failure';
+    const worktreePath = join(cwd, '.omx', 'team', teamName, 'worktrees', 'worker-2');
+    try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  -V) echo 'tmux 3.2a' ;;
+  list-panes) printf '%s\\t%s\\t%s\\n' '%21' '0' '42421' ;;
+esac
+`,
+      );
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState(teamName, 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+      const config = await readTeamConfig(teamName, cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = `omx-team-${teamName}`;
+      config.workers[0]!.pane_id = '%21';
+      config.workspace_mode = 'worktree';
+      config.worktree_mode = { enabled: true, detached: true, name: null };
+      await saveTeamConfig(config, cwd);
+      execFileSync('git', ['worktree', 'add', '--detach', worktreePath], { cwd, stdio: 'ignore' });
+      await mkdir(join(worktreePath, 'AGENTS.md'));
+
+      const result = await scaleUp(
+        teamName,
+        1,
+        'executor',
+        [],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /^scale_up_worker_preparation_failed:worker-2:/);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2')), false);
+      assert.equal(existsSync(workerStartupScriptPath(cwd, teamName, 'worker-2')), false);
+      assert.equal(existsSync(join(worktreePath, 'AGENTS.md')), true);
+      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
+        '-V',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+      ]);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
   it('retains only unresolved rollback workers and deletes never-created tasks after an explicit proof-loss phase', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-rollback-kill-fail-'));
+    const cwd = await initRepo();
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-rollback-kill-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -2535,6 +2596,12 @@ esac
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
       await initTeamState('rollback-kill-fail', 'task', 'executor', 1, cwd);
       await configureScaleUpTeamForDirectDispatch('rollback-kill-fail', cwd);
+      const rollbackConfig = await readTeamConfig('rollback-kill-fail', cwd);
+      assert.ok(rollbackConfig);
+      if (!rollbackConfig) return;
+      rollbackConfig.workspace_mode = 'worktree';
+      rollbackConfig.worktree_mode = { enabled: true, detached: true, name: null };
+      await saveTeamConfig(rollbackConfig, cwd);
 
       const result = await scaleUp(
         'rollback-kill-fail',
@@ -2579,10 +2646,15 @@ esac
       assert.equal(await readTask('rollback-kill-fail', '3', cwd), null);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-4')), false);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'runtime', 'worker-4-startup.sh')), false);
+      const worker4WorktreePath = join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-4');
+      assert.equal(existsSync(worker4WorktreePath), false);
+      assert.equal(existsSync(join(worker4WorktreePath, 'AGENTS.md')), false);
+      assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-2', 'AGENTS.md')), true);
+      assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-3', 'AGENTS.md')), true);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-2', 'identity.json')), true);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'identity.json')), true);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'inbox.md')), true);
-      const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      const tmuxCommands: string[] = await readScaleUpTmuxLogCommands(tmuxLogPath);
       const mutationCommands = tmuxCommands
         .filter((command) => command.startsWith('split-window ') || command.startsWith('kill-pane '))
         .map((command) => command.startsWith('split-window ') ? command.split(' -c ')[0]! : command);
@@ -2592,11 +2664,17 @@ esac
         'kill-pane -t %31',
         'kill-pane -t %32',
       ]);
-      for (const splitCommand of mutationCommands) {
-        const splitIndex = tmuxCommands.findIndex((command) => command.startsWith(splitCommand));
-        assert.ok(splitIndex > 0);
-        assert.equal(tmuxCommands[splitIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+      for (const mutationCommand of mutationCommands) {
+        const mutationIndex = tmuxCommands.findIndex((command) => (
+          command === mutationCommand || command.startsWith(`${mutationCommand} -c `)
+        ));
+        assert.ok(mutationIndex > 0);
+        assert.equal(tmuxCommands[mutationIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
       }
+      assert.ok(tmuxCommands.some((command) => command.startsWith('split-window -v -t %21 ')));
+      assert.ok(tmuxCommands.some((command) => command.startsWith('split-window -v -t %31 ')));
+      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
+      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %32'));
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -2934,6 +3012,66 @@ exit 0
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
+      ]);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+  it('preserves workers, resources, and exact task artifacts when task reconciliation fails after pane teardown', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-task-reconcile-fail-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-task-reconcile-fail-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes) printf '%s\\t%s\\t%s\\n' '%11' '0' '42411' ;;
+esac
+`,
+      );
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('task-reconcile-fail', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('task-reconcile-fail', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%13';
+      await saveTeamConfig(config, cwd);
+      const firstTask = await createTask('task-reconcile-fail', {
+        subject: 'first reconciliation', description: 'must be restored after later failure', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const firstTaskPath = join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'tasks', `task-${firstTask.id}.json`);
+      const firstTaskRaw = await readFile(firstTaskPath, 'utf-8');
+      const task = await createTask('task-reconcile-fail', {
+        subject: 'locked reconciliation', description: 'must remain exact', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const taskPath = join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'tasks', `task-${task.id}.json`);
+      const taskRaw = await readFile(taskPath, 'utf-8');
+      const priorConfig = structuredClone(await readTeamConfig('task-reconcile-fail', cwd));
+      await mkdir(join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'claims', `task-${task.id}.lock`));
+
+      const result = await scaleDown(
+        'task-reconcile-fail',
+        cwd,
+        { workerNames: ['worker-2'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+
+      assert.deepEqual(result, { ok: false, error: 'scale_down_task_reconciliation_failed:Error: Timed out acquiring task claim lock for task-reconcile-fail/2' });
+      assert.deepEqual(await readTeamConfig('task-reconcile-fail', cwd), priorConfig);
+      assert.equal(await readFile(taskPath, 'utf-8'), taskRaw);
+      assert.equal(await readFile(firstTaskPath, 'utf-8'), firstTaskRaw);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'workers', 'worker-2')), true);
+      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;

@@ -437,9 +437,7 @@ export async function scaleUp(
     const createdTaskIds: string[] = [];
     const createdTaskOwnerById = new Map<string, string | undefined>();
 
-    const createdWorkerDirectories: string[] = [];
     const provisionedWorktrees: EnsureWorktreeResult[] = [];
-    const createdStartupScriptPaths: string[] = [];
     const preparedWorkerDirectoryOwner = new Map<string, string>();
     const preparedStartupScriptOwner = new Map<string, string>();
     const preparedWorktreeOwner = new Map<string, string>();
@@ -529,13 +527,13 @@ export async function scaleUp(
           return Boolean(owner && removablePreparedOwners.has(owner) && !safelyRemovedWorktreePaths.has(worktree.worktreePath));
         });
         if (removableWorktrees.length > 0) await rollbackProvisionedWorktrees(removableWorktrees);
-        await Promise.all(createdWorkerDirectories.map(async (workerDirPath) => {
+        await Promise.all([...preparedWorkerDirectoryOwner.keys()].map(async (workerDirPath) => {
           const owner = preparedWorkerDirectoryOwner.get(workerDirPath);
           if (owner && removablePreparedOwners.has(owner)) {
             await rm(workerDirPath, { recursive: true, force: true });
           }
         }));
-        await Promise.all(createdStartupScriptPaths.map(async (startupScriptPath) => {
+        await Promise.all([...preparedStartupScriptOwner.keys()].map(async (startupScriptPath) => {
           const owner = preparedStartupScriptOwner.get(startupScriptPath);
           if (owner && removablePreparedOwners.has(owner)) await rm(startupScriptPath, { force: true });
         }));
@@ -588,10 +586,10 @@ export async function scaleUp(
       await rollbackProvisionedWorktrees(provisionedWorktrees.filter((worktree) => (
         !safelyRemovedWorktreePaths.has(worktree.worktreePath)
       )));
-      await Promise.all(createdWorkerDirectories.map(async (workerDirPath) => {
+      await Promise.all([...preparedWorkerDirectoryOwner.keys()].map(async (workerDirPath) => {
         await rm(workerDirPath, { recursive: true, force: true });
       }));
-      await Promise.all(createdStartupScriptPaths.map(async (startupScriptPath) => {
+      await Promise.all([...preparedStartupScriptOwner.keys()].map(async (startupScriptPath) => {
         await rm(startupScriptPath, { force: true });
       }));
       if (!runtimeDirectoryExisted) {
@@ -639,93 +637,101 @@ export async function scaleUp(
         console.log(`[omx:scaling] ${workerName}: mixed task roles [${workerLaunchPlan.mixedTaskRoles.join(', ')}], falling back to ${agentType}`);
       }
 
-      // Create worker directory
+      // Prepare every pre-pane artifact under the rollback boundary. A pane is
+      // not required for ownership: workerName and any created worktree are
+      // sufficient for rollback to clean a failed preparation.
       const workerDirPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'workers', workerName);
-      await mkdir(workerDirPath, { recursive: true });
-      createdWorkerDirectories.push(workerDirPath);
-      preparedWorkerDirectoryOwner.set(workerDirPath, workerName);
+      const startupScriptPath = join(
+        teamStateRoot,
+        'team',
+        sanitized,
+        'runtime',
+        `worker-${workerIndex}-startup.sh`,
+      );
+      let workerWorkspace: EnsureWorktreeResult | null = null;
+      let workerCwd = leaderCwd;
+      let cmd: string;
+      let rawRolePromptContent: string | null = null;
+      try {
+        preparedWorkerDirectoryOwner.set(workerDirPath, workerName);
+        await mkdir(workerDirPath, { recursive: true });
 
-      const worktreeMode = effectiveWorktreeMode;
-      const workerWorkspaceResult = worktreeMode.enabled
-        ? ensureWorktree(planWorktreeTarget({
+        if (effectiveWorktreeMode.enabled) {
+          const ensuredWorkspace = ensureWorktree(planWorktreeTarget({
             cwd: leaderCwd,
             scope: 'team',
-            mode: worktreeMode,
+            mode: effectiveWorktreeMode,
             teamName: sanitized,
             workerName,
-          }))
-        : { enabled: false } as const;
-      const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
-      if (workerWorkspace) provisionedWorktrees.push(workerWorkspace);
-      if (workerWorkspace) preparedWorktreeOwner.set(workerWorkspace.worktreePath, workerName);
-      const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
-
-      // Build startup command and create tmux pane
-      const rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
-        ?? await loadRolePrompt(runtimeRole, codexPromptsDir());
-      const resolvedWorkerModel = parseTeamWorkerLaunchArgs(workerLaunchArgs).modelOverride ?? undefined;
-      const rolePromptContent = rawRolePromptContent
-        ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)
-        : null;
-      const teamInstructionsPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'worker-agents.md');
-      const instructionsFilePath = workerWorkspace
-        ? await writeWorkerWorktreeRootAgentsFile({
-            teamName: sanitized,
-            workerName,
-            workerRole: runtimeRole,
-            rolePromptContent: rolePromptContent ?? '',
-            teamStateRoot,
-            leaderCwd,
-            worktreePath: workerWorkspace.worktreePath,
-          })
-        : rolePromptContent
-          ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, runtimeRole, rolePromptContent)
-          : teamInstructionsPath;
-      const extraEnv: Record<string, string> = {
-        OMX_TEAM_STATE_ROOT: teamStateRoot,
-        OMX_TEAM_LEADER_CWD: leaderCwd,
-        OMX_MODEL_INSTRUCTIONS_FILE: instructionsFilePath,
-        ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
-      };
-      if (workerWorkspace) {
-        extraEnv.OMX_TEAM_WORKTREE_PATH = workerWorkspace.worktreePath;
-        if (workerWorkspace.branchName) {
-          extraEnv.OMX_TEAM_WORKTREE_BRANCH = workerWorkspace.branchName;
+          }));
+          if (!ensuredWorkspace.enabled) throw new Error(`worktree_not_provisioned:${workerName}`);
+          workerWorkspace = ensuredWorkspace;
+          provisionedWorktrees.push(ensuredWorkspace);
+          preparedWorktreeOwner.set(ensuredWorkspace.worktreePath, workerName);
+          workerCwd = ensuredWorkspace.worktreePath;
         }
-        extraEnv.OMX_TEAM_WORKTREE_DETACHED = workerWorkspace.detached ? '1' : '0';
-      }
-      trustWorkerMiseConfigIfAvailable(workerCwd);
-      const startupCommand = writeWorkerStartupScriptCommand(
-        sanitized,
-        workerIndex,
-        workerLaunchArgs,
-        workerCwd,
-        extraEnv,
-        workerCli,
-        undefined,
-        runtimeRole,
-      );
-      if (startupCommand) {
-        const startupScriptPath = join(
-          teamStateRoot,
-          'team',
-          sanitized,
-          'runtime',
-          `worker-${workerIndex}-startup.sh`,
-        );
-        createdStartupScriptPaths.push(startupScriptPath);
+
+        rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
+          ?? await loadRolePrompt(runtimeRole, codexPromptsDir());
+        const resolvedWorkerModel = parseTeamWorkerLaunchArgs(workerLaunchArgs).modelOverride ?? undefined;
+        const rolePromptContent = rawRolePromptContent
+          ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)
+          : null;
+        const teamInstructionsPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'worker-agents.md');
+        const instructionsFilePath = workerWorkspace
+          ? await writeWorkerWorktreeRootAgentsFile({
+              teamName: sanitized,
+              workerName,
+              workerRole: runtimeRole,
+              rolePromptContent: rolePromptContent ?? '',
+              teamStateRoot,
+              leaderCwd,
+              worktreePath: workerWorkspace.worktreePath,
+            })
+          : rolePromptContent
+            ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, runtimeRole, rolePromptContent)
+            : teamInstructionsPath;
+        const extraEnv: Record<string, string> = {
+          OMX_TEAM_STATE_ROOT: teamStateRoot,
+          OMX_TEAM_LEADER_CWD: leaderCwd,
+          OMX_MODEL_INSTRUCTIONS_FILE: instructionsFilePath,
+          ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+        };
+        if (workerWorkspace) {
+          extraEnv.OMX_TEAM_WORKTREE_PATH = workerWorkspace.worktreePath;
+          if (workerWorkspace.branchName) {
+            extraEnv.OMX_TEAM_WORKTREE_BRANCH = workerWorkspace.branchName;
+          }
+          extraEnv.OMX_TEAM_WORKTREE_DETACHED = workerWorkspace.detached ? '1' : '0';
+        }
+        trustWorkerMiseConfigIfAvailable(workerCwd);
         preparedStartupScriptOwner.set(startupScriptPath, workerName);
+        const startupCommand = writeWorkerStartupScriptCommand(
+          sanitized,
+          workerIndex,
+          workerLaunchArgs,
+          workerCwd,
+          extraEnv,
+          workerCli,
+          undefined,
+          runtimeRole,
+        );
+        cmd = startupCommand ?? buildWorkerStartupCommand(
+          sanitized,
+          workerIndex,
+          workerLaunchArgs,
+          workerCwd,
+          extraEnv,
+          workerCli,
+          undefined,
+          runtimeRole,
+        );
+      } catch (error) {
+        return await rollbackScaleUp(
+          `scale_up_worker_preparation_failed:${workerName}:${error instanceof Error ? error.message : String(error)}`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
       }
-      const cmd = startupCommand ?? buildWorkerStartupCommand(
-        sanitized,
-        workerIndex,
-        workerLaunchArgs,
-        workerCwd,
-        extraEnv,
-        workerCli,
-        undefined,
-        runtimeRole,
-      );
 
       // Find the right-most worker pane to split from, or fall back to leader pane.
       // Keep the initial split from leader horizontal to preserve the leader-left
@@ -1140,6 +1146,36 @@ export async function scaleDown(
       typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
     ));
     unresolvedWorkersForRecovery = unresolvedWorkers;
+    const resolvedWorkerNames = new Set(removedWorkers.map((worker) => worker.name));
+    const reconciledTaskArtifacts = new Map<string, Buffer>();
+    try {
+      const tasksAfterTeardown = await listTasks(sanitized, leaderCwd);
+      for (const task of tasksAfterTeardown) {
+        if (task.status === 'completed' || task.status === 'failed') continue;
+        const claimedBy = task.claim?.owner;
+        if (!resolvedWorkerNames.has(task.owner ?? '') && !(claimedBy && resolvedWorkerNames.has(claimedBy))) continue;
+        const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`);
+        reconciledTaskArtifacts.set(taskPath, await readFile(taskPath));
+        const updated = await updateTask(sanitized, task.id, {
+          owner: undefined,
+          claim: undefined,
+          status: task.status === 'in_progress' ? 'pending' : task.status,
+        }, leaderCwd);
+        if (!updated) throw new Error(`task_not_found:${task.id}`);
+      }
+    } catch (error) {
+      try {
+        await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
+          await writeFile(taskPath, raw);
+        }));
+      } catch (restoreError) {
+        await restorePriorWorkerStatuses(targetWorkers);
+        return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(restoreError)}` };
+      }
+      await restorePriorWorkerStatuses(targetWorkers);
+      return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
+    }
+
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = removedWorkers
       .filter((worker) =>
         worker.worktree_created === true
@@ -1180,18 +1216,6 @@ export async function scaleDown(
     }
 
     removedNames.push(...removedWorkers.map((worker) => worker.name));
-    const resolvedWorkerNames = new Set(removedWorkers.map((worker) => worker.name));
-    const tasksAfterTeardown = await listTasks(sanitized, leaderCwd);
-    for (const task of tasksAfterTeardown) {
-      if (task.status === 'completed' || task.status === 'failed') continue;
-      const claimedBy = task.claim?.owner;
-      if (!resolvedWorkerNames.has(task.owner ?? '') && !(claimedBy && resolvedWorkerNames.has(claimedBy))) continue;
-      await updateTask(sanitized, task.id, {
-        owner: undefined,
-        claim: undefined,
-        status: task.status === 'in_progress' ? 'pending' : task.status,
-      }, leaderCwd);
-    }
     const removedSet = new Set(removedNames);
     config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
     config.worker_count = config.workers.length;
