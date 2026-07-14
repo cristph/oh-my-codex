@@ -1059,18 +1059,15 @@ printf '%s\\n' "$@" > '${capturePath}'
       );
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.match(result.error, /scale_up_rollback_pane_proof_unavailable:%31:malformed_snapshot/);
+      assert.match(result.error, /scale_up_rollback_cleanup_debt:pane_proof_unavailable:%31:malformed_snapshot/);
 
       const config = await readTeamConfig('scale-up-owner-tag-rollback', cwd);
-      assert.equal(config?.workers.length, 2);
-      assert.equal(config?.workers[1]?.pane_id, '%31');
-      assert.equal(config?.next_worker_index, 3);
-      assert.equal((await readTask('scale-up-owner-tag-rollback', '1', cwd))?.owner, 'worker-2');
-      const identity = JSON.parse(await readFile(
+      assert.equal(config?.workers.length, 1);
+      assert.equal(config?.next_worker_index, 2);
+      assert.equal(await readTask('scale-up-owner-tag-rollback', '1', cwd), null);
+      assert.equal(existsSync(
         join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'workers', 'worker-2', 'identity.json'),
-        'utf-8',
-      )) as { pane_id?: string };
-      assert.equal(identity.pane_id, '%31');
+      ), false);
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
@@ -2616,44 +2613,17 @@ esac
         { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
       );
 
-      assert.deepEqual(result, {
-        ok: false,
-        error: 'scale_up_rollback_pane_teardown_failed:%31,%32',
-      });
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /^scale_up_rollback_cleanup_debt:.*pane_teardown_failed:%31,%32/);
       assert.equal(await readFile(splitCountPath, 'utf-8'), '2');
       const config = await readTeamConfig('rollback-kill-fail', cwd);
-      const worker = config?.workers.find((candidate) => candidate.name === 'worker-2');
-      assert.equal(worker?.pane_id, '%31');
-      assert.equal(worker?.index, 2);
-      assert.equal(config?.worker_count, 3);
-      assert.equal(config?.next_worker_index, 4);
-      const identity = JSON.parse(await readFile(
-        join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-2', 'identity.json'),
-        'utf-8',
-      )) as { pane_id?: string };
-      assert.equal(identity.pane_id, '%31');
-      assert.equal((await readTask('rollback-kill-fail', '1', cwd))?.owner, 'worker-2');
-      const secondWorker = config?.workers.find((candidate) => candidate.name === 'worker-3');
-      assert.equal(secondWorker?.pane_id, '%32');
-      assert.equal(secondWorker?.index, 3);
-      const secondIdentity = JSON.parse(await readFile(
-        join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'identity.json'),
-        'utf-8',
-      )) as { pane_id?: string };
-      assert.equal(secondIdentity.pane_id, '%32');
-      assert.equal((await readTask('rollback-kill-fail', '2', cwd))?.owner, 'worker-3');
-      assert.equal(config?.workers.some((candidate) => candidate.name === 'worker-4'), false);
+      assert.deepEqual(config?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.equal(config?.worker_count, 1);
+      assert.equal(config?.next_worker_index, 2);
+      assert.equal(await readTask('rollback-kill-fail', '1', cwd), null);
+      assert.equal(await readTask('rollback-kill-fail', '2', cwd), null);
       assert.equal(await readTask('rollback-kill-fail', '3', cwd), null);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-4')), false);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'runtime', 'worker-4-startup.sh')), false);
-      const worker4WorktreePath = join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-4');
-      assert.equal(existsSync(worker4WorktreePath), false);
-      assert.equal(existsSync(join(worker4WorktreePath, 'AGENTS.md')), false);
-      assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-2', 'AGENTS.md')), true);
-      assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', 'worker-3', 'AGENTS.md')), true);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-2', 'identity.json')), true);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'identity.json')), true);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'inbox.md')), true);
+      // P2: retry execution of recorded cleanup debt is intentionally a follow-up surface.
       const tmuxCommands: string[] = await readScaleUpTmuxLogCommands(tmuxLogPath);
       const mutationCommands = tmuxCommands
         .filter((command) => command.startsWith('split-window ') || command.startsWith('kill-pane '))
@@ -2847,6 +2817,32 @@ describe('scaleDown', () => {
       if (!result.ok) {
         assert.match(result.error, /Not enough idle workers/);
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('serializes a concurrent claim across the canonical scale-down boundary', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-claim-boundary-'));
+    try {
+      await initTeamState('claim-boundary', 'task', 'executor', 2, cwd);
+      const task = await createTask('claim-boundary', {
+        subject: 'boundary task', description: 'must not be claimed by a removed worker', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const down = scaleDown('claim-boundary', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+        OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS: '100',
+      });
+      const lockPath = join(cwd, '.omx', 'state', 'team', 'claim-boundary', 'claims', `task-${task.id}.lock`);
+      for (let attempt = 0; attempt < 50 && !existsSync(lockPath); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(lockPath), true);
+      const claim = claimTask('claim-boundary', task.id, 'worker-2', task.version ?? 1, cwd);
+      assert.deepEqual(await down, { ok: true, removedWorkers: ['worker-2'], newWorkerCount: 1 });
+      assert.deepEqual(await claim, { ok: false, error: 'claim_conflict' });
+      const reconciled = await readTask('claim-boundary', task.id, cwd);
+      assert.equal(reconciled?.owner, undefined);
+      assert.equal(reconciled?.claim, undefined);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -3063,7 +3059,6 @@ exit 0
       if (!config) return;
       config.workers[1]!.pane_id = '%13';
       await saveTeamConfig(config, cwd);
-      const priorConfig = structuredClone(config);
 
       const priorStatus = {
         state: 'idle' as const,
@@ -3079,14 +3074,11 @@ exit 0
         { workerNames: ['worker-2'], force: true },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      assert.deepEqual(result, {
-        ok: false,
-        error: 'scale_down_pane_teardown_failed:%13',
-      });
-
-      const preserved = await readTeamConfig('kill-fail', cwd);
-      assert.deepEqual(preserved, priorConfig);
-      assert.deepEqual(await readWorkerStatus('kill-fail', 'worker-2', cwd), priorStatus);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
+      const committed = await readTeamConfig('kill-fail', cwd);
+      assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), false);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
@@ -3200,8 +3192,6 @@ esac
       }, cwd);
       const resolvedClaim = await claimTask('success-proof-loss', resolvedTask.id, 'worker-2', resolvedTask.version ?? 1, cwd);
       assert.equal(resolvedClaim.ok, true);
-      const unresolvedTaskPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'tasks', `task-${unresolvedTask.id}.json`);
-      const unresolvedTaskRaw = await readFile(unresolvedTaskPath, 'utf-8');
       const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-3', 'status.json');
       const worker3Raw = '{"reason":"three",\n"updated_at":"2026-07-14T00:00:01.000Z", "state":"idle"}\n';
@@ -3214,17 +3204,16 @@ esac
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
 
-      assert.deepEqual(result, { ok: false, error: 'scale_down_pane_proof_unavailable:%14:query_failed' });
-      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-3']);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_proof_unavailable:%14:query_failed/);
+      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker2StatusPath), false);
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-2')), false);
-      assert.equal(await readFile(worker3StatusPath, 'utf-8'), worker3Raw);
+      assert.equal(existsSync(worker3StatusPath), false);
       assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, undefined);
-      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, undefined);
       const reclaimedTask = await readTask('success-proof-loss', resolvedTask.id, cwd);
       assert.equal(reclaimedTask?.status, 'pending');
       assert.equal(reclaimedTask?.claim, undefined);
-      assert.equal(await readFile(unresolvedTaskPath, 'utf-8'), unresolvedTaskRaw);
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
@@ -3273,12 +3262,9 @@ esac
       }, cwd);
       const resolvedClaim = await claimTask('gone-kill-fail', resolvedTask.id, 'worker-2', resolvedTask.version ?? 1, cwd);
       assert.equal(resolvedClaim.ok, true);
-      const unresolvedTaskPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'tasks', `task-${unresolvedTask.id}.json`);
-      const unresolvedTaskRaw = await readFile(unresolvedTaskPath, 'utf-8');
       const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-3', 'status.json');
-      const worker3Raw = '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n';
-      await writeFile(worker3StatusPath, worker3Raw);
+      await writeFile(worker3StatusPath, '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n');
 
       const result = await scaleDown(
         'gone-kill-fail',
@@ -3287,16 +3273,16 @@ esac
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
 
-      assert.deepEqual(result, { ok: false, error: 'scale_down_pane_teardown_failed:%14' });
-      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-3']);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%14/);
+      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker2StatusPath), false);
-      assert.equal(await readFile(worker3StatusPath, 'utf-8'), worker3Raw);
+      assert.equal(existsSync(worker3StatusPath), false);
       assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, undefined);
-      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, undefined);
       const reclaimedTask = await readTask('gone-kill-fail', resolvedTask.id, cwd);
       assert.equal(reclaimedTask?.status, 'pending');
       assert.equal(reclaimedTask?.claim, undefined);
-      assert.equal(await readFile(unresolvedTaskPath, 'utf-8'), unresolvedTaskRaw);
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
@@ -3351,12 +3337,9 @@ esac
           { workerNames: ['worker-2'], force: true },
           { OMX_TEAM_SCALING_ENABLED: '1' },
         );
-        assert.deepEqual(result, { ok: false, error: 'scale_down_pane_teardown_failed:%13' });
-        if (priorRaw === undefined) {
-          assert.equal(existsSync(statusPath), false);
-        } else {
-          assert.deepEqual(await readFile(statusPath), Buffer.from(priorRaw));
-        }
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
+        assert.equal(existsSync(statusPath), false);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;

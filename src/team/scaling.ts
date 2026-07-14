@@ -43,7 +43,7 @@ import {
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
   teamListTasks as listTasks,
-  teamUpdateTask as updateTask,
+  teamReadTask as readTask,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
@@ -51,6 +51,7 @@ import {
   type TeamTask,
   type WorkerInfo,
   type WorkerStatus,
+  writeAtomic,
 } from './team-ops.js';
 import {
   queueInboxInstruction,
@@ -87,6 +88,8 @@ import {
   type PlannedWorktreeTarget,
   type WorktreeMode,
 } from './worktree.js';
+import { withTaskClaimLock } from './state/locks.js';
+
 
 import {
   buildApprovedTeamHandoffSection,
@@ -97,6 +100,42 @@ import {
   readPersistedTeamUltragoalContext,
   renderLeaderOwnedUltragoalContextSection,
 } from './ultragoal-context.js';
+
+const TASK_CLAIM_LOCK_STALE_MS = 5 * 60 * 1000;
+
+async function withTaskClaimLocks<T>(
+  teamName: string,
+  taskIds: readonly string[],
+  cwd: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const uniqueTaskIds = [...new Set(taskIds)].sort((left, right) => Number(left) - Number(right));
+  const teamDir = (name: string, lockCwd: string) => join(resolveCanonicalTeamStateRoot(lockCwd), 'team', name);
+  const locks = {
+    teamDir,
+    taskClaimLockDir: (name: string, taskId: string, lockCwd: string) => (
+      join(teamDir(name, lockCwd), 'claims', `task-${taskId}.lock`)
+    ),
+    mailboxLockDir: (name: string, workerName: string, lockCwd: string) => (
+      join(teamDir(name, lockCwd), 'mailbox', `.lock-${workerName}`)
+    ),
+  };
+  const acquire = async (index: number): Promise<T> => {
+    if (index >= uniqueTaskIds.length) return await fn();
+    const taskId = uniqueTaskIds[index]!;
+    const locked = await withTaskClaimLock(
+      teamName,
+      taskId,
+      cwd,
+      TASK_CLAIM_LOCK_STALE_MS,
+      locks,
+      async () => await acquire(index + 1),
+    );
+    if (!locked.ok) throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
+    return locked.value;
+  };
+  return await acquire(0);
+}
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
@@ -502,176 +541,90 @@ export async function scaleUp(
 
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
-    const createdTaskOwnerById = new Map<string, string | undefined>();
 
     const provisionedWorktrees: EnsureWorktreeResult[] = [];
     const preparedWorkerDirectoryOwner = new Map<string, string>();
     const preparedStartupScriptOwner = new Map<string, string>();
-    const preparedWorktreeOwner = new Map<string, string>();
     const runtimeDirectoryPath = join(teamStateRoot, 'team', sanitized, 'runtime');
     const runtimeDirectoryExisted = existsSync(runtimeDirectoryPath);
     const rollbackScaleUp = async (
       error: string,
       context: { paneId?: string; worker?: WorkerInfo; workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
-      const rollbackPaneIds = [
-        ...addedWorkers.map((worker) => worker.pane_id),
-        context.paneId,
-      ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
-      const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
-        leaderPaneId: config.leader_pane_id,
-        hudPaneId: config.hud_pane_id,
-      });
-      const firstUnavailablePaneId = paneTeardown.proofUnavailable[0]?.paneId;
-      const processedPaneIds = firstUnavailablePaneId
-        ? paneTeardown.attemptedPaneIds.slice(0, paneTeardown.attemptedPaneIds.indexOf(firstUnavailablePaneId))
-        : paneTeardown.attemptedPaneIds;
-      const successfullyRemovedPaneIds = new Set([
-        ...paneTeardown.provenGonePaneIds,
-        ...processedPaneIds.filter((paneId) => !paneTeardown.kill.failedPaneIds.includes(paneId)),
-      ]);
       const rollbackWorkers = [...new Map(
         [...addedWorkers, context.worker]
           .filter((worker): worker is WorkerInfo => Boolean(worker))
           .map((worker): [string, WorkerInfo] => [worker.name, worker]),
       ).values()];
-      const safelyRemovedWorkers = rollbackWorkers.filter((worker) => (
-        typeof worker.pane_id === 'string' && successfullyRemovedPaneIds.has(worker.pane_id)
-      ));
-      const safelyRemovedWorkerNames = new Set(safelyRemovedWorkers.map((worker) => worker.name));
-      const safelyRemovedWorktreePaths = new Set(
-        safelyRemovedWorkers
-          .map((worker) => worker.worktree_path)
-          .filter((worktreePath): worktreePath is string => typeof worktreePath === 'string'),
-      );
-      const cleanupSafelyRemovedWorkers = async (): Promise<void> => {
-        const safelyRemovedWorktrees = provisionedWorktrees.filter((worktree) => (
-          safelyRemovedWorktreePaths.has(worktree.worktreePath)
-        ));
-        if (safelyRemovedWorktrees.length > 0) {
-          await rollbackProvisionedWorktrees(safelyRemovedWorktrees);
+      const rollbackWorkerNames = new Set(rollbackWorkers.map((worker) => worker.name));
+
+      // Make the rollback authoritative before touching any fallible resource.
+      // Orphaned panes/worktrees are retry debt, never a reason to retain half-added members.
+      try {
+        for (const taskId of createdTaskIds) {
+          await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
         }
-        await Promise.all(safelyRemovedWorkers.map(async (worker) => {
-          if (worker.worktree_path) {
-            await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
+        config.workers = config.workers.filter((worker) => !rollbackWorkerNames.has(worker.name));
+        config.worker_count = config.workers.length;
+        config.next_worker_index = initialNextIndex;
+        config.worktree_mode = initialWorktreeMode;
+        await saveTeamConfig(config, leaderCwd);
+        const committed = await readTeamConfig(sanitized, leaderCwd);
+        if (!committed || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))) {
+          throw new Error('canonical_scale_up_rollback_config_verification_failed');
+        }
+        for (const taskId of createdTaskIds) {
+          if (await readTask(sanitized, taskId, leaderCwd)) {
+            throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
           }
-          await rm(join(teamStateRoot, 'team', sanitized, 'workers', worker.name), { recursive: true, force: true });
-          await rm(join(runtimeDirectoryPath, `worker-${worker.index}-startup.sh`), { force: true });
-        }));
-      };
-      for (const worker of safelyRemovedWorkers) {
-        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
-        if (idx >= 0) config.workers.splice(idx, 1);
+        }
+      } catch (rollbackError) {
+        return { ok: false, error: `scale_up_rollback_persistence_failed:${String(rollbackError)}` };
       }
 
-      const failedPaneIds = paneTeardown.kill.failedPaneIds;
-      const unresolvedWorkers = rollbackWorkers.filter((worker) => (
-        typeof worker.pane_id === 'string' && !successfullyRemovedPaneIds.has(worker.pane_id)
-      ));
-      const unresolvedWorkerNames = new Set(unresolvedWorkers.map((worker) => worker.name));
-      if (failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
-        await cleanupSafelyRemovedWorkers();
-        const preparedOwners = new Set([
-          ...preparedWorkerDirectoryOwner.values(),
-          ...preparedStartupScriptOwner.values(),
-          ...preparedWorktreeOwner.values(),
-        ]);
-        const removablePreparedOwners = new Set(
-          [...preparedOwners].filter((owner) => !unresolvedWorkerNames.has(owner)),
-        );
-        for (const worktree of provisionedWorktrees) {
-          const owner = preparedWorktreeOwner.get(worktree.worktreePath);
-          if (!owner || !removablePreparedOwners.has(owner)) continue;
-          await removeWorkerWorktreeRootAgentsFile(
-            sanitized,
-            owner,
-            teamStateRoot,
-            worktree.worktreePath,
-          ).catch(() => {});
-        }
-        const removableWorktrees = provisionedWorktrees.filter((worktree) => {
-          const owner = preparedWorktreeOwner.get(worktree.worktreePath);
-          return Boolean(owner && removablePreparedOwners.has(owner) && !safelyRemovedWorktreePaths.has(worktree.worktreePath));
+      const cleanupDebt: string[] = [];
+      const rollbackPaneIds = [
+        ...rollbackWorkers.map((worker) => worker.pane_id),
+        context.paneId,
+      ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
+      try {
+        const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
+          leaderPaneId: config.leader_pane_id,
+          hudPaneId: config.hud_pane_id,
         });
-        if (removableWorktrees.length > 0) await rollbackProvisionedWorktrees(removableWorktrees);
+        if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
+        if (paneTeardown.proofUnavailable.length > 0) {
+          cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
+        }
+      } catch (cleanupError) {
+        cleanupDebt.push(`pane_cleanup_exception:${String(cleanupError)}`);
+      }
+      try {
+        const contextWorkerName = context.worker?.name ?? context.workerName;
+        const contextWorktreePath = context.worker?.worktree_path ?? context.worktreePath;
+        if (contextWorkerName && contextWorktreePath) {
+          await removeWorkerWorktreeRootAgentsFile(sanitized, contextWorkerName, teamStateRoot, contextWorktreePath);
+        }
+        await rollbackProvisionedWorktrees(provisionedWorktrees);
         await Promise.all([...preparedWorkerDirectoryOwner.keys()].map(async (workerDirPath) => {
-          const owner = preparedWorkerDirectoryOwner.get(workerDirPath);
-          if (owner && removablePreparedOwners.has(owner)) {
-            await rm(workerDirPath, { recursive: true, force: true });
-          }
+          await rm(workerDirPath, { recursive: true, force: true });
         }));
         await Promise.all([...preparedStartupScriptOwner.keys()].map(async (startupScriptPath) => {
-          const owner = preparedStartupScriptOwner.get(startupScriptPath);
-          if (owner && removablePreparedOwners.has(owner)) await rm(startupScriptPath, { force: true });
+          await rm(startupScriptPath, { force: true });
         }));
-        for (const taskId of createdTaskIds) {
-          if (unresolvedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
-          await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+        if (!runtimeDirectoryExisted) await rm(runtimeDirectoryPath, { recursive: true, force: true });
+      } catch (cleanupError) {
+        cleanupDebt.push(`resource_cleanup_failed:${String(cleanupError)}`);
+      }
+      if (cleanupDebt.length > 0) {
+        const reason = `scale_up_rollback_cleanup_debt:${cleanupDebt.join(';')}; retry cleanup for [${[...rollbackWorkerNames].join(',')}]`;
+        try {
+          await appendTeamEvent(sanitized, { type: 'team_leader_nudge', worker: 'leader-fixed', reason }, leaderCwd);
+        } catch (eventError) {
+          cleanupDebt.push(`cleanup_debt_event_failed:${String(eventError)}`);
         }
-        for (const worker of unresolvedWorkers) {
-          if (!config.workers.some((candidate) => candidate.name === worker.name)) {
-            config.workers.push(worker);
-          }
-          await writeWorkerIdentity(sanitized, worker.name, worker, leaderCwd);
-        }
-        config.worker_count = config.workers.length;
-        config.next_worker_index = Math.max(
-          initialNextIndex,
-          ...config.workers.map((worker) => worker.index + 1),
-        );
-        await saveTeamConfig(config, leaderCwd);
-        if (failedPaneIds.length > 0) {
-          return { ok: false, error: `scale_up_rollback_pane_teardown_failed:${failedPaneIds.join(',')}` };
-        }
-        const unavailable = paneTeardown.proofUnavailable
-          .map((proof) => `${proof.paneId}:${proof.reason}`)
-          .join(',');
-        return { ok: false, error: `scale_up_rollback_pane_proof_unavailable:${unavailable}` };
+        return { ok: false, error: `scale_up_rollback_cleanup_debt:${cleanupDebt.join(';')}` };
       }
-
-      await cleanupSafelyRemovedWorkers();
-      for (const worker of addedWorkers) {
-        if (safelyRemovedWorkerNames.has(worker.name)) continue;
-        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
-        if (idx >= 0) config.workers.splice(idx, 1);
-      }
-
-      const contextWorkerName = context.worker?.name ?? context.workerName;
-      const contextWorktreePath = context.worker?.worktree_path ?? context.worktreePath;
-      if (
-        contextWorkerName
-        && contextWorktreePath
-        && !rollbackWorkers.some((worker) => worker.name === contextWorkerName)
-      ) {
-        await removeWorkerWorktreeRootAgentsFile(
-          sanitized,
-          contextWorkerName,
-          teamStateRoot,
-          contextWorktreePath,
-        ).catch(() => {});
-      }
-      await rollbackProvisionedWorktrees(provisionedWorktrees.filter((worktree) => (
-        !safelyRemovedWorktreePaths.has(worktree.worktreePath)
-      )));
-      await Promise.all([...preparedWorkerDirectoryOwner.keys()].map(async (workerDirPath) => {
-        await rm(workerDirPath, { recursive: true, force: true });
-      }));
-      await Promise.all([...preparedStartupScriptOwner.keys()].map(async (startupScriptPath) => {
-        await rm(startupScriptPath, { force: true });
-      }));
-      if (!runtimeDirectoryExisted) {
-        await rm(runtimeDirectoryPath, { recursive: true, force: true });
-      }
-
-      for (const taskId of createdTaskIds) {
-        await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
-      }
-
-      config.worker_count = config.workers.length;
-      config.next_worker_index = initialNextIndex;
-      config.worktree_mode = initialWorktreeMode;
-      await saveTeamConfig(config, leaderCwd);
-
       return { ok: false, error };
     };
 
@@ -689,7 +642,6 @@ export async function scaleUp(
           role: task.role,
         }, leaderCwd);
         createdTaskIds.push(createdTask.id);
-        createdTaskOwnerById.set(createdTask.id, createdTask.owner);
       }
       materializedTasks = await listTasks(sanitized, leaderCwd);
     } catch (error) {
@@ -761,13 +713,11 @@ export async function scaleUp(
             if (recoveredWorkspace) {
               workerWorkspace = recoveredWorkspace;
               provisionedWorktrees.push(recoveredWorkspace);
-              preparedWorktreeOwner.set(recoveredWorkspace.worktreePath, workerName);
             }
             throw error;
           }
           if (!workerWorkspace) throw new Error(`worktree_not_provisioned:${workerName}`);
           provisionedWorktrees.push(workerWorkspace);
-          preparedWorktreeOwner.set(workerWorkspace.worktreePath, workerName);
           throwIfScaleUpFailureInjected(env, 'worktree-post-create');
           workerCwd = workerWorkspace.worktreePath;
         }
@@ -1212,8 +1162,6 @@ export async function scaleDown(
       }));
     };
 
-    let unresolvedWorkersForRecovery: readonly WorkerInfo[] = targetWorkers;
-    try {
 
 
     // Phase 1: Set workers to 'draining' status
@@ -1242,89 +1190,80 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: Prepare and lock task reconciliation before irreversible pane teardown.
-    // Keep the exact bytes so unresolved workers can be restored after a mixed teardown.
-    const reconciledTaskArtifacts = new Map<string, Buffer>();
-    const reconciledTaskOwners = new Map<string, Set<string>>();
+    // Phase 3: hold the exact claim locks used by claimTask until task ownership
+    // and worker membership are durably committed. A claimant can therefore only
+    // observe the old owner before this boundary or the reconciled task afterward.
+    const targetWorkerNames = new Set(targetWorkers.map((worker) => worker.name));
+    const candidateTaskIds = (await listTasks(sanitized, leaderCwd))
+      .filter((task) => task.status !== 'completed' && task.status !== 'failed')
+      .map((task) => task.id);
     try {
-      const tasksBeforeTeardown = await listTasks(sanitized, leaderCwd);
-      const targetWorkerNames = new Set(targetWorkers.map((worker) => worker.name));
-      for (const task of tasksBeforeTeardown) {
-        if (task.status === 'completed' || task.status === 'failed') continue;
-        const owners = new Set([task.owner, task.claim?.owner].filter((owner): owner is string => (
-          typeof owner === 'string' && owner.length > 0 && targetWorkerNames.has(owner)
-        )));
-        if (owners.size === 0) continue;
-        const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`);
-        reconciledTaskArtifacts.set(taskPath, await readFile(taskPath));
-        reconciledTaskOwners.set(taskPath, owners);
-        const updated = await updateTask(sanitized, task.id, {
-          owner: undefined,
-          claim: undefined,
-          status: task.status === 'in_progress' ? 'pending' : task.status,
-        }, leaderCwd);
-        if (!updated) throw new Error(`task_not_found:${task.id}`);
-      }
+      await withTaskClaimLocks(sanitized, candidateTaskIds, leaderCwd, async () => {
+        const lockedTasks = await listTasks(sanitized, leaderCwd);
+        const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
+        if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
+        }
+        for (const task of lockedTasks) {
+          if (task.status === 'completed' || task.status === 'failed') continue;
+          if (!targetWorkerNames.has(task.owner ?? '') && !targetWorkerNames.has(task.claim?.owner ?? '')) continue;
+          const reconciledTask: TeamTask = {
+            ...task,
+            owner: undefined,
+            claim: undefined,
+            status: task.status === 'in_progress' ? 'pending' : task.status,
+            version: Math.max(1, task.version ?? 1) + 1,
+          };
+          await writeAtomic(
+            join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`),
+            JSON.stringify(reconciledTask, null, 2),
+          );
+        }
+        const removedSet = new Set(targetWorkers.map((worker) => worker.name));
+        config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
+        config.worker_count = config.workers.length;
+        await saveTeamConfig(config, leaderCwd);
+        const committed = await readTeamConfig(sanitized, leaderCwd);
+        if (!committed || committed.workers.some((worker) => removedSet.has(worker.name))) {
+          throw new Error('canonical_scale_down_config_verification_failed');
+        }
+        for (const taskId of candidateTaskIds) {
+          const reconciled = await listTasks(sanitized, leaderCwd);
+          const task = reconciled.find((candidate) => candidate.id === taskId);
+          if (task && (targetWorkerNames.has(task.owner ?? '') || targetWorkerNames.has(task.claim?.owner ?? ''))) {
+            throw new Error(`canonical_scale_down_task_verification_failed:${taskId}`);
+          }
+        }
+      });
     } catch (error) {
-      try {
-        await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
-          await writeFile(taskPath, raw);
-        }));
-      } catch (restoreError) {
-        await restorePriorWorkerStatuses(targetWorkers);
-        return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(restoreError)}` };
-      }
       await restorePriorWorkerStatuses(targetWorkers);
       return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
     }
 
-    // Phase 4: Kill tmux panes only after all task updates have been validated.
-    const leaderPaneId = config.leader_pane_id;
-    const hudPaneId = config.hud_pane_id;
+    // Phase 4: cleanup is deliberately after the canonical commit. Failures are
+    // durable retry debt: removed workers and their task ownership are never put back.
+    removedNames.push(...targetWorkers.map((worker) => worker.name));
+    const cleanupDebt: string[] = [];
     const targetPaneIds = targetWorkers
-      .map((w) => w.pane_id)
+      .map((worker) => worker.pane_id)
       .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
-      leaderPaneId,
-      hudPaneId,
-    });
-    const firstUnavailablePaneId = paneTeardown.proofUnavailable[0]?.paneId;
-    const processedPaneIds = firstUnavailablePaneId
-      ? paneTeardown.attemptedPaneIds.slice(0, paneTeardown.attemptedPaneIds.indexOf(firstUnavailablePaneId))
-      : paneTeardown.attemptedPaneIds;
-    const resolvedPaneIds = new Set([
-      ...paneTeardown.provenGonePaneIds,
-      ...processedPaneIds.filter((paneId) => !paneTeardown.kill.failedPaneIds.includes(paneId)),
-    ]);
-    const removedWorkers = targetWorkers.filter((worker) => (
-      !worker.pane_id || resolvedPaneIds.has(worker.pane_id)
-    ));
-    const unresolvedWorkers = targetWorkers.filter((worker) => (
-      typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
-    ));
-    unresolvedWorkersForRecovery = unresolvedWorkers;
-    const unresolvedWorkerNames = new Set(unresolvedWorkers.map((worker) => worker.name));
     try {
-      await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
-        const owners = reconciledTaskOwners.get(taskPath);
-        if (owners && [...owners].some((owner) => unresolvedWorkerNames.has(owner))) {
-          await writeFile(taskPath, raw);
-        }
-      }));
+      const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
+        leaderPaneId: config.leader_pane_id,
+        hudPaneId: config.hud_pane_id,
+      });
+      if (paneTeardown.kill.failedPaneIds.length > 0) {
+        cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
+      }
+      if (paneTeardown.proofUnavailable.length > 0) {
+        cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
+      }
     } catch (error) {
-      await restorePriorWorkerStatuses(unresolvedWorkers);
-      return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(error)}` };
+      cleanupDebt.push(`pane_cleanup_exception:${String(error)}`);
     }
-
-    const detachedWorktreesToRollback: EnsureWorktreeResult[] = removedWorkers
-      .filter((worker) =>
-        worker.worktree_created === true
-        && worker.worktree_detached === true
-        && typeof worker.worktree_repo_root === 'string'
-        && worker.worktree_repo_root.length > 0
-        && typeof worker.worktree_path === 'string'
-        && worker.worktree_path.length > 0,
-      )
+    const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
+      .filter((worker) => worker.worktree_created === true && worker.worktree_detached === true
+        && typeof worker.worktree_repo_root === 'string' && typeof worker.worktree_path === 'string')
       .map((worker) => ({
         enabled: true,
         repoRoot: worker.worktree_repo_root as string,
@@ -1336,60 +1275,33 @@ export async function scaleDown(
         createdBranch: false,
       }));
     try {
-      if (detachedWorktreesToRollback.length > 0) {
-        await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
-      }
-      await Promise.all(removedWorkers.map(async (worker) => {
+      if (detachedWorktreesToRollback.length > 0) await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
+      await Promise.all(targetWorkers.map(async (worker) => {
         if (worker.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(
             sanitized,
             worker.name,
             worker.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
             worker.worktree_path,
-          ).catch(() => {});
+          );
         }
         await rm(join(teamStateRoot, 'team', sanitized, 'workers', worker.name), { recursive: true, force: true });
       }));
     } catch (error) {
-      await restorePriorWorkerStatuses(unresolvedWorkers);
-      return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
+      cleanupDebt.push(`resource_cleanup_failed:${String(error)}`);
     }
-
-    removedNames.push(...removedWorkers.map((worker) => worker.name));
-    const removedSet = new Set(removedNames);
-    config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
-    config.worker_count = config.workers.length;
-    await saveTeamConfig(config, leaderCwd);
-    await restorePriorWorkerStatuses(unresolvedWorkers);
-
-    if (paneTeardown.kill.failedPaneIds.length > 0) {
-      return {
-        ok: false,
-        error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
-      };
-    }
-    if (paneTeardown.proofUnavailable.length > 0) {
-      const unavailable = paneTeardown.proofUnavailable
-        .map((proof) => `${proof.paneId}:${proof.reason}`)
-        .join(',');
-      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
-    }
-
-    await appendTeamEvent(sanitized, {
-      type: 'team_leader_nudge',
-      worker: 'leader-fixed',
-      reason: `scale_down: removed ${removedNames.length} worker(s) [${removedNames.join(', ')}], new count=${config.worker_count}`,
-    }, leaderCwd);
-
-    return {
-      ok: true,
-      removedWorkers: removedNames,
-      newWorkerCount: config.worker_count,
-    };
+    const reason = cleanupDebt.length > 0
+      ? `scale_down_cleanup_debt:${cleanupDebt.join(';')}; retry cleanup for [${removedNames.join(',')}]`
+      : `scale_down: removed ${removedNames.length} worker(s) [${removedNames.join(', ')}], new count=${config.worker_count}`;
+    try {
+      await appendTeamEvent(sanitized, { type: 'team_leader_nudge', worker: 'leader-fixed', reason }, leaderCwd);
     } catch (error) {
-      await restorePriorWorkerStatuses(unresolvedWorkersForRecovery);
-      throw error;
+      cleanupDebt.push(`cleanup_debt_event_failed:${String(error)}`);
     }
+    if (cleanupDebt.length > 0) {
+      return { ok: false, error: `scale_down_cleanup_debt:${cleanupDebt.join(';')}` };
+    }
+    return { ok: true, removedWorkers: removedNames, newWorkerCount: config.worker_count };
   });
 }
 
