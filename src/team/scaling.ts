@@ -11,7 +11,7 @@
  */
 
 import { join, resolve } from 'path';
-import { mkdir, rm } from 'fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import {
   sanitizeTeamName,
@@ -478,6 +478,30 @@ export async function scaleUp(
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
 
+      const failedPaneIds = paneTeardown.kill.failedPaneIds;
+      if (failedPaneIds.length > 0) {
+        const failedPaneIdSet = new Set(failedPaneIds);
+        const failedWorkersByName = new Map<string, WorkerInfo>();
+        for (const worker of [...addedWorkers, context.worker].filter((worker): worker is WorkerInfo => Boolean(worker))) {
+          if (typeof worker.pane_id === 'string' && failedPaneIdSet.has(worker.pane_id)) {
+            failedWorkersByName.set(worker.name, worker);
+          }
+        }
+        for (const worker of failedWorkersByName.values()) {
+          if (!config.workers.some((candidate) => candidate.name === worker.name)) {
+            config.workers.push(worker);
+          }
+          await writeWorkerIdentity(sanitized, worker.name, worker, leaderCwd);
+        }
+        config.worker_count = config.workers.length;
+        config.next_worker_index = Math.max(
+          initialNextIndex,
+          ...config.workers.map((worker) => worker.index + 1),
+        );
+        await saveTeamConfig(config, leaderCwd);
+        return { ok: false, error: `scale_up_rollback_pane_teardown_failed:${failedPaneIds.join(',')}` };
+      }
+
       if (paneTeardown.proofUnavailable.length > 0) {
         if (context.worker && !config.workers.some((worker) => worker.name === context.worker!.name)) {
           config.workers.push(context.worker);
@@ -935,6 +959,7 @@ export async function scaleDown(
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
+    const teamStateRoot = config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd);
 
     // Determine which workers to remove
     let targetWorkers: WorkerInfo[];
@@ -987,18 +1012,32 @@ export async function scaleDown(
 
     const sessionName = config.tmux_session;
     const removedNames: string[] = [];
-    const priorWorkerStatuses = new Map<string, WorkerStatus>();
+    const priorWorkerStatusArtifacts = new Map<string, { exists: true; raw: Buffer } | { exists: false }>();
     for (const worker of targetWorkers) {
-      priorWorkerStatuses.set(worker.name, await readWorkerStatus(sanitized, worker.name, leaderCwd));
+      const statusPath = join(teamStateRoot, 'team', sanitized, 'workers', worker.name, 'status.json');
+      try {
+        priorWorkerStatusArtifacts.set(worker.name, { exists: true, raw: await readFile(statusPath) });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          priorWorkerStatusArtifacts.set(worker.name, { exists: false });
+        } else {
+          throw error;
+        }
+      }
     }
     const restorePriorWorkerStatuses = async (): Promise<void> => {
       await Promise.all(targetWorkers.map(async (worker) => {
-        const priorStatus = priorWorkerStatuses.get(worker.name);
-        if (priorStatus) {
-          await writeWorkerStatus(sanitized, worker.name, priorStatus, leaderCwd);
+        const statusPath = join(teamStateRoot, 'team', sanitized, 'workers', worker.name, 'status.json');
+        const priorArtifact = priorWorkerStatusArtifacts.get(worker.name);
+        if (priorArtifact?.exists) {
+          await writeFile(statusPath, priorArtifact.raw);
+        } else {
+          await rm(statusPath, { force: true });
         }
       }));
     };
+
+    try {
 
 
     // Phase 1: Set workers to 'draining' status
@@ -1103,7 +1142,11 @@ export async function scaleDown(
       ok: true,
       removedWorkers: removedNames,
       newWorkerCount: config.worker_count,
-    };
+      };
+    } catch (error) {
+      await restorePriorWorkerStatuses();
+      throw error;
+    }
   });
 }
 
