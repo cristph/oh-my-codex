@@ -40,6 +40,9 @@ import {
   teamReadWorkerStatus as readWorkerStatus,
   teamWriteWorkerStatus as writeWorkerStatus,
   teamWithScalingLock as withScalingLock,
+  teamWithTaskMembershipBarrier as withTaskMembershipBarrier,
+  recoverTeamMembershipTaskTransaction,
+  commitTeamMembershipTaskTransaction,
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
   teamListTasks as listTasks,
@@ -47,11 +50,11 @@ import {
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
+  teamRemoveDispatchRequestsForWorkers as removeDispatchRequestsForWorkers,
   type TeamConfig,
   type TeamTask,
   type WorkerInfo,
   type WorkerStatus,
-  writeAtomic,
 } from './team-ops.js';
 import {
   queueInboxInstruction,
@@ -457,6 +460,7 @@ export async function scaleUp(
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
+    const originalConfig = JSON.parse(JSON.stringify(config)) as TeamConfig;
 
     const maxWorkers = config.max_workers;
     const currentCount = config.workers.length;
@@ -533,7 +537,6 @@ export async function scaleUp(
       };
     }
 
-    const initialWorktreeMode = config.worktree_mode;
     const effectiveWorktreeMode = config.worktree_mode ?? resolveScaleUpWorktreeMode(config);
     if (!config.worktree_mode && effectiveWorktreeMode.enabled) {
       config.worktree_mode = effectiveWorktreeMode;
@@ -558,39 +561,31 @@ export async function scaleUp(
       ).values()];
       const rollbackWorkerNames = new Set(rollbackWorkers.map((worker) => worker.name));
 
-      // Make the rollback authoritative before touching any fallible resource.
-      // Orphaned panes/worktrees are retry debt, never a reason to retain half-added members.
+      // Restore and verify original config/manifest membership before any worker
+      // artifact deletion. Subsequent failures are retryable cleanup debt only.
+      try {
+        await saveTeamConfig(originalConfig, leaderCwd);
+        const committed = await readTeamConfig(sanitized, leaderCwd);
+        if (!committed || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))) {
+          throw new Error('canonical_scale_up_rollback_config_verification_failed');
+        }
+        Object.assign(config, originalConfig);
+      } catch (rollbackError) {
+        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(rollbackError)}` };
+      }
+
+      const cleanupDebt: string[] = [];
       try {
         for (const taskId of createdTaskIds) {
           await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
         }
-        // Inbox, identity, status, and dispatch state are canonical worker state.
-        // Remove it before attempting any fallible pane or worktree cleanup.
         await Promise.all([...new Set([
           ...rollbackWorkers.map((worker) => worker.name),
           context.workerName,
         ].filter((workerName): workerName is string => Boolean(workerName)))].map(async (workerName) => {
           await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
         }));
-        const dispatchPath = join(teamStateRoot, 'team', sanitized, 'dispatch', 'requests.json');
-        try {
-          const requests = JSON.parse(await readFile(dispatchPath, 'utf8')) as Array<{ to_worker?: string }>;
-          await writeAtomic(
-            dispatchPath,
-            JSON.stringify(requests.filter((request) => !rollbackWorkerNames.has(request.to_worker ?? '')), null, 2),
-          );
-        } catch (dispatchError) {
-          if ((dispatchError as NodeJS.ErrnoException).code !== 'ENOENT') throw dispatchError;
-        }
-        config.workers = config.workers.filter((worker) => !rollbackWorkerNames.has(worker.name));
-        config.worker_count = config.workers.length;
-        config.next_worker_index = initialNextIndex;
-        config.worktree_mode = initialWorktreeMode;
-        await saveTeamConfig(config, leaderCwd);
-        const committed = await readTeamConfig(sanitized, leaderCwd);
-        if (!committed || committed.workers.some((worker) => rollbackWorkerNames.has(worker.name))) {
-          throw new Error('canonical_scale_up_rollback_config_verification_failed');
-        }
+        await removeDispatchRequestsForWorkers(sanitized, [...rollbackWorkerNames], leaderCwd);
         for (const taskId of createdTaskIds) {
           if (await readTask(sanitized, taskId, leaderCwd)) {
             throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
@@ -602,10 +597,9 @@ export async function scaleUp(
           }
         }
       } catch (rollbackError) {
-        return { ok: false, error: `scale_up_rollback_persistence_failed:${String(rollbackError)}` };
+        cleanupDebt.push(`canonical_cleanup_failed:${String(rollbackError)}`);
       }
 
-      const cleanupDebt: string[] = [];
       const rollbackPaneIds = [
         ...rollbackWorkers.map((worker) => worker.pane_id),
         context.paneId,
@@ -1103,7 +1097,10 @@ export async function scaleDown(
   const drainTimeoutMs = options.drainTimeoutMs ?? 30_000;
 
   return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleDownResult | ScaleError> => {
-    const config = await readTeamConfig(sanitized, leaderCwd);
+    const config = await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+      await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+      return await readTeamConfig(sanitized, leaderCwd);
+    });
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
@@ -1224,12 +1221,14 @@ export async function scaleDown(
       return { ok: false, error: `scale_down_proof_unavailable:${proofUnavailableWorkers.map((worker) => worker.pane_id ?? worker.name).join(',')}` };
     }
     const removableWorkerNames = new Set(removableWorkers.map((worker) => worker.name));
-    const candidateTaskIds = (await listTasks(sanitized, leaderCwd))
-      .filter((task) => task.status !== 'completed' && task.status !== 'failed')
-      .map((task) => task.id);
     try {
-      await withTaskClaimLocks(sanitized, candidateTaskIds, leaderCwd, async () => {
-        // Rescan under the same claim barrier claimTask obeys.
+      await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+        await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+        const candidateTaskIds = (await listTasks(sanitized, leaderCwd))
+          .filter((task) => task.status !== 'completed' && task.status !== 'failed')
+          .map((task) => task.id);
+        await withTaskClaimLocks(sanitized, candidateTaskIds, leaderCwd, async () => {
+          // The membership barrier remains held through this snapshot and commit.
         const lockedTasks = await listTasks(sanitized, leaderCwd);
         const configPath = join(teamStateRoot, 'team', sanitized, 'config.json');
         const configSnapshot = await readFile(configPath);
@@ -1243,43 +1242,55 @@ export async function scaleDown(
         }
         const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
         if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
-        try {
-          for (const [index, task] of reconciledTasks.entries()) {
-            await writeAtomic(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`), JSON.stringify({
-              ...task, owner: undefined, claim: undefined,
+        const currentConfig = JSON.parse(configSnapshot.toString('utf8')) as TeamConfig;
+        const nextConfig: TeamConfig = {
+          ...currentConfig,
+          workers: currentConfig.workers.filter((worker) => !removableWorkerNames.has(worker.name)),
+        };
+        nextConfig.worker_count = nextConfig.workers.length;
+        const nextManifest = manifestSnapshot
+          ? JSON.stringify({
+            ...(JSON.parse(manifestSnapshot.toString('utf8')) as Record<string, unknown>),
+            workers: nextConfig.workers,
+            worker_count: nextConfig.worker_count,
+          }, null, 2)
+          : null;
+        await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+          tasks: reconciledTasks.map((task) => ({
+            taskId: task.id,
+            oldBytes: taskSnapshots.get(task.id)?.toString('utf8') ?? null,
+            newBytes: JSON.stringify({
+              ...task,
+              owner: undefined,
+              claim: undefined,
               status: task.status === 'in_progress' ? 'pending' : task.status,
               version: Math.max(1, task.version ?? 1) + 1,
-            } satisfies TeamTask, null, 2));
-            if (index === 0 && env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write') {
-              throw new Error('injected_scale_down_failure:after-first-task-write');
-            }
-          }
-          config.workers = config.workers.filter((worker) => !removableWorkerNames.has(worker.name));
-          config.worker_count = config.workers.length;
-          await saveTeamConfig(config, leaderCwd);
-          const committed = await readTeamConfig(sanitized, leaderCwd);
-          if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) throw new Error('canonical_scale_down_config_verification_failed');
-          for (const task of reconciledTasks) {
-            const reconciled = await readTask(sanitized, task.id, leaderCwd);
-            if (reconciled && (removableWorkerNames.has(reconciled.owner ?? '') || removableWorkerNames.has(reconciled.claim?.owner ?? ''))) {
-              throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
-            }
-          }
-        } catch (commitError) {
-          await Promise.all([...taskSnapshots.entries()].map(async ([taskId, snapshot]) => {
-            await writeAtomic(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), snapshot.toString('utf8'));
-          }));
-          await writeAtomic(configPath, configSnapshot.toString('utf8'));
-          if (manifestSnapshot) await writeAtomic(manifestPath, manifestSnapshot.toString('utf8'));
-          else await rm(manifestPath, { force: true });
-          if (!(await readFile(configPath)).equals(configSnapshot)) throw new Error('canonical_scale_down_rollback_config_verification_failed');
-          for (const [taskId, snapshot] of taskSnapshots) {
-            if (!(await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`))).equals(snapshot)) {
-              throw new Error(`canonical_scale_down_rollback_task_verification_failed:${taskId}`);
-            }
-          }
-          throw commitError;
+            } satisfies TeamTask, null, 2),
+          })),
+          config: {
+            oldBytes: configSnapshot.toString('utf8'),
+            newBytes: JSON.stringify(nextConfig, null, 2),
+          },
+          manifest: {
+            oldBytes: manifestSnapshot?.toString('utf8') ?? null,
+            newBytes: nextManifest,
+          },
+          interruptAfterFirstTaskWrite: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write',
+          failRollbackPersistence: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'rollback-persistence-failure',
+        });
+        const committed = await readTeamConfig(sanitized, leaderCwd);
+        if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) {
+          throw new Error('canonical_scale_down_config_verification_failed');
         }
+        config.workers = committed.workers;
+        config.worker_count = committed.worker_count;
+        for (const task of reconciledTasks) {
+          const reconciled = await readTask(sanitized, task.id, leaderCwd);
+          if (reconciled && (removableWorkerNames.has(reconciled.owner ?? '') || removableWorkerNames.has(reconciled.claim?.owner ?? ''))) {
+            throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
+          }
+        }
+      });
       });
     } catch (error) {
       await restorePriorWorkerStatuses(removableWorkers);

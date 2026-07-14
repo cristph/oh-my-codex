@@ -94,6 +94,7 @@ export { readDispatchRequest as teamReadDispatchRequest } from './state.js';
 export { transitionDispatchRequest as teamTransitionDispatchRequest } from './state.js';
 export { markDispatchRequestNotified as teamMarkDispatchRequestNotified } from './state.js';
 export { markDispatchRequestDelivered as teamMarkDispatchRequestDelivered } from './state.js';
+export { removeDispatchRequestsForWorkers as teamRemoveDispatchRequestsForWorkers } from './state.js';
 
 // === Events ===
 export { appendTeamEvent as teamAppendEvent } from './state.js';
@@ -124,6 +125,12 @@ export { writeWorkerStatus as teamWriteWorkerStatus } from './state.js';
 
 // === Scaling lock ===
 export { withScalingLock as teamWithScalingLock } from './state.js';
+export { withTeamTaskBarrier as teamWithTaskMembershipBarrier } from './state.js';
+export {
+  recoverTeamMembershipTaskTransaction,
+  commitTeamMembershipTaskTransaction,
+  type TeamMembershipTaskTransaction,
+} from './state.js';
 
 // === Dispatch lock helpers ===
 export { resolveDispatchLockTimeoutMs } from './state.js';

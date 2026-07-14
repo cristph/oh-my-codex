@@ -16,6 +16,7 @@ import {
   readWorkerStatus,
   writeWorkerStatus,
   withScalingLock,
+  recoverTeamMembershipTaskTransaction,
   DEFAULT_MAX_WORKERS,
 } from '../state.js';
 import { isScalingEnabled, scaleUp, scaleDown } from '../scaling.js';
@@ -3201,7 +3202,7 @@ esac
     }
   });
 
-  it('restores all canonical task and config bytes after a mid-commit scale-down failure', async () => {
+  it('converges entirely old or entirely new after a mid-commit scale-down interruption', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-atomic-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-atomic-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3218,17 +3219,21 @@ esac
       await saveTeamConfig(config, cwd);
       const first = await createTask('atomic-down', { subject: 'first', description: 'first', status: 'pending', owner: 'worker-2' }, cwd);
       const second = await createTask('atomic-down', { subject: 'second', description: 'second', status: 'pending', owner: 'worker-2' }, cwd);
-      const stateRoot = join(cwd, '.omx', 'state', 'team', 'atomic-down');
-      const configRaw = await readFile(join(stateRoot, 'config.json'));
-      const firstRaw = await readFile(join(stateRoot, 'tasks', `task-${first.id}.json`));
-      const secondRaw = await readFile(join(stateRoot, 'tasks', `task-${second.id}.json`));
       const result = await scaleDown('atomic-down', cwd, { workerNames: ['worker-2'], force: true }, {
         OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SCALE_DOWN_INJECT_FAILURE: 'after-first-task-write',
       });
-      assert.match(result.ok ? '' : result.error, /injected_scale_down_failure:after-first-task-write/);
-      assert.deepEqual(await readFile(join(stateRoot, 'config.json')), configRaw);
-      assert.deepEqual(await readFile(join(stateRoot, 'tasks', `task-${first.id}.json`)), firstRaw);
-      assert.deepEqual(await readFile(join(stateRoot, 'tasks', `task-${second.id}.json`)), secondRaw);
+      assert.match(result.ok ? '' : result.error, /injected_scale_down_interruption:after-first-task-write/);
+      await recoverTeamMembershipTaskTransaction('atomic-down', cwd);
+      const recoveredConfig = await readTeamConfig('atomic-down', cwd);
+      const recoveredFirst = await readTask('atomic-down', first.id, cwd);
+      const recoveredSecond = await readTask('atomic-down', second.id, cwd);
+      const convergedOld = recoveredConfig?.workers.some((worker) => worker.name === 'worker-2') === true
+        && recoveredFirst?.owner === 'worker-2'
+        && recoveredSecond?.owner === 'worker-2';
+      const convergedNew = recoveredConfig?.workers.some((worker) => worker.name === 'worker-2') === false
+        && recoveredFirst?.owner === undefined
+        && recoveredSecond?.owner === undefined;
+      assert.equal(convergedOld || convergedNew, true);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

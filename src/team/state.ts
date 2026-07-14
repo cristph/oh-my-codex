@@ -775,6 +775,119 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
   }
 }
 
+type MembershipTransactionFile = {
+  path: string;
+  oldBytes: string | null;
+  newBytes: string | null;
+};
+
+type MembershipTransactionJournal = {
+  schemaVersion: 1;
+  phase: 'prepared' | 'committed';
+  files: MembershipTransactionFile[];
+};
+
+export type TeamMembershipTaskTransaction = {
+  tasks: Array<{ taskId: string; oldBytes: string | null; newBytes: string | null }>;
+  config: { oldBytes: string; newBytes: string };
+  manifest?: { oldBytes: string | null; newBytes: string | null };
+  interruptAfterFirstTaskWrite?: boolean;
+  failRollbackPersistence?: boolean;
+};
+
+function membershipTransactionPath(teamName: string, cwd: string): string {
+  return join(teamDir(teamName, cwd), '.membership-task-transaction.json');
+}
+
+async function applyMembershipTransactionFiles(files: readonly MembershipTransactionFile[], useNewBytes: boolean): Promise<void> {
+  for (const file of files) {
+    const bytes = useNewBytes ? file.newBytes : file.oldBytes;
+    if (bytes === null) await rm(file.path, { force: true });
+    else await writeAtomic(file.path, bytes);
+  }
+}
+
+/**
+ * Resolve an interrupted membership/task commit before a reader or writer observes
+ * its files. Prepared transactions roll back; committed transactions roll forward.
+ */
+export async function recoverTeamMembershipTaskTransaction(teamName: string, cwd: string): Promise<void> {
+  const journalPath = membershipTransactionPath(teamName, cwd);
+  let journal: MembershipTransactionJournal;
+  try {
+    journal = JSON.parse(await readFile(journalPath, 'utf8')) as MembershipTransactionJournal;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (journal.schemaVersion !== 1 || (journal.phase !== 'prepared' && journal.phase !== 'committed') || !Array.isArray(journal.files)) {
+    throw new Error(`Invalid membership transaction journal for ${teamName}`);
+  }
+  await applyMembershipTransactionFiles(journal.files, journal.phase === 'committed');
+  await rm(journalPath, { force: true });
+}
+
+/**
+ * Persist config/manifest and task membership changes as an old-or-new journaled
+ * generation. Callers must hold the team membership barrier for the whole call.
+ */
+export async function commitTeamMembershipTaskTransaction(
+  teamName: string,
+  cwd: string,
+  transaction: TeamMembershipTaskTransaction,
+): Promise<void> {
+  const files: MembershipTransactionFile[] = [
+    ...transaction.tasks.map((task) => ({
+      path: taskFilePath(teamName, task.taskId, cwd),
+      oldBytes: task.oldBytes,
+      newBytes: task.newBytes,
+    })),
+    {
+      path: teamConfigPath(teamName, cwd),
+      oldBytes: transaction.config.oldBytes,
+      newBytes: transaction.config.newBytes,
+    },
+  ];
+  if (transaction.manifest) {
+    files.push({
+      path: teamManifestV2Path(teamName, cwd),
+      oldBytes: transaction.manifest.oldBytes,
+      newBytes: transaction.manifest.newBytes,
+    });
+  }
+  const journalPath = membershipTransactionPath(teamName, cwd);
+  const journal: MembershipTransactionJournal = { schemaVersion: 1, phase: 'prepared', files };
+  await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+  try {
+    if (transaction.interruptAfterFirstTaskWrite && transaction.tasks.length > 0) {
+      await applyMembershipTransactionFiles(files.slice(0, 1), true);
+      throw new Error('injected_scale_down_interruption:after-first-task-write');
+    }
+    if (transaction.failRollbackPersistence && transaction.tasks.length > 0) {
+      await applyMembershipTransactionFiles(files.slice(0, 1), true);
+      throw new Error('injected_scale_down_failure:rollback-persistence-failure');
+    }
+    await applyMembershipTransactionFiles(files, true);
+    journal.phase = 'committed';
+    await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+    await rm(journalPath, { force: true });
+  } catch (error) {
+    if (
+      (error instanceof Error && error.message === 'injected_scale_down_interruption:after-first-task-write')
+      || transaction.failRollbackPersistence
+    ) throw error;
+    // Leave the prepared marker durable if restoring old bytes also fails. Entry
+    // recovery will retry until the state has converged to the old generation.
+    try {
+      await applyMembershipTransactionFiles(files, false);
+      await rm(journalPath, { force: true });
+    } catch {
+      // The prepared journal is the durable recovery authority.
+    }
+    throw error;
+  }
+}
+
 // Initialize team state directory + config.json
 // Creates: .omx/state/team/{name}/, workers/{worker-1}..{worker-N}/, tasks/
 // Throws if workerCount > maxWorkers (default 20)
@@ -1272,6 +1385,14 @@ async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<
   return await withTeamLockImpl(teamName, cwd, LOCK_STALE_MS, { teamDir, taskClaimLockDir, mailboxLockDir }, fn);
 }
 
+/**
+ * Serializes membership snapshots with task creation and claims. Lock order is
+ * this barrier first, then task claim locks; scale-down follows the same order.
+ */
+export async function withTeamTaskBarrier<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
+  return await withTeamLock(teamName, cwd, fn);
+}
+
 async function withTaskClaimLock<T>(
   teamName: string,
   taskId: string,
@@ -1296,7 +1417,8 @@ export async function createTask(
   task: Omit<TeamTask, 'id' | 'created_at'>,
   cwd: string
 ): Promise<TeamTaskV2> {
-  return withTeamLock(teamName, cwd, async () => {
+  return withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
     const cfg = await readTeamConfig(teamName, cwd);
     if (!cfg) throw new Error(`Team ${teamName} not found`);
 
@@ -1397,16 +1519,19 @@ export async function claimTask(
   expectedVersion: number | null,
   cwd: string
 ): Promise<ClaimTaskResult> {
-  return await claimTaskImpl(taskId, workerName, expectedVersion, {
-    teamName,
-    cwd,
-    readTask,
-    readTeamConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus,
-    taskFilePath,
-    writeAtomic,
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await claimTaskImpl(taskId, workerName, expectedVersion, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+    });
   });
 }
 
@@ -1627,6 +1752,23 @@ export function resolveDispatchLockTimeoutMs(env: NodeJS.ProcessEnv = process.en
 
 async function withDispatchLock<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
   return await withDispatchLockImpl(teamName, cwd, teamDir, dispatchLockDir, fn);
+}
+
+/** Remove worker-targeted dispatch requests under the authoritative dispatch lock. */
+export async function removeDispatchRequestsForWorkers(
+  teamName: string,
+  workerNames: readonly string[],
+  cwd: string,
+): Promise<void> {
+  const names = new Set(workerNames);
+  await withDispatchLock(teamName, cwd, async () => {
+    const retained = (await readDispatchRequests(teamName, cwd)).filter((request) => !names.has(request.to_worker));
+    await writeDispatchRequests(teamName, retained, cwd);
+    const remaining = await readDispatchRequests(teamName, cwd);
+    if (remaining.some((request) => names.has(request.to_worker))) {
+      throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
+    }
+  });
 }
 
 export async function enqueueDispatchRequest(
