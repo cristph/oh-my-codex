@@ -46,6 +46,8 @@ import {
   readMonitorSnapshot,
   resolveDispatchLockTimeoutMs,
   writeTeamManifestV2,
+  removeDispatchRequestsForWorkers,
+
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { claimTask as claimTaskWithDeps } from '../state/tasks.js';
@@ -114,6 +116,8 @@ if (argv[0] === 'schema') {
       'mark-delivered',
       'mark-failed',
       'request-replay',
+      'remove-dispatch-records',
+
       'capture-snapshot',
     ],
     events: [],
@@ -181,6 +185,18 @@ switch (command.command) {
     process.stdout.write(JSON.stringify({ event: 'DispatchFailed', request_id: command.request_id, reason: command.reason }) + '\\n');
     process.exit(0);
   }
+  case 'RemoveDispatchRecords': {
+    const ids = new Set(command.request_ids || []);
+    dispatch.records = dispatch.records.filter((entry) => !ids.has(entry.request_id));
+    writeJson(dispatchPath, dispatch);
+    process.stdout.write(JSON.stringify({ event: 'DispatchRecordsRemoved', request_ids: command.request_ids || [] }) + '\\n');
+    process.exit(0);
+  }
+  case 'CaptureSnapshot': {
+    process.stdout.write(JSON.stringify({ event: 'SnapshotCaptured' }) + '\\n');
+    process.exit(0);
+  }
+
   case 'CreateMailboxMessage': {
     mailbox.records.push({
       message_id: command.message_id,
@@ -526,6 +542,57 @@ exit 1
     } finally {
       if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
       else delete process.env.OMX_RUNTIME_BINARY;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('scopes bridge rollback IDs to the target team legacy file and preserves same-target foreign records', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-rollback-scope-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+
+    try {
+      await initTeamState('team-rollback-a', 't', 'executor', 1, cwd);
+      await initTeamState('team-rollback-b', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+
+
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      const scopedRequest = await enqueueDispatchRequest('team-rollback-a', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        trigger_message: 'rollback scoped request',
+      }, cwd);
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const teamRoot = join(cwd, '.omx', 'state', 'team');
+      const legacyPath = join(teamRoot, 'team-rollback-a', 'dispatch', 'requests.json');
+      const rootDispatchPath = join(cwd, '.omx', 'state', 'dispatch.json');
+      const scopedRequestId = scopedRequest.request.request_id;
+      await writeFile(rootDispatchPath, JSON.stringify({ records: [
+        { request_id: scopedRequestId, target: 'worker-1', status: 'pending', created_at: new Date().toISOString(), notified_at: null, delivered_at: null, failed_at: null, reason: null, metadata: { team_name: 'team-rollback-a' } },
+        { request_id: 'team-b-worker-1', target: 'worker-1', status: 'pending', created_at: new Date().toISOString(), notified_at: null, delivered_at: null, failed_at: null, reason: null, metadata: { team_name: 'team-rollback-b' } },
+        { request_id: 'unscoped-worker-1', target: 'worker-1', status: 'pending', created_at: new Date().toISOString(), notified_at: null, delivered_at: null, failed_at: null, reason: null, metadata: null },
+      ] }, null, 2));
+
+      await removeDispatchRequestsForWorkers('team-rollback-a', ['worker-1'], cwd);
+
+      assert.deepEqual(JSON.parse(await readFile(legacyPath, 'utf8')), []);
+      const runtimeLog = await readFile(runtimeLogPath, 'utf8');
+      const removalLine = runtimeLog.split('\n').find((line) => line.startsWith('exec {"command":"RemoveDispatchRecords"'));
+      assert.ok(removalLine);
+      const removalPayload = JSON.parse(removalLine.slice(removalLine.indexOf('{'), removalLine.lastIndexOf(' --state-dir='))) as { request_ids: string[] };
+      assert.deepEqual(removalPayload.request_ids, [scopedRequestId]);
+      assert.match(runtimeLog, /CaptureSnapshot/);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
       await rm(cwd, { recursive: true, force: true });
     }
   });
