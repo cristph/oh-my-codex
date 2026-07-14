@@ -2682,6 +2682,85 @@ esac
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+
+  for (const phase of ['identity', 'inbox', 'config'] as const) {
+    it(`rolls back live pane and materialized state when ${phase} materialization fails`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-scale-up-${phase}-failure-`));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), `omx-scale-up-${phase}-failure-bin-`));
+      const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+      const previousPath = process.env.PATH;
+      try {
+        await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+        const teamName = `scale-up-${phase}-failure`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: `${phase} rollback`, description: 'must be removed', owner: 'worker-2' }],
+          cwd,
+          {
+            OMX_TEAM_SCALING_ENABLED: '1',
+            OMX_TEAM_SKIP_READY_WAIT: '1',
+            OMX_TEAM_SCALE_UP_INJECT_FAILURE: phase,
+          },
+        );
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.match(result.error, new RegExp(`scale_up_worker_materialization_failed:worker-2:.*${phase}`));
+        assert.equal((await readTeamConfig(teamName, cwd))?.workers.length, 1);
+        assert.equal(await readTask(teamName, '1', cwd), null);
+        assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2')), false);
+        assert.equal(existsSync(workerStartupScriptPath(cwd, teamName, 'worker-2')), false);
+        const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.ok(tmuxCommands.some((command) => command.startsWith('split-window ')));
+        assert.ok(tmuxCommands.includes('kill-pane -t %31'));
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
+    });
+  }
+  it('rolls back a named worktree created before injected ensure bookkeeping fails', async () => {
+    const repo = await initRepo();
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-named-post-create-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    const teamName = 'named-post-create-failure';
+    const branchName = 'feature/named-post-create/worker-2';
+    const worktreePath = join(repo, '.omx', 'team', teamName, 'worktrees', 'worker-2');
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState(teamName, 'task', 'executor', 1, repo, undefined, process.env, {
+        workspace_mode: 'worktree',
+        leader_cwd: repo,
+        team_state_root: join(repo, '.omx', 'state'),
+        worktree_mode: { enabled: true, detached: false, name: 'feature/named-post-create' },
+      });
+      await configureScaleUpTeamForDirectDispatch(teamName, repo);
+      const result = await scaleUp(teamName, 1, 'executor', [], repo, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+        OMX_TEAM_SKIP_READY_WAIT: '1',
+        OMX_TEAM_SCALE_UP_INJECT_FAILURE: 'worktree-ensure-post-create',
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /scale_up_worker_preparation_failed:worker-2:.*worktree-ensure-post-create/);
+      assert.equal(existsSync(worktreePath), false);
+      assert.throws(() => execFileSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], { cwd: repo }));
+      assert.equal((await readTeamConfig(teamName, repo))?.workers.length, 1);
+      assert.equal(existsSync(join(repo, '.omx', 'state', 'team', teamName, 'workers', 'worker-2')), false);
+      assert.deepEqual((await readScaleUpTmuxLogCommands(tmuxLogPath)).filter((command) => command.startsWith('split-window ')), []);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(repo, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('scaleDown', () => {
@@ -3020,7 +3099,7 @@ exit 0
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
-  it('preserves workers, resources, and exact task artifacts when task reconciliation fails after pane teardown', async () => {
+  it('aborts before pane teardown and preserves exact state when task reconciliation cannot acquire a lock', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-task-reconcile-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-task-reconcile-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3038,6 +3117,7 @@ esac
 `,
       );
       await chmod(tmuxStubPath, 0o755);
+      await writeFile(tmuxLogPath, '');
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
       await initTeamState('task-reconcile-fail', 'task', 'executor', 2, cwd);
       const config = await readTeamConfig('task-reconcile-fail', cwd);
@@ -3070,9 +3150,7 @@ esac
       assert.equal(await readFile(taskPath, 'utf-8'), taskRaw);
       assert.equal(await readFile(firstTaskPath, 'utf-8'), firstTaskRaw);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'workers', 'worker-2')), true);
-      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-      ]);
+      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), []);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

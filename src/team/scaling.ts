@@ -84,8 +84,10 @@ import {
   planWorktreeTarget,
   rollbackProvisionedWorktrees,
   type EnsureWorktreeResult,
+  type PlannedWorktreeTarget,
   type WorktreeMode,
 } from './worktree.js';
+
 import {
   buildApprovedTeamHandoffSection,
   resolvePersistedApprovedTeamExecutionContinuityState,
@@ -213,6 +215,71 @@ function buildScaleUpWorkerLaunchPlans(params: {
 
 function resolveInstructionStateRoot(worktreePath?: string | null): string | undefined {
   return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
+}
+
+function throwIfScaleUpFailureInjected(env: NodeJS.ProcessEnv, phase: string): void {
+  if (env.OMX_TEAM_SCALE_UP_INJECT_FAILURE === phase) {
+    throw new Error(`injected_scale_up_failure:${phase}`);
+  }
+}
+
+function recoverCreatedWorktreeAfterEnsureFailure(
+  plan: PlannedWorktreeTarget,
+  worktreePathExistedBeforeEnsure: boolean,
+  branchExistedBeforeEnsure: boolean,
+): EnsureWorktreeResult | null {
+  if (worktreePathExistedBeforeEnsure || !existsSync(plan.worktreePath)) return null;
+
+  const commonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+    cwd: plan.worktreePath,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  const repoCommonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+    cwd: plan.repoRoot,
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (
+    commonDir.status !== 0
+    || repoCommonDir.status !== 0
+    || resolve(plan.worktreePath, (commonDir.stdout || '').trim())
+      !== resolve(plan.repoRoot, (repoCommonDir.stdout || '').trim())
+  ) {
+    return null;
+  }
+
+  if (plan.branchName) {
+    const branch = spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], {
+      cwd: plan.worktreePath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    if (branch.status !== 0 || (branch.stdout || '').trim() !== `refs/heads/${plan.branchName}`) return null;
+  } else {
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: plan.worktreePath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    const branch = spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], {
+      cwd: plan.worktreePath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    if (head.status !== 0 || branch.status === 0 || (head.stdout || '').trim() !== plan.baseRef) return null;
+  }
+
+  return {
+    enabled: true,
+    repoRoot: plan.repoRoot,
+    worktreePath: plan.worktreePath,
+    detached: plan.detached,
+    branchName: plan.branchName,
+    created: true,
+    reused: false,
+    createdBranch: Boolean(plan.branchName && !branchExistedBeforeEnsure),
+  };
 }
 
 interface ScaleUpApprovedExecutionGate {
@@ -610,19 +677,26 @@ export async function scaleUp(
 
     // Persist incoming tasks only after launch policy is frozen; the resulting
     // task listing is used for inbox and task materialization, never launch policy.
-    for (const task of tasks) {
-      const createdTask = await createStateTask(sanitized, {
-        subject: task.subject,
-        description: task.description,
-        status: 'pending',
-        owner: task.owner,
-        blocked_by: task.blocked_by,
-        role: task.role,
-      }, leaderCwd);
-      createdTaskIds.push(createdTask.id);
-      createdTaskOwnerById.set(createdTask.id, createdTask.owner);
+    let materializedTasks: TeamTask[];
+    try {
+      for (const task of tasks) {
+        const createdTask = await createStateTask(sanitized, {
+          subject: task.subject,
+          description: task.description,
+          status: 'pending',
+          owner: task.owner,
+          blocked_by: task.blocked_by,
+          role: task.role,
+        }, leaderCwd);
+        createdTaskIds.push(createdTask.id);
+        createdTaskOwnerById.set(createdTask.id, createdTask.owner);
+      }
+      materializedTasks = await listTasks(sanitized, leaderCwd);
+    } catch (error) {
+      return await rollbackScaleUp(
+        `scale_up_task_materialization_failed:${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    const materializedTasks = await listTasks(sanitized, leaderCwd);
 
     for (const workerLaunchPlan of workerLaunchPlans) {
       const {
@@ -657,18 +731,45 @@ export async function scaleUp(
         await mkdir(workerDirPath, { recursive: true });
 
         if (effectiveWorktreeMode.enabled) {
-          const ensuredWorkspace = ensureWorktree(planWorktreeTarget({
+          const worktreePlan = planWorktreeTarget({
             cwd: leaderCwd,
             scope: 'team',
             mode: effectiveWorktreeMode,
             teamName: sanitized,
             workerName,
-          }));
-          if (!ensuredWorkspace.enabled) throw new Error(`worktree_not_provisioned:${workerName}`);
-          workerWorkspace = ensuredWorkspace;
-          provisionedWorktrees.push(ensuredWorkspace);
-          preparedWorktreeOwner.set(ensuredWorkspace.worktreePath, workerName);
-          workerCwd = ensuredWorkspace.worktreePath;
+          });
+          if (!worktreePlan.enabled) throw new Error(`worktree_not_planned:${workerName}`);
+          const worktreePathExistedBeforeEnsure = existsSync(worktreePlan.worktreePath);
+          const branchExistedBeforeEnsure = worktreePlan.branchName
+            ? spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${worktreePlan.branchName}`], {
+                cwd: worktreePlan.repoRoot,
+                encoding: 'utf-8',
+                windowsHide: true,
+              }).status === 0
+            : false;
+          try {
+            const ensuredWorkspace = ensureWorktree(worktreePlan);
+            throwIfScaleUpFailureInjected(env, 'worktree-ensure-post-create');
+            if (!ensuredWorkspace.enabled) throw new Error(`worktree_not_provisioned:${workerName}`);
+            workerWorkspace = ensuredWorkspace;
+          } catch (error) {
+            const recoveredWorkspace = recoverCreatedWorktreeAfterEnsureFailure(
+              worktreePlan,
+              worktreePathExistedBeforeEnsure,
+              branchExistedBeforeEnsure,
+            );
+            if (recoveredWorkspace) {
+              workerWorkspace = recoveredWorkspace;
+              provisionedWorktrees.push(recoveredWorkspace);
+              preparedWorktreeOwner.set(recoveredWorkspace.worktreePath, workerName);
+            }
+            throw error;
+          }
+          if (!workerWorkspace) throw new Error(`worktree_not_provisioned:${workerName}`);
+          provisionedWorktrees.push(workerWorkspace);
+          preparedWorktreeOwner.set(workerWorkspace.worktreePath, workerName);
+          throwIfScaleUpFailureInjected(env, 'worktree-post-create');
+          workerCwd = workerWorkspace.worktreePath;
         }
 
         rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
@@ -803,8 +904,12 @@ export async function scaleUp(
       // Intentionally avoid forcing `select-layout tiled` here.
       // Tiled relayout reflows leader/HUD panes and breaks team window layout.
 
+      try {
+
 
       await writeWorkerIdentity(sanitized, workerName, workerInfo, leaderCwd);
+      throwIfScaleUpFailureInjected(env, 'identity');
+
 
       // Wait for worker readiness
       const readyTimeoutMs = resolveWorkerReadyTimeoutMs(env);
@@ -828,6 +933,8 @@ export async function scaleUp(
         approvedContextSection,
         workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
+      throwIfScaleUpFailureInjected(env, 'inbox');
+
 
       const triggerDirective = buildTriggerDirective(
         workerName,
@@ -958,14 +1065,28 @@ export async function scaleUp(
       config.workers.push(workerInfo);
       config.worker_count = config.workers.length;
       config.next_worker_index = nextIndex;
+      throwIfScaleUpFailureInjected(env, 'config');
+
       await saveTeamConfig(config, leaderCwd);
+      } catch (error) {
+        return await rollbackScaleUp(
+          `scale_up_worker_materialization_failed:${workerName}:${error instanceof Error ? error.message : String(error)}`,
+          { paneId, worker: workerInfo },
+        );
+      }
     }
 
-    await appendTeamEvent(sanitized, {
-      type: 'team_leader_nudge',
-      worker: 'leader-fixed',
-      reason: `scale_up: added ${count} worker(s), new count=${config.worker_count}`,
-    }, leaderCwd);
+    try {
+      await appendTeamEvent(sanitized, {
+        type: 'team_leader_nudge',
+        worker: 'leader-fixed',
+        reason: `scale_up: added ${count} worker(s), new count=${config.worker_count}`,
+      }, leaderCwd);
+    } catch (error) {
+      return await rollbackScaleUp(
+        `scale_up_finalization_failed:${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     return {
       ok: true,
@@ -1121,7 +1242,43 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: Kill tmux panes and remove from config
+    // Phase 3: Prepare and lock task reconciliation before irreversible pane teardown.
+    // Keep the exact bytes so unresolved workers can be restored after a mixed teardown.
+    const reconciledTaskArtifacts = new Map<string, Buffer>();
+    const reconciledTaskOwners = new Map<string, Set<string>>();
+    try {
+      const tasksBeforeTeardown = await listTasks(sanitized, leaderCwd);
+      const targetWorkerNames = new Set(targetWorkers.map((worker) => worker.name));
+      for (const task of tasksBeforeTeardown) {
+        if (task.status === 'completed' || task.status === 'failed') continue;
+        const owners = new Set([task.owner, task.claim?.owner].filter((owner): owner is string => (
+          typeof owner === 'string' && owner.length > 0 && targetWorkerNames.has(owner)
+        )));
+        if (owners.size === 0) continue;
+        const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`);
+        reconciledTaskArtifacts.set(taskPath, await readFile(taskPath));
+        reconciledTaskOwners.set(taskPath, owners);
+        const updated = await updateTask(sanitized, task.id, {
+          owner: undefined,
+          claim: undefined,
+          status: task.status === 'in_progress' ? 'pending' : task.status,
+        }, leaderCwd);
+        if (!updated) throw new Error(`task_not_found:${task.id}`);
+      }
+    } catch (error) {
+      try {
+        await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
+          await writeFile(taskPath, raw);
+        }));
+      } catch (restoreError) {
+        await restorePriorWorkerStatuses(targetWorkers);
+        return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(restoreError)}` };
+      }
+      await restorePriorWorkerStatuses(targetWorkers);
+      return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
+    }
+
+    // Phase 4: Kill tmux panes only after all task updates have been validated.
     const leaderPaneId = config.leader_pane_id;
     const hudPaneId = config.hud_pane_id;
     const targetPaneIds = targetWorkers
@@ -1146,34 +1303,17 @@ export async function scaleDown(
       typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
     ));
     unresolvedWorkersForRecovery = unresolvedWorkers;
-    const resolvedWorkerNames = new Set(removedWorkers.map((worker) => worker.name));
-    const reconciledTaskArtifacts = new Map<string, Buffer>();
+    const unresolvedWorkerNames = new Set(unresolvedWorkers.map((worker) => worker.name));
     try {
-      const tasksAfterTeardown = await listTasks(sanitized, leaderCwd);
-      for (const task of tasksAfterTeardown) {
-        if (task.status === 'completed' || task.status === 'failed') continue;
-        const claimedBy = task.claim?.owner;
-        if (!resolvedWorkerNames.has(task.owner ?? '') && !(claimedBy && resolvedWorkerNames.has(claimedBy))) continue;
-        const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`);
-        reconciledTaskArtifacts.set(taskPath, await readFile(taskPath));
-        const updated = await updateTask(sanitized, task.id, {
-          owner: undefined,
-          claim: undefined,
-          status: task.status === 'in_progress' ? 'pending' : task.status,
-        }, leaderCwd);
-        if (!updated) throw new Error(`task_not_found:${task.id}`);
-      }
-    } catch (error) {
-      try {
-        await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
+      await Promise.all([...reconciledTaskArtifacts].map(async ([taskPath, raw]) => {
+        const owners = reconciledTaskOwners.get(taskPath);
+        if (owners && [...owners].some((owner) => unresolvedWorkerNames.has(owner))) {
           await writeFile(taskPath, raw);
-        }));
-      } catch (restoreError) {
-        await restorePriorWorkerStatuses(targetWorkers);
-        return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(restoreError)}` };
-      }
-      await restorePriorWorkerStatuses(targetWorkers);
-      return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
+        }
+      }));
+    } catch (error) {
+      await restorePriorWorkerStatuses(unresolvedWorkers);
+      return { ok: false, error: `scale_down_task_reconciliation_restore_failed:${String(error)}` };
     }
 
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = removedWorkers
