@@ -815,6 +815,8 @@ export type TeamMembershipTaskTransaction = {
   manifest?: { oldBytes: string | null; newBytes: string | null };
   interruptAfterFirstTaskWrite?: boolean;
   failRollbackPersistence?: boolean;
+  /** Inject an interrupted rollback after the selected old-generation file write. */
+  failRollbackPersistenceAfter?: 'config' | 'manifest';
   /** Recovery must complete the new generation rather than restore old bytes. */
   recoverToNewOnFailure?: boolean;
 };
@@ -895,10 +897,10 @@ export async function commitTeamMembershipTaskTransaction(
       throw new Error('injected_scale_down_interruption:after-first-task-write');
     }
     await applyMembershipTransactionFiles(files, true);
-    if (transaction.failRollbackPersistence) {
+    if (transaction.failRollbackPersistence || transaction.failRollbackPersistenceAfter) {
       // Exercise the restore path after a complete new generation is visible.
-      // The catch below intentionally writes one OLD file then leaves the
-      // durable journal in place so public entry recovery owns convergence.
+      // The catch below intentionally writes OLD bytes then leaves the durable
+      // journal in place so public entry recovery owns convergence.
       throw new Error('injected_scale_down_failure:rollback-persistence-failure');
     }
     journal.phase = 'committed';
@@ -906,8 +908,13 @@ export async function commitTeamMembershipTaskTransaction(
     await removeAndSync(journalPath);
   } catch (error) {
     if (error instanceof Error && error.message === 'injected_scale_down_interruption:after-first-task-write') throw error;
-    if (transaction.failRollbackPersistence) {
-      await applyMembershipTransactionFiles(files.slice(0, 1), false);
+    if (transaction.failRollbackPersistence || transaction.failRollbackPersistenceAfter) {
+      const target = transaction.failRollbackPersistenceAfter;
+      const targetIndex = target ? files.findIndex((file) => file.path === (target === 'config'
+        ? teamConfigPath(teamName, cwd)
+        : teamManifestV2Path(teamName, cwd))) : 0;
+      const partial = files.slice(0, Math.max(1, targetIndex + 1));
+      await applyMembershipTransactionFiles(partial, false);
       throw error;
     }
     if (transaction.recoverToNewOnFailure) {
@@ -1852,45 +1859,26 @@ export async function removeDispatchRequestsForWorkers(
     const removedRequestIds = requests
       .filter((request) => names.has(request.to_worker))
       .map((request) => request.request_id);
-    let authoritativeRemovalPerformed = false;
     if (isBridgeEnabled() && removedRequestIds.length > 0) {
       const stateDir = resolveBridgeStateDir(cwd);
       const bridge = getDefaultBridge(stateDir);
-      let eventBackedIds: string[] = [];
-      try {
-        const events = JSON.parse(await readFile(join(stateDir, 'events.json'), 'utf8')) as unknown[];
-        const eventRequestIds = new Set<string>();
-        const collectRequestIds = (value: unknown): void => {
-          if (!value || typeof value !== 'object') return;
-          if ('request_id' in value && typeof (value as { request_id?: unknown }).request_id === 'string') {
-            eventRequestIds.add((value as { request_id: string }).request_id);
-          }
-          for (const nested of Object.values(value)) collectRequestIds(nested);
-        };
-        for (const event of events) collectRequestIds(event);
-        eventBackedIds = removedRequestIds.filter((requestId) => eventRequestIds.has(requestId));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const removal = bridge.removeDispatchRecords(removedRequestIds);
+      if (
+        removal.event !== 'DispatchRecordsRemoved'
+        || removedRequestIds.some((requestId) => !removal.request_ids.includes(requestId))
+      ) {
+        throw new Error(`authoritative_dispatch_rollback_command_failed:${[...names].join(',')}`);
       }
-      const authoritativeIds = eventBackedIds;
-      if (authoritativeIds.length > 0) {
-        const removal = bridge.removeDispatchRecords(authoritativeIds);
-        if (removal.event !== 'DispatchRecordsRemoved' || removal.request_ids.some((requestId) => !authoritativeIds.includes(requestId))) {
-          throw new Error(`authoritative_dispatch_rollback_command_failed:${[...names].join(',')}`);
-        }
-        const remainingAuthoritative = bridge.readDispatchRecords();
-        if (remainingAuthoritative.some((record) => authoritativeIds.includes(record.request_id))) {
-          throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
-        }
-        authoritativeRemovalPerformed = true;
+      const remainingAuthoritative = bridge.readDispatchRecords();
+      if (remainingAuthoritative.some((record) => removedRequestIds.includes(record.request_id))) {
+        throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
     }
     // The legacy per-team request file is compatibility output only. Update it
-    // after the authoritative runtime confirms removal; never regenerate the
-    // shared bridge dispatch.json from this local snapshot.
+    // only after the authoritative runtime confirms removal; never regenerate
+    // the shared bridge dispatch.json from a local snapshot during rollback.
     const retained = requests.filter((request) => !names.has(request.to_worker));
     await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(retained, null, 2));
-    if (!authoritativeRemovalPerformed) await writeBridgeDispatchCompat(teamName, retained, cwd);
     const remaining = await readDispatchRequests(teamName, cwd);
     if (remaining.some((request) => names.has(request.to_worker))) {
       throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);

@@ -17,6 +17,7 @@ import {
   writeWorkerStatus,
   withScalingLock,
   recoverTeamMembershipTaskTransaction,
+  commitTeamMembershipTaskTransaction,
   DEFAULT_MAX_WORKERS,
   listDispatchRequests,
   readTeamManifestV2,
@@ -32,6 +33,7 @@ import { buildWorkerProcessLaunchSpec } from '../tmux-session.js';
 
 
 delete process.env.OMX_TEAM_STATE_ROOT;
+process.env.OMX_RUNTIME_BRIDGE = '0';
 
 async function initCommittedGitRepo(cwd: string): Promise<void> {
   execFileSync('git', ['init'], { cwd, stdio: 'pipe' });
@@ -1049,7 +1051,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       await chmod(tmuxStubPath, 0o755);
       await writeFile(tmuxLogPath, '');
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
-      process.env.OMX_RUNTIME_BRIDGE = '1';
+      process.env.OMX_RUNTIME_BRIDGE = '0';
 
       await initTeamState('scale-up-owner-tag-rollback', 'task', 'executor', 1, cwd);
       await configureScaleUpTeamForDirectDispatch('scale-up-owner-tag-rollback', cwd);
@@ -3320,6 +3322,47 @@ esac
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+
+  for (const target of ['config', 'manifest'] as const) {
+    it(`publicly recovers a committed scale-up membership rollback after partial ${target} old-generation persistence`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-scale-up-rollback-${target}-`));
+      try {
+        const teamName = `rollback-${target}`;
+        await initTeamState(teamName, 'task', 'executor', 2, cwd);
+        const task = await createTask(teamName, {
+          subject: 'rollback owner', description: 'must converge with membership', status: 'pending', owner: 'worker-2',
+        }, cwd);
+        const teamDir = join(cwd, '.omx', 'state', 'team', teamName);
+        const configPath = join(teamDir, 'config.json');
+        const manifestPath = join(teamDir, 'manifest.v2.json');
+        const taskPath = join(teamDir, 'tasks', `task-${task.id}.json`);
+        const oldConfig = await readFile(configPath, 'utf8');
+        const oldManifest = await readFile(manifestPath, 'utf8');
+        const oldTask = await readFile(taskPath, 'utf8');
+        const oldConfigValue = JSON.parse(oldConfig) as { workers: Array<{ name: string }> };
+        const nextConfig = { ...oldConfigValue, workers: oldConfigValue.workers.filter((worker) => worker.name !== 'worker-2') };
+        const nextManifest = { ...JSON.parse(oldManifest) as object, workers: nextConfig.workers, worker_count: nextConfig.workers.length };
+        const nextTask = { ...JSON.parse(oldTask) as object, owner: undefined, claim: undefined };
+        await assert.rejects(
+          commitTeamMembershipTaskTransaction(teamName, cwd, {
+            tasks: [{ taskId: task.id, oldBytes: oldTask, newBytes: JSON.stringify(nextTask, null, 2) }],
+            config: { oldBytes: oldConfig, newBytes: JSON.stringify(nextConfig, null, 2) },
+            manifest: { oldBytes: oldManifest, newBytes: JSON.stringify(nextManifest, null, 2) },
+            recoverToNewOnFailure: true,
+            failRollbackPersistenceAfter: target,
+          }),
+          /rollback-persistence-failure/,
+        );
+        assert.equal(existsSync(join(teamDir, '.membership-task-transaction.json')), true);
+        await recoverTeamMembershipTaskTransaction(teamName, cwd);
+        assert.equal((await readTeamConfig(teamName, cwd))?.workers.some((worker) => worker.name === 'worker-2'), false);
+        assert.equal((await readTeamManifestV2(teamName, cwd))?.workers.some((worker) => worker.name === 'worker-2'), false);
+        assert.equal((await readTask(teamName, task.id, cwd))?.owner, undefined);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
 
   it('commits a successfully killed pane while restoring the exact status for a later proof-loss pane', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-'));

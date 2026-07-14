@@ -83,8 +83,25 @@ fn run() -> Result<(), String> {
                 None
             };
             let mut engine = match state_dir {
-                Some(dir) => RuntimeEngine::load(dir)
-                    .unwrap_or_else(|_| RuntimeEngine::new().with_state_dir(dir)),
+                Some(dir) => match RuntimeEngine::load(dir) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        let has_persisted_state = [
+                            "events.json",
+                            "snapshot.json",
+                            "mailbox.json",
+                            "dispatch.json",
+                        ]
+                        .iter()
+                        .any(|name| std::path::Path::new(dir).join(name).exists());
+                        if has_persisted_state {
+                            return Err(format!(
+                                "failed to load authoritative runtime state: {error}"
+                            ));
+                        }
+                        RuntimeEngine::new().with_state_dir(dir)
+                    }
+                },
                 None => RuntimeEngine::new(),
             };
 

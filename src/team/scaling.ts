@@ -259,8 +259,12 @@ function resolveInstructionStateRoot(worktreePath?: string | null): string | und
   return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
 }
 
+function hasScaleUpFailureInjection(env: NodeJS.ProcessEnv, phase: string): boolean {
+  return env.OMX_TEAM_SCALE_UP_INJECT_FAILURE?.split(',').map((value) => value.trim()).includes(phase) ?? false;
+}
+
 function throwIfScaleUpFailureInjected(env: NodeJS.ProcessEnv, phase: string): void {
-  if (env.OMX_TEAM_SCALE_UP_INJECT_FAILURE === phase) {
+  if (hasScaleUpFailureInjection(env, phase)) {
     throw new Error(`injected_scale_up_failure:${phase}`);
   }
 }
@@ -582,7 +586,12 @@ export async function scaleUp(
               // A failed rollback must recover toward the original membership,
               // never back to the just-added workers.
               recoverToNewOnFailure: true,
-              failRollbackPersistence: attempt === 0 && env.OMX_TEAM_SCALE_UP_INJECT_FAILURE === 'rollback-membership-persistence',
+              failRollbackPersistence: attempt === 0 && hasScaleUpFailureInjection(env, 'rollback-membership-persistence'),
+              failRollbackPersistenceAfter: attempt === 0 && hasScaleUpFailureInjection(env, 'rollback-membership-config-persistence')
+                ? 'config'
+                : attempt === 0 && hasScaleUpFailureInjection(env, 'rollback-membership-manifest-persistence')
+                  ? 'manifest'
+                  : undefined,
             });
           });
           const [committed, committedManifest] = await Promise.all([
@@ -618,6 +627,10 @@ export async function scaleUp(
         }
       }
       if (!membershipRestored) {
+        const journalPath = join(teamStateRoot, 'team', sanitized, '.membership-task-transaction.json');
+        if (!existsSync(journalPath)) {
+          return { ok: false, error: `scale_up_rollback_membership_persistence_failed:no_recoverable_journal:${String(membershipRollbackError)}` };
+        }
         return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(membershipRollbackError)}` };
       }
       Object.assign(config, originalConfig);
@@ -1079,6 +1092,7 @@ export async function scaleUp(
           worker: workerInfo,
         });
       }
+      throwIfScaleUpFailureInjected(env, 'post-dispatch-rollback');
 
       addedWorkers.push(workerInfo);
       config.workers.push(workerInfo);
