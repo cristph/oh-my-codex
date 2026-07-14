@@ -998,7 +998,7 @@ function classifyPluginDeveloperInstructions(
 		normalized ===
 		normalizeDeveloperInstructionsText(LEGACY_PLUGIN_DEVELOPER_INSTRUCTIONS)
 	) {
-		return "current";
+		return "historical";
 	}
 	if (
 		normalized === normalizeDeveloperInstructionsText(OMX_DEVELOPER_INSTRUCTIONS)

@@ -1878,6 +1878,18 @@ describe("omx setup install mode behavior", () => {
 						config,
 						/native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works/i,
 					);
+					assert.match(
+						config,
+						/When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work/i,
+					);
+					assert.match(config, /role_routing_unavailable/i);
+					assert.match(config, /do not fabricate `agent_type`/i);
+					assert.match(config, /OMX adapted role-pass protocol/i);
+					assert.match(
+						config,
+						/pre-validated role intent in the OMX subagent ledger/i,
+					);
+					assert.match(config, /never fake the role via a prompt label/i);
 					assert.doesNotMatch(config, /Native subagents live in \.codex\/agents/);
 					assert.doesNotMatch(config, /Treat installed prompts as narrower execution surfaces/);
 					assert.match(config, /^plugin_hooks = true$/m);
@@ -2020,7 +2032,7 @@ describe("omx setup install mode behavior", () => {
 		}
 	});
 
-	it("preserves latest unwrapped developer_instructions without prompting", async () => {
+	it("migrates historical unwrapped developer_instructions after prompting", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-setup-install-mode-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
@@ -2043,10 +2055,18 @@ describe("omx setup install mode behavior", () => {
 						},
 					});
 
-					assert.equal(promptCount, 0);
+					assert.equal(promptCount, 1);
 					const config = await readFile(configPath, "utf-8");
-					assert.match(config, /You have oh-my-codex installed through Codex plugin mode/);
-					assert.doesNotMatch(config, /<omx version=/);
+					assert.match(
+						config,
+						/<omx version=\\"1\\">You have oh-my-codex installed through Codex plugin mode/,
+					);
+					assert.match(
+						config,
+						/When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work/i,
+					);
+					assert.match(config, /role_routing_unavailable/i);
+					assert.match(config, /OMX adapted role-pass protocol/i);
 					assert.equal(
 						(config.match(/^developer_instructions\s*=/gm) ?? []).length,
 						1,
