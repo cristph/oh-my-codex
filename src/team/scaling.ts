@@ -1274,13 +1274,19 @@ export async function scaleDown(
 
     // Phase 3: exact proof determines removability before canonical mutation.
     // Proof-unavailable workers retain their membership, task ownership, and artifacts.
-    const proofUnavailableWorkers = targetWorkers.filter((worker) => (
-      typeof worker.pane_id === 'string' && readExactPaneProofSync(worker.pane_id).status === 'unavailable'
-    ));
+    const proofUnavailable = targetWorkers.flatMap((worker) => {
+      if (typeof worker.pane_id !== 'string') return [];
+      const proof = readExactPaneProofSync(worker.pane_id);
+      return proof.status === 'unavailable' ? [{ worker, reason: proof.reason }] : [];
+    });
+    const proofUnavailableWorkers = proofUnavailable.map(({ worker }) => worker);
     const removableWorkers = targetWorkers.filter((worker) => !proofUnavailableWorkers.includes(worker));
     if (proofUnavailableWorkers.length > 0) await restorePriorWorkerStatuses(proofUnavailableWorkers);
     if (removableWorkers.length === 0) {
-      return { ok: false, error: `scale_down_proof_unavailable:${proofUnavailableWorkers.map((worker) => worker.pane_id ?? worker.name).join(',')}` };
+      const detail = proofUnavailable
+        .map(({ worker, reason }) => `${worker.pane_id ?? worker.name}:${reason}`)
+        .join(',');
+      return { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
     }
     const removableWorkerNames = new Set(removableWorkers.map((worker) => worker.name));
     try {
