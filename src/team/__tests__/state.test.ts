@@ -17,6 +17,7 @@ import {
   migrateV1ToV2,
   readTask,
   readTeamConfig,
+  saveTeamConfig,
   readTeamManifestV2,
   transitionTaskStatus,
   releaseTaskClaim,
@@ -47,6 +48,8 @@ import {
   writeTeamManifestV2,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
+import { claimTask as claimTaskWithDeps } from '../state/tasks.js';
+import type { TeamTaskV2 } from '../state/types.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
@@ -751,6 +754,76 @@ exit 1
       const conflicts = [c1, c2].filter((c) => !c.ok && c.error === 'claim_conflict').length;
       assert.equal(oks, 1);
       assert.equal(conflicts, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('claimTask revalidates a stale member under its claim lock when expectedVersion is null', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-claim-member-boundary-'));
+    try {
+      const teamName = 'team-claim-member-boundary';
+      await initTeamState(teamName, 't', 'executor', 2, cwd);
+      const task = await createTask(teamName, { subject: 'a', description: 'd', status: 'pending' }, cwd);
+
+      const claim = await claimTaskWithDeps(task.id, 'worker-2', null, {
+        teamName,
+        cwd,
+        readTask,
+        readTeamConfig,
+        withTaskClaimLock: async (_teamName, _taskId, _cwd, fn) => {
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          config.workers = config.workers.filter((worker) => worker.name !== 'worker-2');
+          await saveTeamConfig(config, cwd);
+          return { ok: true, value: await fn() };
+        },
+        normalizeTask: (current) => current as TeamTaskV2,
+        isTerminalTaskStatus: (status) => status === 'completed' || status === 'failed',
+        taskFilePath: (_teamName, taskId, _cwd) => join(cwd, '.omx', 'state', 'team', teamName, 'tasks', `task-${taskId}.json`),
+        writeAtomic,
+      });
+
+      assert.deepEqual(claim, { ok: false, error: 'worker_not_found' });
+      const persisted = await readTask(teamName, task.id, cwd);
+      assert.equal(persisted?.status, 'pending');
+      assert.equal(persisted?.owner, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('claimTask rejects a removed worker for a task created after the scale-down snapshot', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-claim-post-snapshot-'));
+    try {
+      const teamName = 'team-claim-post-snapshot';
+      await initTeamState(teamName, 't', 'executor', 2, cwd);
+      const scaleDownSnapshot = await readTeamConfig(teamName, cwd);
+      assert.ok(scaleDownSnapshot?.workers.some((worker) => worker.name === 'worker-2'));
+      const postSnapshotTask = await createTask(teamName, { subject: 'post snapshot', description: 'd', status: 'pending' }, cwd);
+
+      const claim = await claimTaskWithDeps(postSnapshotTask.id, 'worker-2', null, {
+        teamName,
+        cwd,
+        readTask,
+        readTeamConfig,
+        withTaskClaimLock: async (_teamName, _taskId, _cwd, fn) => {
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          config.workers = config.workers.filter((worker) => worker.name !== 'worker-2');
+          await saveTeamConfig(config, cwd);
+          return { ok: true, value: await fn() };
+        },
+        normalizeTask: (current) => current as TeamTaskV2,
+        isTerminalTaskStatus: (status) => status === 'completed' || status === 'failed',
+        taskFilePath: (_teamName, taskId, _cwd) => join(cwd, '.omx', 'state', 'team', teamName, 'tasks', `task-${taskId}.json`),
+        writeAtomic,
+      });
+
+      assert.deepEqual(claim, { ok: false, error: 'worker_not_found' });
+      const persisted = await readTask(teamName, postSnapshotTask.id, cwd);
+      assert.equal(persisted?.status, 'pending');
+      assert.equal(persisted?.owner, undefined);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

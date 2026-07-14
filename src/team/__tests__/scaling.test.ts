@@ -1068,6 +1068,14 @@ printf '%s\\n' "$@" > '${capturePath}'
       assert.equal(existsSync(
         join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'workers', 'worker-2', 'identity.json'),
       ), false);
+      assert.equal(existsSync(
+        join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'workers', 'worker-2', 'inbox.md'),
+      ), false);
+      const dispatch = JSON.parse(await readFile(
+        join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'dispatch', 'requests.json'),
+        'utf8',
+      )) as Array<{ to_worker?: string }>;
+      assert.equal(dispatch.some((request) => request.to_worker === 'worker-2'), false);
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
@@ -2954,6 +2962,7 @@ esac
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -3016,6 +3025,9 @@ exit 0
 
       const tmuxCommands = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n');
       assert.deepEqual(tmuxCommands, [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
       ]);
@@ -3082,6 +3094,7 @@ exit 0
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
       ]);
     } finally {
@@ -3142,7 +3155,9 @@ esac
       assert.equal(await readFile(taskPath, 'utf-8'), taskRaw);
       assert.equal(await readFile(firstTaskPath, 'utf-8'), firstTaskRaw);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'workers', 'worker-2')), true);
-      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), []);
+      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+      ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -3150,6 +3165,78 @@ esac
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+  it('preserves proof-unavailable scale-down workers and their tasks before canonical commit', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-proof-unavailable-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-proof-unavailable-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, '#!/bin/sh\n[ "$1" = list-panes ] && exit 1\nexit 0\n');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('proof-unavailable', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('proof-unavailable', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%13';
+      await saveTeamConfig(config, cwd);
+      const task = await createTask('proof-unavailable', {
+        subject: 'preserved', description: 'exact proof is unavailable', status: 'pending', owner: 'worker-2',
+      }, cwd);
+      const statusPath = join(cwd, '.omx', 'state', 'team', 'proof-unavailable', 'workers', 'worker-2', 'status.json');
+      const statusRaw = '{"state":"idle", "reason":"preserve bytes", "updated_at":"2026-07-14T00:00:00.000Z"}\n';
+      await writeFile(statusPath, statusRaw);
+      const result = await scaleDown('proof-unavailable', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+      });
+      assert.equal(result.ok, false);
+      assert.deepEqual((await readTeamConfig('proof-unavailable', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2']);
+      assert.equal((await readTask('proof-unavailable', task.id, cwd))?.owner, 'worker-2');
+      assert.equal(await readFile(statusPath, 'utf8'), statusRaw);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('restores all canonical task and config bytes after a mid-commit scale-down failure', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-atomic-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-atomic-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, "#!/bin/sh\n[ \"$1\" = list-panes ] && { printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'; exit 0; }\nexit 0\n");
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('atomic-down', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('atomic-down', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%13';
+      await saveTeamConfig(config, cwd);
+      const first = await createTask('atomic-down', { subject: 'first', description: 'first', status: 'pending', owner: 'worker-2' }, cwd);
+      const second = await createTask('atomic-down', { subject: 'second', description: 'second', status: 'pending', owner: 'worker-2' }, cwd);
+      const stateRoot = join(cwd, '.omx', 'state', 'team', 'atomic-down');
+      const configRaw = await readFile(join(stateRoot, 'config.json'));
+      const firstRaw = await readFile(join(stateRoot, 'tasks', `task-${first.id}.json`));
+      const secondRaw = await readFile(join(stateRoot, 'tasks', `task-${second.id}.json`));
+      const result = await scaleDown('atomic-down', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SCALE_DOWN_INJECT_FAILURE: 'after-first-task-write',
+      });
+      assert.match(result.ok ? '' : result.error, /injected_scale_down_failure:after-first-task-write/);
+      assert.deepEqual(await readFile(join(stateRoot, 'config.json')), configRaw);
+      assert.deepEqual(await readFile(join(stateRoot, 'tasks', `task-${first.id}.json`)), firstRaw);
+      assert.deepEqual(await readFile(join(stateRoot, 'tasks', `task-${second.id}.json`)), secondRaw);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
   it('commits a successfully killed pane while restoring the exact status for a later proof-loss pane', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-bin-'));
@@ -3215,6 +3302,8 @@ esac
       assert.equal(reclaimedTask?.status, 'pending');
       assert.equal(reclaimedTask?.claim, undefined);
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
@@ -3284,6 +3373,8 @@ esac
       assert.equal(reclaimedTask?.status, 'pending');
       assert.equal(reclaimedTask?.claim, undefined);
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %14',

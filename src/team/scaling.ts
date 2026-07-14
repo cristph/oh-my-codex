@@ -564,6 +564,24 @@ export async function scaleUp(
         for (const taskId of createdTaskIds) {
           await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
         }
+        // Inbox, identity, status, and dispatch state are canonical worker state.
+        // Remove it before attempting any fallible pane or worktree cleanup.
+        await Promise.all([...new Set([
+          ...rollbackWorkers.map((worker) => worker.name),
+          context.workerName,
+        ].filter((workerName): workerName is string => Boolean(workerName)))].map(async (workerName) => {
+          await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
+        }));
+        const dispatchPath = join(teamStateRoot, 'team', sanitized, 'dispatch', 'requests.json');
+        try {
+          const requests = JSON.parse(await readFile(dispatchPath, 'utf8')) as Array<{ to_worker?: string }>;
+          await writeAtomic(
+            dispatchPath,
+            JSON.stringify(requests.filter((request) => !rollbackWorkerNames.has(request.to_worker ?? '')), null, 2),
+          );
+        } catch (dispatchError) {
+          if ((dispatchError as NodeJS.ErrnoException).code !== 'ENOENT') throw dispatchError;
+        }
         config.workers = config.workers.filter((worker) => !rollbackWorkerNames.has(worker.name));
         config.worker_count = config.workers.length;
         config.next_worker_index = initialNextIndex;
@@ -576,6 +594,11 @@ export async function scaleUp(
         for (const taskId of createdTaskIds) {
           if (await readTask(sanitized, taskId, leaderCwd)) {
             throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
+          }
+        }
+        for (const workerName of rollbackWorkerNames) {
+          if (existsSync(join(teamStateRoot, 'team', sanitized, 'workers', workerName))) {
+            throw new Error(`canonical_scale_up_rollback_worker_verification_failed:${workerName}`);
           }
         }
       } catch (rollbackError) {
@@ -1190,55 +1213,79 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: hold the exact claim locks used by claimTask until task ownership
-    // and worker membership are durably committed. A claimant can therefore only
-    // observe the old owner before this boundary or the reconciled task afterward.
-    const targetWorkerNames = new Set(targetWorkers.map((worker) => worker.name));
+    // Phase 3: exact proof determines removability before canonical mutation.
+    // Proof-unavailable workers retain their membership, task ownership, and artifacts.
+    const proofUnavailableWorkers = targetWorkers.filter((worker) => (
+      typeof worker.pane_id === 'string' && readExactPaneProofSync(worker.pane_id).status === 'unavailable'
+    ));
+    const removableWorkers = targetWorkers.filter((worker) => !proofUnavailableWorkers.includes(worker));
+    if (proofUnavailableWorkers.length > 0) await restorePriorWorkerStatuses(proofUnavailableWorkers);
+    if (removableWorkers.length === 0) {
+      return { ok: false, error: `scale_down_proof_unavailable:${proofUnavailableWorkers.map((worker) => worker.pane_id ?? worker.name).join(',')}` };
+    }
+    const removableWorkerNames = new Set(removableWorkers.map((worker) => worker.name));
     const candidateTaskIds = (await listTasks(sanitized, leaderCwd))
       .filter((task) => task.status !== 'completed' && task.status !== 'failed')
       .map((task) => task.id);
     try {
       await withTaskClaimLocks(sanitized, candidateTaskIds, leaderCwd, async () => {
+        // Rescan under the same claim barrier claimTask obeys.
         const lockedTasks = await listTasks(sanitized, leaderCwd);
+        const configPath = join(teamStateRoot, 'team', sanitized, 'config.json');
+        const configSnapshot = await readFile(configPath);
+        const manifestPath = join(teamStateRoot, 'team', sanitized, 'manifest.v2.json');
+        const manifestSnapshot = existsSync(manifestPath) ? await readFile(manifestPath) : null;
+        const reconciledTasks = lockedTasks.filter((task) => task.status !== 'completed' && task.status !== 'failed'
+          && (removableWorkerNames.has(task.owner ?? '') || removableWorkerNames.has(task.claim?.owner ?? '')));
+        const taskSnapshots = new Map<string, Buffer>();
+        for (const task of reconciledTasks) {
+          taskSnapshots.set(task.id, await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`)));
+        }
         const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
-        if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
-        }
-        for (const task of lockedTasks) {
-          if (task.status === 'completed' || task.status === 'failed') continue;
-          if (!targetWorkerNames.has(task.owner ?? '') && !targetWorkerNames.has(task.claim?.owner ?? '')) continue;
-          const reconciledTask: TeamTask = {
-            ...task,
-            owner: undefined,
-            claim: undefined,
-            status: task.status === 'in_progress' ? 'pending' : task.status,
-            version: Math.max(1, task.version ?? 1) + 1,
-          };
-          await writeAtomic(
-            join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`),
-            JSON.stringify(reconciledTask, null, 2),
-          );
-        }
-        const removedSet = new Set(targetWorkers.map((worker) => worker.name));
-        config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
-        config.worker_count = config.workers.length;
-        await saveTeamConfig(config, leaderCwd);
-        const committed = await readTeamConfig(sanitized, leaderCwd);
-        if (!committed || committed.workers.some((worker) => removedSet.has(worker.name))) {
-          throw new Error('canonical_scale_down_config_verification_failed');
-        }
-        for (const taskId of candidateTaskIds) {
-          const reconciled = await listTasks(sanitized, leaderCwd);
-          const task = reconciled.find((candidate) => candidate.id === taskId);
-          if (task && (targetWorkerNames.has(task.owner ?? '') || targetWorkerNames.has(task.claim?.owner ?? ''))) {
-            throw new Error(`canonical_scale_down_task_verification_failed:${taskId}`);
+        if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
+        try {
+          for (const [index, task] of reconciledTasks.entries()) {
+            await writeAtomic(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`), JSON.stringify({
+              ...task, owner: undefined, claim: undefined,
+              status: task.status === 'in_progress' ? 'pending' : task.status,
+              version: Math.max(1, task.version ?? 1) + 1,
+            } satisfies TeamTask, null, 2));
+            if (index === 0 && env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write') {
+              throw new Error('injected_scale_down_failure:after-first-task-write');
+            }
           }
+          config.workers = config.workers.filter((worker) => !removableWorkerNames.has(worker.name));
+          config.worker_count = config.workers.length;
+          await saveTeamConfig(config, leaderCwd);
+          const committed = await readTeamConfig(sanitized, leaderCwd);
+          if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) throw new Error('canonical_scale_down_config_verification_failed');
+          for (const task of reconciledTasks) {
+            const reconciled = await readTask(sanitized, task.id, leaderCwd);
+            if (reconciled && (removableWorkerNames.has(reconciled.owner ?? '') || removableWorkerNames.has(reconciled.claim?.owner ?? ''))) {
+              throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
+            }
+          }
+        } catch (commitError) {
+          await Promise.all([...taskSnapshots.entries()].map(async ([taskId, snapshot]) => {
+            await writeAtomic(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), snapshot.toString('utf8'));
+          }));
+          await writeAtomic(configPath, configSnapshot.toString('utf8'));
+          if (manifestSnapshot) await writeAtomic(manifestPath, manifestSnapshot.toString('utf8'));
+          else await rm(manifestPath, { force: true });
+          if (!(await readFile(configPath)).equals(configSnapshot)) throw new Error('canonical_scale_down_rollback_config_verification_failed');
+          for (const [taskId, snapshot] of taskSnapshots) {
+            if (!(await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`))).equals(snapshot)) {
+              throw new Error(`canonical_scale_down_rollback_task_verification_failed:${taskId}`);
+            }
+          }
+          throw commitError;
         }
       });
     } catch (error) {
-      await restorePriorWorkerStatuses(targetWorkers);
+      await restorePriorWorkerStatuses(removableWorkers);
       return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
     }
+    targetWorkers = removableWorkers;
 
     // Phase 4: cleanup is deliberately after the canonical commit. Failures are
     // durable retry debt: removed workers and their task ownership are never put back.
