@@ -329,18 +329,27 @@ function listPanes(target: string): TmuxPaneInfo[] {
 function listPanesResult(target: string): PaneListResult {
   const result = runTmux(['list-panes', '-t', target, '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}']);
   if (!result.ok) return { panes: [], error: result.stderr };
-  return {
-    panes: result.stdout
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map((line) => {
-        const [paneId = '', currentCommand = '', startCommand = ''] = line.split('\t');
-        return { paneId, currentCommand, startCommand };
-      })
-      .filter((pane) => pane.paneId.startsWith('%')),
-    error: null,
-  };
+
+  const panes: TmuxPaneInfo[] = [];
+  for (const rawLine of result.stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+
+    const firstSeparator = line.indexOf('\t');
+    const secondSeparator = firstSeparator >= 0 ? line.indexOf('\t', firstSeparator + 1) : -1;
+    const paneId = firstSeparator >= 0 ? line.slice(0, firstSeparator) : line;
+    if (firstSeparator < 0 || secondSeparator < 0 || !/^%[0-9]+$/.test(paneId)) {
+      return { panes: [], error: 'malformed pane topology' };
+    }
+
+    panes.push({
+      paneId,
+      currentCommand: line.slice(firstSeparator + 1, secondSeparator),
+      startCommand: line.slice(secondSeparator + 1),
+    });
+  }
+
+  return { panes, error: null };
 }
 
 

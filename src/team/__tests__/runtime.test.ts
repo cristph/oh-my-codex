@@ -7315,6 +7315,57 @@ esac
     }
   });
 
+  it('shutdownTeam preserves shared-session state when topology output is malformed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-topology-malformed-'));
+    const teamName = 'team-topology-malformed';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-topology-malformed-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    ;;
+  list-panes)
+    printf 'not-a-pane-snapshot\\n'
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          await initTeamState(teamName, 'shutdown malformed topology test', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) return;
+          config.tmux_session = 'leader:0';
+          config.leader_pane_id = '%10';
+          config.hud_pane_id = '%12';
+          config.workers[0]!.pane_id = '%13';
+          await saveTeamConfig(config, cwd);
+
+          await assert.rejects(
+            () => shutdownTeam(teamName, cwd, { force: true }),
+            /shutdown_shared_session_topology_unavailable:malformed pane topology/,
+          );
+
+          assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+          assert.deepEqual(await readTeamConfig(teamName, cwd), config);
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.match(tmuxLog, /list-panes -t leader:0 -F #\{pane_id\}/);
+          assert.doesNotMatch(tmuxLog, /kill-pane|split-window|resize-pane|select-pane|show-option|kill-session/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('shutdownTeam preserves unrelated non-worker panes during shared-session shutdown', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unrelated-pane-'));
     const teamName = 'team-shutdown-unrelated-pane';

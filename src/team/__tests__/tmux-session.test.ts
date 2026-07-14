@@ -4542,6 +4542,9 @@ case "$1" in
 esac
 `,
         async ({ logPath }) => {
+          const codexStubPath = join(dirname(logPath), 'codex');
+          await writeFile(codexStubPath, '#!/bin/sh\nexit 0\n');
+          await chmod(codexStubPath, 0o755);
           process.env.TMUX = 'leader-session,stub,0';
           process.env.TMUX_PANE = '%1';
           process.env.OMX_TEAM_WORKER_CLI = 'codex';
