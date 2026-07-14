@@ -1026,7 +1026,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi',
           '    count=$((count + 1))',
           '    printf "%s" "$count" > "$count_file"',
-          '    if [ "$count" -le 3 ]; then',
+          '    if [ "$count" -le 4 ]; then',
           "      printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
           "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
           "      printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
@@ -1711,7 +1711,7 @@ exit 0
       assert.match(result.error, /scale_up_dispatch_failed:worker-2/);
 
       const workerRootAgents = join(cwd, '.omx', 'team', 'rollback-worktree', 'worktrees', 'worker-2', 'AGENTS.md');
-      assert.equal(await readFile(workerRootAgents, 'utf-8'), '# Root project instructions\n');
+      await assert.rejects(readFile(workerRootAgents, 'utf-8'), { code: 'ENOENT' });
       const backupPath = join(cwd, '.git', 'worktrees', 'worker-2', 'omx', 'root-agents-backup.json');
       assert.equal(existsSync(backupPath), false);
     } finally {
@@ -2163,6 +2163,97 @@ exit 0
       }
     });
   }
+
+  it('rolls back all preparation when the split target proof is lost immediately before split-window', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-second-split-proof-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-second-split-proof-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const proofCountPath = join(fakeBinDir, 'proof-count');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+
+    try {
+      await writeFile(
+        tmuxStubPath,
+        [
+          '#!/bin/sh',
+          'set -eu',
+          `printf '%s\\n' "$*" >> "${tmuxLogPath}"`,
+          'case "${1:-}" in',
+          '  -V)',
+          '    echo "tmux 3.2a"',
+          '    ;;',
+          '  list-panes)',
+          `    count=0; [ ! -f "${proofCountPath}" ] || count=$(cat "${proofCountPath}")`,
+          '    count=$((count + 1))',
+          `    printf '%s' "$count" > "${proofCountPath}"`,
+          '    if [ "$count" -eq 1 ]; then',
+          "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+          '    else',
+          '      exit 1',
+          '    fi',
+          '    ;;',
+          '  split-window)',
+          '    echo "%31"',
+          '    ;;',
+          'esac',
+          'exit 0',
+          '',
+        ].join('\n'),
+      );
+      await chmod(tmuxStubPath, 0o755);
+      await writeFile(tmuxLogPath, '');
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      const teamName = 'second-split-proof';
+      await initTeamState(teamName, 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+      const teamStateDir = join(cwd, '.omx', 'state', 'team', teamName);
+      const configPath = join(teamStateDir, 'config.json');
+      const tasksDir = join(teamStateDir, 'tasks');
+      const workersDir = join(teamStateDir, 'workers');
+      const runtimeDir = join(teamStateDir, 'runtime');
+      const configBefore = await readFile(configPath, 'utf-8');
+      const taskEntriesBefore = (await readdir(tasksDir)).sort();
+      const workerEntriesBefore = (await readdir(workersDir)).sort();
+      const runtimeDirExistedBefore = existsSync(runtimeDir);
+
+      const result = await scaleUp(
+        teamName,
+        1,
+        'executor',
+        [{ subject: 'must not persist', description: 'proof loss rollback', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+
+      assert.deepEqual(result, {
+        ok: false,
+        error: 'scale_up_split_target_proof_unavailable:%21:query_failed',
+      });
+      const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.deepEqual(
+        tmuxCommands.filter((command) => command.startsWith('list-panes ')),
+        [
+          'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+          'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        ],
+      );
+      assert.equal(tmuxCommands.some((command) => command.startsWith('split-window ')), false);
+      assert.equal(tmuxCommands.some((command) => command.startsWith('send-keys ')), false);
+      assert.equal(await readFile(configPath, 'utf-8'), configBefore);
+      assert.deepEqual((await readdir(tasksDir)).sort(), taskEntriesBefore);
+      assert.deepEqual((await readdir(workersDir)).sort(), workerEntriesBefore);
+      assert.equal(existsSync(join(workersDir, 'worker-2')), false);
+      assert.equal(existsSync(join(cwd, '.omx', 'team', teamName, 'worktrees', 'worker-2')), false);
+      assert.equal(existsSync(runtimeDir), runtimeDirExistedBefore);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
 
   it('provisions detached worktrees for scaled-up workers from persisted team worktree mode', async () => {
     const repo = await initRepo();
@@ -2687,6 +2778,15 @@ exit 0
       if (!config) return;
       config.workers[1]!.pane_id = '%13';
       await saveTeamConfig(config, cwd);
+      const priorConfig = structuredClone(config);
+
+      const priorStatus = {
+        state: 'idle' as const,
+        reason: 'waiting for assignment',
+        updated_at: '2026-07-14T00:00:00.000Z',
+      };
+      await writeWorkerStatus('kill-fail', 'worker-2', priorStatus, cwd);
+
 
       const result = await scaleDown(
         'kill-fail',
@@ -2700,7 +2800,8 @@ exit 0
       });
 
       const preserved = await readTeamConfig('kill-fail', cwd);
-      assert.ok(preserved?.workers.some((worker) => worker.name === 'worker-2'));
+      assert.deepEqual(preserved, priorConfig);
+      assert.deepEqual(await readWorkerStatus('kill-fail', 'worker-2', cwd), priorStatus);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',

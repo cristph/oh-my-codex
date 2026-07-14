@@ -312,6 +312,46 @@ describe('HUD resize hook command builders', () => {
     assert.match(args[1] ?? '', new RegExp(`resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
   });
 
+  it('fails closed in hook shell proofs without resizing malformed, duplicate, dead, absent, or unavailable panes', async () => {
+    const previousFixture = process.env.OMX_HUD_HOOK_FIXTURE;
+    try {
+      await withMockTmuxFixture(
+        'omx-hud-hook-proof-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    case "\${OMX_HUD_HOOK_FIXTURE:-}" in
+      missing) printf '%%7\\t0\\n' ;;
+      extra) printf '%%7\\t0\\t2000000007\\textra\\n' ;;
+      duplicate) printf '%%7\\t0\\t2000000007\\n%%7\\t0\\t2000000007\\n' ;;
+      dead) printf '%%7\\t1\\t2000000007\\n' ;;
+      absent) printf '%%8\\t0\\t2000000008\\n' ;;
+      query-failure) echo 'tmux query failed' >&2; exit 1 ;;
+    esac
+    ;;
+  resize-pane) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          const command = buildReconcileHudResizeArgs('%7')[1] ?? '';
+          for (const fixture of ['missing', 'extra', 'duplicate', 'dead', 'absent', 'query-failure']) {
+            process.env.OMX_HUD_HOOK_FIXTURE = fixture;
+            const result = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf-8' });
+            assert.equal(result.status, 0, fixture);
+            const commands = await readFile(logPath, 'utf-8');
+            assert.doesNotMatch(commands, /resize-pane/, fixture);
+            await writeFile(logPath, '');
+          }
+        },
+      );
+    } finally {
+      if (typeof previousFixture === 'string') process.env.OMX_HUD_HOOK_FIXTURE = previousFixture;
+      else delete process.env.OMX_HUD_HOOK_FIXTURE;
+    }
+  });
+
   it('resolves the tmux executable for win32 hook shell snippets', async () => {
     const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-hook-tmux-'));
     const prevPath = process.env.PATH;
@@ -4827,6 +4867,95 @@ esac
       await rm(cwd, { recursive: true, force: true });
     }
   });
+  it('unregisters only the successfully registered HUD hook after partial hook registration failure', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-partial-hook-registration-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousWarn = console.warn;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-partial-hook-registration-',
+        (logPath) => `#!/bin/sh
+set -eu
+registration_failed_file="${logPath}.registration-failed"
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo 'tmux 3.4'
+    ;;
+  display-message)
+    case "$*" in
+      *'#{window_width}'*) echo '120' ;;
+      *) echo 'leader:0 %1' ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *'pane_current_command'*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        ;;
+      *'-a -F #{pane_id}'*)
+        if [ -f "$registration_failed_file" ]; then
+          printf 'malformed snapshot\\n'
+        else
+          printf '%%1\\t0\\t2000000001\\n%%2\\t0\\t2000000002\\n%%3\\t0\\t2000000003\\n'
+        fi
+        ;;
+      *) printf '%%1\\n' ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *' -h '*) echo '%2' ;;
+      *) echo '%3' ;;
+    esac
+    ;;
+  set-hook)
+    case "$*" in
+      *'client-attached['*) : > "$registration_failed_file"; echo 'client-attached hook registration failed' >&2; exit 1 ;;
+    esac
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const geminiPath = join(dirname(logPath), 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          console.warn = () => {};
+
+          assert.throws(
+            () => createTeamSession('Partial hook registration', 1, cwd),
+            (error: unknown) => error instanceof CreateTeamSessionPartialError
+              && error.proofUnavailable.some((proof) => proof.paneId === '%1' && proof.reason === 'malformed_snapshot'),
+          );
+
+          const commands = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean);
+          const registeredResize = commands.filter((command) => /^set-hook -t leader:0 client-resized\[\d+\]/.test(command));
+          const registeredAttached = commands.filter((command) => /^set-hook -t leader:0 client-attached\[\d+\]/.test(command));
+          const unregisteredResize = commands.filter((command) => /^set-hook -u -t leader:0 client-resized\[\d+\]$/.test(command));
+          const unregisteredAttached = commands.filter((command) => /^set-hook -u -t leader:0 client-attached\[\d+\]$/.test(command));
+          assert.equal(registeredResize.length, 1);
+          assert.equal(registeredAttached.length, 1);
+          assert.equal(unregisteredResize.length, 1);
+          assert.equal(unregisteredAttached.length, 0);
+        },
+      );
+    } finally {
+      console.warn = previousWarn;
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   it('degrades HUD run-shell resize failures to warnings during team startup', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-runshell-fallback-'));

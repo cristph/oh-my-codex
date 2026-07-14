@@ -745,7 +745,7 @@ function buildAuthoritativeHudResizeShellCommand(
   const target = buildHudPaneTarget(hudPaneId);
   const snapshot = buildNestedTmuxShellCommand("list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}'");
   const resize = buildNestedTmuxShellCommand(buildHudResizeCommand(target, heightLines));
-  const proof = `awk -F '\\t' -v pane='${target}' '$1 !~ /^%[0-9]+$/ || ($2 != "0" && $2 != "1") || $3 !~ /^[1-9][0-9]*$/ || length($3) > 16 || (length($3) == 16 && ("x" $3) > "x9007199254740991") || seen[$1]++ { bad = 1 } $1 == pane && $2 == "0" { live = 1 } END { exit bad || !live }'`;
+  const proof = `awk -F '\\t' -v pane='${target}' 'NF != 3 || $1 !~ /^%[0-9]+$/ || ($2 != "0" && $2 != "1") || $3 !~ /^[1-9][0-9]*$/ || length($3) > 16 || (length($3) == 16 && ("x" $3) > "x9007199254740991") || seen[$1]++ { bad = 1 } $1 == pane && $2 == "0" { live = 1 } END { exit bad || !live }'`;
   return `if snapshot=$(${snapshot}); then printf '%s\\n' "$snapshot" | ${proof} && ${resize}; fi`;
 }
 

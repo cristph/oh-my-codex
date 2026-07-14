@@ -12,6 +12,7 @@
 
 import { join, resolve } from 'path';
 import { mkdir, rm } from 'fs/promises';
+import { existsSync } from 'fs';
 import {
   sanitizeTeamName,
   isTmuxAvailable,
@@ -414,16 +415,32 @@ export async function scaleUp(
       approvedExecutionGate.approvedContextSection,
       renderLeaderOwnedUltragoalContextSection(persistedUltragoalContext),
     );
+    const initialSplitTarget = config.workers.length > 0
+      ? (config.workers[config.workers.length - 1]?.pane_id ?? config.leader_pane_id ?? '')
+      : (config.leader_pane_id ?? '');
+    const initialSplitTargetProof = readExactPaneProofSync(initialSplitTarget);
+    if (initialSplitTargetProof.status !== 'live') {
+      return {
+        ok: false,
+        error: `scale_up_split_target_proof_unavailable:${initialSplitTarget}:${initialSplitTargetProof.reason}`,
+      };
+    }
+
+    const initialWorktreeMode = config.worktree_mode;
     const effectiveWorktreeMode = config.worktree_mode ?? resolveScaleUpWorktreeMode(config);
     if (!config.worktree_mode && effectiveWorktreeMode.enabled) {
       config.worktree_mode = effectiveWorktreeMode;
-      await saveTeamConfig(config, leaderCwd);
     }
 
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
     const createdTaskOwnerById = new Map<string, string | undefined>();
 
+    const createdWorkerDirectories: string[] = [];
+    const provisionedWorktrees: EnsureWorktreeResult[] = [];
+    const createdStartupScriptPaths: string[] = [];
+    const runtimeDirectoryPath = join(teamStateRoot, 'team', sanitized, 'runtime');
+    const runtimeDirectoryExisted = existsSync(runtimeDirectoryPath);
     const rollbackScaleUp = async (
       error: string,
       context: { paneId?: string; worker?: WorkerInfo; workerName?: string; worktreePath?: string } = {},
@@ -501,6 +518,16 @@ export async function scaleUp(
           contextWorktreePath,
         ).catch(() => {});
       }
+      await rollbackProvisionedWorktrees(provisionedWorktrees);
+      await Promise.all(createdWorkerDirectories.map(async (workerDirPath) => {
+        await rm(workerDirPath, { recursive: true, force: true });
+      }));
+      await Promise.all(createdStartupScriptPaths.map(async (startupScriptPath) => {
+        await rm(startupScriptPath, { force: true });
+      }));
+      if (!runtimeDirectoryExisted) {
+        await rm(runtimeDirectoryPath, { recursive: true, force: true });
+      }
 
       for (const taskId of createdTaskIds) {
         if (safelyRemovedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
@@ -509,6 +536,7 @@ export async function scaleUp(
 
       config.worker_count = config.workers.length;
       config.next_worker_index = initialNextIndex;
+      config.worktree_mode = initialWorktreeMode;
       await saveTeamConfig(config, leaderCwd);
 
       return { ok: false, error };
@@ -546,6 +574,7 @@ export async function scaleUp(
       // Create worker directory
       const workerDirPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'workers', workerName);
       await mkdir(workerDirPath, { recursive: true });
+      createdWorkerDirectories.push(workerDirPath);
 
       const worktreeMode = effectiveWorktreeMode;
       const workerWorkspaceResult = worktreeMode.enabled
@@ -558,6 +587,7 @@ export async function scaleUp(
           }))
         : { enabled: false } as const;
       const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
+      if (workerWorkspace) provisionedWorktrees.push(workerWorkspace);
       const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
 
       // Build startup command and create tmux pane
@@ -595,7 +625,7 @@ export async function scaleUp(
         extraEnv.OMX_TEAM_WORKTREE_DETACHED = workerWorkspace.detached ? '1' : '0';
       }
       trustWorkerMiseConfigIfAvailable(workerCwd);
-      const cmd = writeWorkerStartupScriptCommand(
+      const startupCommand = writeWorkerStartupScriptCommand(
         sanitized,
         workerIndex,
         workerLaunchArgs,
@@ -604,7 +634,17 @@ export async function scaleUp(
         workerCli,
         undefined,
         runtimeRole,
-      ) ?? buildWorkerStartupCommand(
+      );
+      if (startupCommand) {
+        createdStartupScriptPaths.push(join(
+          teamStateRoot,
+          'team',
+          sanitized,
+          'runtime',
+          `worker-${workerIndex}-startup.sh`,
+        ));
+      }
+      const cmd = startupCommand ?? buildWorkerStartupCommand(
         sanitized,
         workerIndex,
         workerLaunchArgs,
@@ -947,6 +987,19 @@ export async function scaleDown(
 
     const sessionName = config.tmux_session;
     const removedNames: string[] = [];
+    const priorWorkerStatuses = new Map<string, WorkerStatus>();
+    for (const worker of targetWorkers) {
+      priorWorkerStatuses.set(worker.name, await readWorkerStatus(sanitized, worker.name, leaderCwd));
+    }
+    const restorePriorWorkerStatuses = async (): Promise<void> => {
+      await Promise.all(targetWorkers.map(async (worker) => {
+        const priorStatus = priorWorkerStatuses.get(worker.name);
+        if (priorStatus) {
+          await writeWorkerStatus(sanitized, worker.name, priorStatus, leaderCwd);
+        }
+      }));
+    };
+
 
     // Phase 1: Set workers to 'draining' status
     for (const w of targetWorkers) {
@@ -988,9 +1041,12 @@ export async function scaleDown(
       const unavailable = paneTeardown.proofUnavailable
         .map((proof) => `${proof.paneId}:${proof.reason}`)
         .join(',');
+      await restorePriorWorkerStatuses();
+
       return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
     }
     if (paneTeardown.kill.failedPaneIds.length > 0) {
+      await restorePriorWorkerStatuses();
       return {
         ok: false,
         error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
@@ -1019,6 +1075,7 @@ export async function scaleDown(
       try {
         await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
       } catch (error) {
+        await restorePriorWorkerStatuses();
         return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
       }
     }
