@@ -21,6 +21,18 @@ import { sendWorkerMessage, broadcastWorkerMessage } from '../runtime.js';
 import { drainPendingTeamDispatch } from '../../scripts/notify-hook/team-dispatch.js';
 import { teamCommand } from '../../cli/team.js';
 
+const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}';
+
+function assertExactPaneProofBeforeTargetEffect(tmuxLog: string, paneId: string): void {
+  const commands = tmuxLog.trim().split('\n').filter(Boolean);
+  const effectIndex = commands.findIndex((command) => command.startsWith(`send-keys -t ${paneId} `));
+  assert.ok(effectIndex >= 0, `expected send-keys target effect for ${paneId}`);
+  assert.ok(
+    commands.slice(0, effectIndex).includes(EXACT_GLOBAL_PANE_PROOF_COMMAND),
+    `expected exact global pane proof before send-keys for ${paneId}`,
+  );
+}
+
 function buildFakeTmux(tmuxLogPath: string): string {
   const bufferPath = `${tmuxLogPath}.buffer`;
   return `#!/usr/bin/env bash
@@ -94,7 +106,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n'
+  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n'
+  else
+    printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n'
+  fi
   exit 0
 fi
 exit 0
@@ -402,6 +418,7 @@ describe('team message delivery end-to-end smoke tests', () => {
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
         assert.match(tmuxLog, /send-keys -t %10/);
+        assertExactPaneProofBeforeTargetEffect(tmuxLog, '%10');
       });
     } finally {
       await cleanup();
@@ -411,7 +428,7 @@ describe('team message delivery end-to-end smoke tests', () => {
   it('leader -> worker: broadcast fans out to every worker mailbox and notification path', async () => {
     const { cwd, cleanup } = await setupTeam('leader-broadcast', 3);
     try {
-      await withFakeTmux(cwd, async () => {
+      await withFakeTmux(cwd, async (tmuxLogPath) => {
         await configurePaneIds('leader-broadcast', cwd, '%95', {
           'worker-1': '%10',
           'worker-2': '%11',
@@ -429,6 +446,10 @@ describe('team message delivery end-to-end smoke tests', () => {
         const requests = await listDispatchRequests('leader-broadcast', cwd, { kind: 'mailbox' });
         assert.equal(requests.length, 3);
         assert.equal(requests.filter((request) => request.status === 'notified').length, 3);
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        for (const paneId of ['%10', '%11', '%12']) {
+          assertExactPaneProofBeforeTargetEffect(tmuxLog, paneId);
+        }
       });
     } finally {
       await cleanup();
@@ -728,6 +749,7 @@ describe('team message delivery end-to-end smoke tests', () => {
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
         assert.match(tmuxLog, /send-keys -t %10/);
+        assertExactPaneProofBeforeTargetEffect(tmuxLog, '%10');
         assert.equal(existsSync(join(cwd, '.omx', 'state', 'mailbox.json')), false, 'bridge compat mailbox should not be created when bridge is disabled');
       });
     } finally {

@@ -210,7 +210,11 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    if [ "${2:-}" = "-a" ] && [ "${3:-}" = "-F" ] && [ "${4:-}" = "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]; then',
+          '      printf "%s\n" "%11\t0\t42421" "%21\t0\t42422" "%31\t0\t42424"',
+          '    else',
+          '      echo "42424"',
+          '    fi',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -275,6 +279,7 @@ process.on('SIGTERM', () => process.exit(0));
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /runtime\/worker-2-startup\.sh/);
+      assert.match(tmuxLog, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/m);
       const startupScript = await readFile(
         join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'runtime', 'worker-2-startup.sh'),
         'utf-8',
@@ -311,7 +316,11 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    if [ "${2:-}" = "-a" ] && [ "${3:-}" = "-F" ] && [ "${4:-}" = "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]; then',
+          '      printf "%s\n" "%11\t0\t42421" "%21\t0\t42422" "%31\t0\t42424"',
+          '    else',
+          '      echo "42424"',
+          '    fi',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -383,6 +392,7 @@ process.on('SIGTERM', () => process.exit(0));
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /worker-3-startup\.sh/);
+      assert.match(tmuxLog, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/m);
       assert.doesNotMatch(tmuxLog, /\bclaude\b/);
       assert.doesNotMatch(tmuxLog, /\bgemini\b/);
     } finally {

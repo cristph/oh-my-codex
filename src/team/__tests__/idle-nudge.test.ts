@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_NUDGE_CONFIG, NudgeTracker, capturePane, isPaneIdle } from '../idle-nudge.js';
 
+const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}';
+
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
 set -eu
@@ -59,7 +61,11 @@ if [[ "\$cmd" == "send-keys" ]]; then
 fi
 
 if [[ "\$cmd" == "list-panes" ]]; then
-  printf '0 12345\\n'
+  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%%2\t0\t12345\n'
+  else
+    printf '0 12345\\n'
+  fi
   exit 0
 fi
 
@@ -154,6 +160,13 @@ describe('idle-nudge', () => {
         const first = await tracker.checkAndNudge(['%2'], undefined, 'omx-team-a');
         assert.deepEqual(first, ['%2']);
         const firstLog = await readFile(tmuxLogPath, 'utf-8');
+        const firstCommands = firstLog.trim().split('\n').filter(Boolean);
+        const nudgeEffectIndex = firstCommands.findIndex((command) => command.startsWith('send-keys -t %2 '));
+        assert.ok(nudgeEffectIndex >= 0, 'expected nudge send-keys target effect');
+        assert.ok(
+          firstCommands.slice(0, nudgeEffectIndex).includes(EXACT_GLOBAL_PANE_PROOF_COMMAND),
+          'expected exact global pane proof before nudge target effect',
+        );
 
         setNow(11_000); // < 5000ms scan interval
         const second = await tracker.checkAndNudge(['%2'], undefined, 'omx-team-a');

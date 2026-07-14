@@ -4437,10 +4437,16 @@ case "$1" in
     exit 0
     ;;
   split-window)
-    case "$*" in
-      *"-h"*) echo "%2" ;;
-      *) echo "second worker rejected" >&2; exit 1 ;;
-    esac
+    is_horizontal=0
+    for arg in "$@"; do
+      if [ "$arg" = "-h" ]; then is_horizontal=1; fi
+    done
+    if [ "$is_horizontal" = "1" ]; then
+      echo "%2"
+    else
+      echo "second worker rejected" >&2
+      exit 1
+    fi
     ;;
   set-option|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane)
     exit 0

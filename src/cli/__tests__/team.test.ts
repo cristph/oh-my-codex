@@ -1608,6 +1608,11 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
+      "list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}")
+        printf "%%11\t0\t1111\n%%12\t0\t1212\n%%13\t0\t1313\n%%14\t0\t1414\n"
+        exit 0
+        ;;
+
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
@@ -1690,6 +1695,18 @@ esac
       assert.match(tmuxLog, /kill-pane -t %13/);
       assert.match(tmuxLog, /kill-pane -t %14/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
+      const tmuxCommands = tmuxLog.trim().split('\n').filter(Boolean);
+      const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
+      for (const paneId of ['%12', '%13', '%14']) {
+        const killIndex = tmuxCommands.indexOf(`kill-pane -t ${paneId}`);
+        assert.ok(killIndex > 0, `expected teardown for ${paneId}`);
+        assert.match(
+          tmuxCommands[killIndex - 1] ?? '',
+          exactGlobalPaneProof,
+          `${paneId} teardown must immediately follow a fresh exact global proof`,
+        );
+      }
+      assert.doesNotMatch(tmuxLog, /list-panes -t %(12|13|14)\b/, 'explicit teardown panes must not use target-scoped fallback proof');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
