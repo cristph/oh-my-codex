@@ -19,7 +19,6 @@ import {
   dismissTrustPromptIfPresent,
   sendToWorker,
   isWorkerAlive,
-  getWorkerPanePid,
   teardownWorkerPanes,
   buildWorkerStartupCommand,
   trustWorkerMiseConfigIfAvailable,
@@ -29,6 +28,7 @@ import {
   tagPaneTeamOwner,
   type TeamWorkerCli,
 } from './tmux-session.js';
+import { readExactPaneProofSync } from './exact-pane.js';
 import { spawnSync } from 'child_process';
 import {
   teamReadConfig as readTeamConfig,
@@ -422,10 +422,11 @@ export async function scaleUp(
 
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
+    const createdTaskOwnerById = new Map<string, string | undefined>();
 
     const rollbackScaleUp = async (
       error: string,
-      context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
+      context: { paneId?: string; worker?: WorkerInfo; workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
       const rollbackPaneIds = [
         ...addedWorkers.map((worker) => worker.pane_id),
@@ -435,37 +436,74 @@ export async function scaleUp(
         leaderPaneId: config.leader_pane_id,
         hudPaneId: config.hud_pane_id,
       });
+      const firstUnavailablePaneId = paneTeardown.proofUnavailable[0]?.paneId;
+      const processedPaneIds = firstUnavailablePaneId
+        ? paneTeardown.attemptedPaneIds.slice(0, paneTeardown.attemptedPaneIds.indexOf(firstUnavailablePaneId))
+        : paneTeardown.attemptedPaneIds;
+      const successfullyRemovedPaneIds = new Set([
+        ...paneTeardown.provenGonePaneIds,
+        ...processedPaneIds.filter((paneId) => !paneTeardown.kill.failedPaneIds.includes(paneId)),
+      ]);
+      const safelyRemovedWorkers = addedWorkers.filter((worker) => (
+        typeof worker.pane_id === 'string' && successfullyRemovedPaneIds.has(worker.pane_id)
+      ));
+
+      for (const worker of safelyRemovedWorkers) {
+        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
+        if (idx >= 0) config.workers.splice(idx, 1);
+        if (worker.worktree_path) {
+          await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
+        }
+      }
+      const safelyRemovedWorkerNames = new Set(safelyRemovedWorkers.map((worker) => worker.name));
+      for (const taskId of createdTaskIds) {
+        if (!safelyRemovedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
+        await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+      }
+
       if (paneTeardown.proofUnavailable.length > 0) {
+        if (context.worker && !config.workers.some((worker) => worker.name === context.worker!.name)) {
+          config.workers.push(context.worker);
+          await writeWorkerIdentity(sanitized, context.worker.name, context.worker, leaderCwd);
+        }
+        config.worker_count = config.workers.length;
+        config.next_worker_index = Math.max(
+          initialNextIndex,
+          ...config.workers.map((worker) => worker.index + 1),
+        );
+        await saveTeamConfig(config, leaderCwd);
         const unavailable = paneTeardown.proofUnavailable
           .map((proof) => `${proof.paneId}:${proof.reason}`)
           .join(',');
         return { ok: false, error: `scale_up_rollback_pane_proof_unavailable:${unavailable}` };
       }
 
-      for (const w of addedWorkers) {
-        const idx = config.workers.findIndex((worker) => worker.name === w.name);
-        if (idx >= 0) {
-          config.workers.splice(idx, 1);
-        }
-        if (w.worktree_path) {
-          await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
+      for (const worker of addedWorkers) {
+        if (safelyRemovedWorkerNames.has(worker.name)) continue;
+        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
+        if (idx >= 0) config.workers.splice(idx, 1);
+        if (worker.worktree_path) {
+          await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
         }
       }
 
+      const contextWorkerName = context.worker?.name ?? context.workerName;
+      const contextWorktreePath = context.worker?.worktree_path ?? context.worktreePath;
       if (
-        context.workerName &&
-        context.worktreePath &&
-        !addedWorkers.some((worker) => worker.name === context.workerName)
+        contextWorkerName
+        && contextWorktreePath
+        && !addedWorkers.some((worker) => worker.name === contextWorkerName)
       ) {
         await removeWorkerWorktreeRootAgentsFile(
           sanitized,
-          context.workerName,
+          contextWorkerName,
           teamStateRoot,
-          context.worktreePath,
+          contextWorktreePath,
         ).catch(() => {});
       }
 
       for (const taskId of createdTaskIds) {
+        if (safelyRemovedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
 
@@ -488,6 +526,7 @@ export async function scaleUp(
         role: task.role,
       }, leaderCwd);
       createdTaskIds.push(createdTask.id);
+      createdTaskOwnerById.set(createdTask.id, createdTask.owner);
     }
     const materializedTasks = await listTasks(sanitized, leaderCwd);
 
@@ -603,30 +642,14 @@ export async function scaleUp(
           worktreePath: workerWorkspace?.worktreePath,
         });
       }
-      if (config.tmux_pane_owner_id) {
-        try {
-          tagPaneTeamOwner(paneId, config.tmux_pane_owner_id);
-        } catch (error) {
-          return await rollbackScaleUp(
-            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
-            { paneId, workerName, worktreePath: workerWorkspace?.worktreePath },
-          );
-        }
-      }
-
-      // Intentionally avoid forcing `select-layout tiled` here.
-      // Tiled relayout reflows leader/HUD panes and breaks team window layout.
-
-      // Get PID
-      const panePid = getWorkerPanePid(sessionName, workerIndex, paneId);
-
+      const paneProof = readExactPaneProofSync(paneId);
       const workerInfo: WorkerInfo = {
         name: workerName,
         index: workerIndex,
         role: runtimeRole,
         worker_cli: workerCli,
         assigned_tasks: [],
-        pid: panePid ?? undefined,
+        pid: paneProof.status === 'live' ? paneProof.pid : undefined,
         pane_id: paneId,
         working_dir: workerCwd,
         worktree_repo_root: workerWorkspace ? workerWorkspace.repoRoot : undefined,
@@ -636,6 +659,25 @@ export async function scaleUp(
         worktree_created: workerWorkspace ? workerWorkspace.created : undefined,
         team_state_root: teamStateRoot,
       };
+
+      if (paneProof.status !== 'live') {
+        return await rollbackScaleUp(`Failed to prove tmux pane for ${workerName}`, { paneId, worker: workerInfo });
+      }
+
+      if (config.tmux_pane_owner_id) {
+        try {
+          tagPaneTeamOwner(paneProof.paneId, config.tmux_pane_owner_id);
+        } catch (error) {
+          return await rollbackScaleUp(
+            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
+            { paneId, worker: workerInfo },
+          );
+        }
+      }
+
+      // Intentionally avoid forcing `select-layout tiled` here.
+      // Tiled relayout reflows leader/HUD panes and breaks team window layout.
+
 
       await writeWorkerIdentity(sanitized, workerName, workerInfo, leaderCwd);
 
@@ -783,8 +825,7 @@ export async function scaleUp(
       if (!outcome.ok) {
         return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, {
           paneId,
-          workerName,
-          worktreePath: workerWorkspace?.worktreePath,
+          worker: workerInfo,
         });
       }
 

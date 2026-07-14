@@ -991,7 +991,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     }
   });
 
-  it('rolls back a scaled worker pane when team owner tagging fails', async () => {
+  it('persists a newly created worker when rollback pane proof is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-owner-tag-rollback-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-owner-tag-rollback-bin-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -1021,16 +1021,18 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    esac',
           '    ;;',
           '  list-panes)',
-          '    case "$*" in',
-          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
-          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
-          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
-          "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
-          '        ;;',
-          '      *)',
-          '        echo "42424"',
-          '        ;;',
-          '    esac',
+          `    count_file="${join(fakeBinDir, 'proof-count')}"`,
+          '    count=0',
+          '    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi',
+          '    count=$((count + 1))',
+          '    printf "%s" "$count" > "$count_file"',
+          '    if [ "$count" -eq 1 ]; then',
+          "      printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
+          "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+          "      printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+          '    else',
+          "      printf 'malformed pane snapshot\\n'",
+          '    fi',
           '    ;;',
           '  kill-pane|send-keys|capture-pane)',
           '    ;;',
@@ -1056,17 +1058,24 @@ printf '%s\\n' "$@" > '${capturePath}'
       );
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.match(result.error, /Failed to tag tmux pane for worker-2/);
+      assert.match(result.error, /scale_up_rollback_pane_proof_unavailable:%31:malformed_snapshot/);
 
       const config = await readTeamConfig('scale-up-owner-tag-rollback', cwd);
-      assert.equal(config?.workers.length, 1);
-      assert.equal(await readTask('scale-up-owner-tag-rollback', '1', cwd), null);
+      assert.equal(config?.workers.length, 2);
+      assert.equal(config?.workers[1]?.pane_id, '%31');
+      assert.equal(config?.next_worker_index, 3);
+      assert.equal((await readTask('scale-up-owner-tag-rollback', '1', cwd))?.owner, 'worker-2');
+      const identity = JSON.parse(await readFile(
+        join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'workers', 'worker-2', 'identity.json'),
+        'utf-8',
+      )) as { pane_id?: string };
+      assert.equal(identity.pane_id, '%31');
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
         command === 'set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-owner-tag-rollback'
       )));
-      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
+      assert.equal(tmuxCommands.some((command) => command === 'kill-pane -t %31'), false);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

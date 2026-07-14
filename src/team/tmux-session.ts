@@ -3114,7 +3114,7 @@ export async function teardownWorkerPanes(
     }
     if (proof.status === 'unavailable') {
       summary.proofUnavailable.push(proof);
-      continue;
+      break;
     }
 
     summary.kill.attempted += 1;

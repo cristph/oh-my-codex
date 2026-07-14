@@ -6404,26 +6404,33 @@ esac
     );
   });
 
-  it('records proof-unavailable targets without attempting a kill', async () => {
+  it('stops at the first unavailable proof without killing a later live candidate', async () => {
     await withMockTmuxFixture(
       'omx-tmux-teardown-proof-unavailable-',
-      (logPath) => `#!/bin/sh
+      (logPath) => {
+        const proofStatePath = `${logPath}.proof-state`;
+        return `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${logPath}"
 if [ "$1" = "list-panes" ]; then
-  echo "tmux unavailable" >&2
-  exit 1
+  if [ -f "${proofStatePath}" ]; then
+    printf '%%405\t0\t%s\n' "$$"
+  else
+    : > "${proofStatePath}"
+    echo "tmux unavailable" >&2
+    exit 1
+  fi
 fi
 exit 0
-`,
+`;
+      },
       async ({ logPath }) => {
-        const summary = await teardownWorkerPanes(['%404'], { graceMs: 1 });
+        const summary = await teardownWorkerPanes(['%404', '%405'], { graceMs: 1 });
         assert.equal(summary.kill.attempted, 0);
         assert.deepEqual(summary.provenGonePaneIds, []);
         assert.deepEqual(summary.proofUnavailable.map((proof) => proof.paneId), ['%404']);
-        const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /list-panes -a -F/);
-        assert.doesNotMatch(log, /kill-pane/);
+        const commands = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean);
+        assert.deepEqual(commands, ['list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}']);
       },
     );
   });
