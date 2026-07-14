@@ -4544,7 +4544,7 @@ esac
         async ({ logPath }) => {
           process.env.TMUX = 'leader-session,stub,0';
           process.env.TMUX_PANE = '%1';
-          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
           process.env[OMX_ENTRY_PATH_ENV] = join(cwd, 'omx.js');
           process.argv = [previousArgv[0] || 'node', join(cwd, 'omx.js')];
 
