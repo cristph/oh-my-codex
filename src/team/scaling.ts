@@ -461,32 +461,51 @@ export async function scaleUp(
         ...paneTeardown.provenGonePaneIds,
         ...processedPaneIds.filter((paneId) => !paneTeardown.kill.failedPaneIds.includes(paneId)),
       ]);
-      const safelyRemovedWorkers = addedWorkers.filter((worker) => (
-        typeof worker.pane_id === 'string' && successfullyRemovedPaneIds.has(worker.pane_id)
-      ));
-
-      for (const worker of safelyRemovedWorkers) {
-        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
-        if (idx >= 0) config.workers.splice(idx, 1);
-        if (worker.worktree_path) {
-          await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
-        }
-      }
-      const safelyRemovedWorkerNames = new Set(safelyRemovedWorkers.map((worker) => worker.name));
-      for (const taskId of createdTaskIds) {
-        if (!safelyRemovedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
-        await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
-      }
-
-      const failedPaneIds = paneTeardown.kill.failedPaneIds;
-      const unresolvedWorkers = [...new Map(
+      const rollbackWorkers = [...new Map(
         [...addedWorkers, context.worker]
           .filter((worker): worker is WorkerInfo => Boolean(worker))
           .map((worker): [string, WorkerInfo] => [worker.name, worker]),
-      ).values()].filter((worker) => (
+      ).values()];
+      const safelyRemovedWorkers = rollbackWorkers.filter((worker) => (
+        typeof worker.pane_id === 'string' && successfullyRemovedPaneIds.has(worker.pane_id)
+      ));
+      const safelyRemovedWorkerNames = new Set(safelyRemovedWorkers.map((worker) => worker.name));
+      const safelyRemovedWorktreePaths = new Set(
+        safelyRemovedWorkers
+          .map((worker) => worker.worktree_path)
+          .filter((worktreePath): worktreePath is string => typeof worktreePath === 'string'),
+      );
+      const cleanupSafelyRemovedWorkers = async (): Promise<void> => {
+        const safelyRemovedWorktrees = provisionedWorktrees.filter((worktree) => (
+          safelyRemovedWorktreePaths.has(worktree.worktreePath)
+        ));
+        if (safelyRemovedWorktrees.length > 0) {
+          await rollbackProvisionedWorktrees(safelyRemovedWorktrees);
+        }
+        await Promise.all(safelyRemovedWorkers.map(async (worker) => {
+          if (worker.worktree_path) {
+            await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
+          }
+          await rm(join(teamStateRoot, 'team', sanitized, 'workers', worker.name), { recursive: true, force: true });
+          await rm(join(runtimeDirectoryPath, `worker-${worker.index}-startup.sh`), { force: true });
+        }));
+      };
+      for (const worker of safelyRemovedWorkers) {
+        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
+        if (idx >= 0) config.workers.splice(idx, 1);
+      }
+
+      const failedPaneIds = paneTeardown.kill.failedPaneIds;
+      const unresolvedWorkers = rollbackWorkers.filter((worker) => (
         typeof worker.pane_id === 'string' && !successfullyRemovedPaneIds.has(worker.pane_id)
       ));
+      const unresolvedWorkerNames = new Set(unresolvedWorkers.map((worker) => worker.name));
       if (failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
+        await cleanupSafelyRemovedWorkers();
+        for (const taskId of createdTaskIds) {
+          if (unresolvedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
+          await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+        }
         for (const worker of unresolvedWorkers) {
           if (!config.workers.some((candidate) => candidate.name === worker.name)) {
             config.workers.push(worker);
@@ -508,13 +527,11 @@ export async function scaleUp(
         return { ok: false, error: `scale_up_rollback_pane_proof_unavailable:${unavailable}` };
       }
 
+      await cleanupSafelyRemovedWorkers();
       for (const worker of addedWorkers) {
         if (safelyRemovedWorkerNames.has(worker.name)) continue;
         const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
         if (idx >= 0) config.workers.splice(idx, 1);
-        if (worker.worktree_path) {
-          await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
-        }
       }
 
       const contextWorkerName = context.worker?.name ?? context.workerName;
@@ -522,7 +539,7 @@ export async function scaleUp(
       if (
         contextWorkerName
         && contextWorktreePath
-        && !addedWorkers.some((worker) => worker.name === contextWorkerName)
+        && !rollbackWorkers.some((worker) => worker.name === contextWorkerName)
       ) {
         await removeWorkerWorktreeRootAgentsFile(
           sanitized,
@@ -531,7 +548,9 @@ export async function scaleUp(
           contextWorktreePath,
         ).catch(() => {});
       }
-      await rollbackProvisionedWorktrees(provisionedWorktrees);
+      await rollbackProvisionedWorktrees(provisionedWorktrees.filter((worktree) => (
+        !safelyRemovedWorktreePaths.has(worktree.worktreePath)
+      )));
       await Promise.all(createdWorkerDirectories.map(async (workerDirPath) => {
         await rm(workerDirPath, { recursive: true, force: true });
       }));
@@ -543,7 +562,6 @@ export async function scaleUp(
       }
 
       for (const taskId of createdTaskIds) {
-        if (safelyRemovedWorkerNames.has(createdTaskOwnerById.get(taskId) ?? '')) continue;
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
 
@@ -1014,8 +1032,8 @@ export async function scaleDown(
         }
       }
     }
-    const restorePriorWorkerStatuses = async (): Promise<void> => {
-      await Promise.all(targetWorkers.map(async (worker) => {
+    const restorePriorWorkerStatuses = async (workers: readonly WorkerInfo[]): Promise<void> => {
+      await Promise.all(workers.map(async (worker) => {
         const statusPath = join(teamStateRoot, 'team', sanitized, 'workers', worker.name, 'status.json');
         const priorArtifact = priorWorkerStatusArtifacts.get(worker.name);
         if (priorArtifact?.exists) {
@@ -1026,6 +1044,7 @@ export async function scaleDown(
       }));
     };
 
+    let unresolvedWorkersForRecovery: readonly WorkerInfo[] = targetWorkers;
     try {
 
 
@@ -1065,21 +1084,22 @@ export async function scaleDown(
       leaderPaneId,
       hudPaneId,
     });
-    if (paneTeardown.kill.failedPaneIds.length > 0) {
-      await restorePriorWorkerStatuses();
-      return {
-        ok: false,
-        error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
-      };
-    }
-    if (paneTeardown.proofUnavailable.length > 0) {
-      const unavailable = paneTeardown.proofUnavailable
-        .map((proof) => `${proof.paneId}:${proof.reason}`)
-        .join(',');
-      await restorePriorWorkerStatuses();
-      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
-    }
-    const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
+    const firstUnavailablePaneId = paneTeardown.proofUnavailable[0]?.paneId;
+    const processedPaneIds = firstUnavailablePaneId
+      ? paneTeardown.attemptedPaneIds.slice(0, paneTeardown.attemptedPaneIds.indexOf(firstUnavailablePaneId))
+      : paneTeardown.attemptedPaneIds;
+    const resolvedPaneIds = new Set([
+      ...paneTeardown.provenGonePaneIds,
+      ...processedPaneIds.filter((paneId) => !paneTeardown.kill.failedPaneIds.includes(paneId)),
+    ]);
+    const removedWorkers = targetWorkers.filter((worker) => (
+      !worker.pane_id || resolvedPaneIds.has(worker.pane_id)
+    ));
+    const unresolvedWorkers = targetWorkers.filter((worker) => (
+      typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
+    ));
+    unresolvedWorkersForRecovery = unresolvedWorkers;
+    const detachedWorktreesToRollback: EnsureWorktreeResult[] = removedWorkers
       .filter((worker) =>
         worker.worktree_created === true
         && worker.worktree_detached === true
@@ -1098,27 +1118,45 @@ export async function scaleDown(
         reused: false,
         createdBranch: false,
       }));
-    if (detachedWorktreesToRollback.length > 0) {
-      try {
+    try {
+      if (detachedWorktreesToRollback.length > 0) {
         await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
-      } catch (error) {
-        await restorePriorWorkerStatuses();
-        return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
       }
+      await Promise.all(removedWorkers.map(async (worker) => {
+        if (worker.worktree_path) {
+          await removeWorkerWorktreeRootAgentsFile(
+            sanitized,
+            worker.name,
+            worker.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
+            worker.worktree_path,
+          ).catch(() => {});
+        }
+        await rm(join(teamStateRoot, 'team', sanitized, 'workers', worker.name), { recursive: true, force: true });
+      }));
+    } catch (error) {
+      await restorePriorWorkerStatuses(unresolvedWorkers);
+      return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
     }
 
-    for (const w of targetWorkers) {
-      if (w.worktree_path) {
-        await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, w.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd), w.worktree_path).catch(() => {});
-      }
-      removedNames.push(w.name);
-    }
-
-    // Phase 4: Update config
+    removedNames.push(...removedWorkers.map((worker) => worker.name));
     const removedSet = new Set(removedNames);
-    config.workers = config.workers.filter(w => !removedSet.has(w.name));
+    config.workers = config.workers.filter((worker) => !removedSet.has(worker.name));
     config.worker_count = config.workers.length;
     await saveTeamConfig(config, leaderCwd);
+    await restorePriorWorkerStatuses(unresolvedWorkers);
+
+    if (paneTeardown.kill.failedPaneIds.length > 0) {
+      return {
+        ok: false,
+        error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
+      };
+    }
+    if (paneTeardown.proofUnavailable.length > 0) {
+      const unavailable = paneTeardown.proofUnavailable
+        .map((proof) => `${proof.paneId}:${proof.reason}`)
+        .join(',');
+      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
+    }
 
     await appendTeamEvent(sanitized, {
       type: 'team_leader_nudge',
@@ -1130,9 +1168,9 @@ export async function scaleDown(
       ok: true,
       removedWorkers: removedNames,
       newWorkerCount: config.worker_count,
-      };
+    };
     } catch (error) {
-      await restorePriorWorkerStatuses();
+      await restorePriorWorkerStatuses(unresolvedWorkersForRecovery);
       throw error;
     }
   });
