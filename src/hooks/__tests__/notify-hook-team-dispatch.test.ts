@@ -112,12 +112,47 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    if [[ -n "\${OMX_TEST_EXACT_PANE_SEQUENCE_FILE:-}" && -f "\${OMX_TEST_EXACT_PANE_SEQUENCE_FILE}" ]]; then
+      counterFile="\${OMX_TEST_EXACT_PANE_COUNTER_FILE:-\${OMX_TEST_EXACT_PANE_SEQUENCE_FILE}.idx}"
+      idx=0
+      if [[ -f "$counterFile" ]]; then idx="$(cat "$counterFile")"; fi
+      lineNo=$((idx + 1))
+      line="$(sed -n "\${lineNo}p" "\${OMX_TEST_EXACT_PANE_SEQUENCE_FILE}" || true)"
+      if [[ -z "$line" ]]; then
+        line="$(tail -n 1 "\${OMX_TEST_EXACT_PANE_SEQUENCE_FILE}" || true)"
+      fi
+      echo "$lineNo" > "$counterFile"
+      if [[ "$line" != "__EMPTY__" ]]; then printf '%b\n' "$line"; fi
+      exit 0
+    fi
+    printf '%%42\t0\t4242\n%%99\t0\t9999\n'
+    exit 0
+  fi
   echo "%42 1"
   exit 0
 fi
 exit 0
 `;
 }
+
+function assertFreshExactProofBeforePaneEffects(tmuxLog: string, paneId: string): void {
+  const commands = tmuxLog.trim().split('\n').filter(Boolean);
+  const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
+  const effects = commands
+    .map((command, index) => ({ command, index }))
+    .filter(({ command }) => (
+      command.startsWith(`paste-buffer -t ${paneId} `)
+      || command.startsWith(`kill-pane -t ${paneId} `)
+      || (command.startsWith(`send-keys -t ${paneId} `) && !command.includes(' -l '))
+    ));
+
+  assert.ok(effects.length > 0, `expected explicit pane effects for ${paneId}:\n${commands.join('\n')}`);
+  for (const { command, index } of effects) {
+    assert.match(commands[index - 1] ?? '', exactGlobalPaneProof, `fresh proof must immediately precede ${command}`);
+  }
+}
+
 
 async function readTeamDeliveryLog(cwd: string): Promise<Array<Record<string, unknown>>> {
   const path = join(cwd, '.omx', 'logs', `team-delivery-${new Date().toISOString().slice(0, 10)}.jsonl`);
@@ -645,6 +680,7 @@ exit 0
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assertFreshExactProofBeforePaneEffects(tmuxLog, '%99');
       assert.match(tmuxLog, /send-keys -t %99/);
       assert.match(tmuxLog, /mailbox\/leader-fixed\.json; worker-1 sent a new message/);
       assert.doesNotMatch(tmuxLog, /send-keys -t .*devsess/);
@@ -654,8 +690,131 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
+  it('uses the persisted worker pane as an exact identity without generic resolution', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
 
-  it('leader-fixed dispatch prefers the canonical codex pane over a stale HUD leader pane id', async () => {
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.workers[0].pane_id = '%99';
+      await saveTeamConfig(cfg, cwd);
+      await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        trigger_message: 'use the configured worker pane',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.processed, 1);
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assertFreshExactProofBeforePaneEffects(tmuxLog, '%99');
+      assert.match(tmuxLog, /send-keys -t %99/);
+      assert.doesNotMatch(tmuxLog, /display-message -p -t %99 #\{pane_id\}/);
+      assert.doesNotMatch(tmuxLog, /list-panes -t /);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before tmux effects when request and configured panes differ', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.workers[0].pane_id = '%99';
+      await saveTeamConfig(cfg, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: '%42',
+        trigger_message: 'must not be redirected',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'exact_pane_mismatch');
+      assert.equal(await readFile(tmuxLogPath, 'utf8').catch(() => ''), '');
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('fails an invalid request pane without session or index fallback', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.tmux_session = 'must-not-resolve';
+      delete cfg.workers[0].pane_id;
+      await saveTeamConfig(cfg, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: 'invalid-pane-id',
+        trigger_message: 'must not be sent',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.last_reason, 'exact_pane_unavailable');
+      assert.equal(await readFile(tmuxLogPath, 'utf8').catch(() => ''), '');
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the persisted leader pane as an exact identity without resolver healing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
@@ -754,7 +913,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf "%%42\\t1\\tnode\\tcodex\\n%%91\\t0\\tnode\\tnode dist/cli/omx.js hud --watch\\n"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf "%%42\\t0\\t4242\\n%%91\\t0\\t9191\\n"
+  else
+    printf "%%42\\t1\\tnode\\tcodex\\n%%91\\t0\\tnode\\tnode dist/cli/omx.js hud --watch\\n"
+  fi
   exit 0
 fi
 exit 0
@@ -785,8 +948,9 @@ exit 0
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %91/);
+      assert.match(tmuxLog, /send-keys -t %91/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42/);
+      assert.doesNotMatch(tmuxLog, /display-message -p -t %91 #\{pane_id\}/, 'configured leader pane must bypass the generic resolver');
     } finally {
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -876,7 +1040,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf "%%77\\t1\\tcodex\\tcodex\\n"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf "%%77\\t0\\t7777\\n"
+  else
+    printf "%%77\\t1\\tcodex\\tcodex\\n"
+  fi
   exit 0
 fi
 exit 0
@@ -1632,7 +1800,130 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /list-panes -t omx-team-session-target/);
       assert.match(tmuxLog, /send-keys -t %42 -l dispatch ping/);
+      assert.doesNotMatch(tmuxLog, /list-panes -a/, 'session-only targets must not gain exact-pane proof resolution');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for invalid explicit pane proofs without resolving or targeting another pane', async () => {
+    const scenarios = [
+      ['similar', '%420\\t0\\t4200'],
+      ['dead', '%42\\t1\\t4242'],
+      ['missing', '__EMPTY__'],
+      ['unavailable', 'malformed snapshot'],
+    ] as const;
+
+    for (const [name, snapshot] of scenarios) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-hook-exact-pane-${name}-`));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      const exactPaneSequencePath = join(cwd, 'exact-pane-sequence.txt');
+      const previousPath = process.env.PATH;
+      try {
+        await mkdir(fakeBinDir, { recursive: true });
+        await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+        await writeFile(exactPaneSequencePath, `${snapshot}\n`);
+        process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+        process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE = exactPaneSequencePath;
+
+        await initTeamState('alpha', 'task', 'executor', 1, cwd);
+        const queued = await enqueueDispatchRequest('alpha', {
+          kind: 'inbox',
+          to_worker: 'worker-1',
+          worker_index: 1,
+          pane_id: '%42',
+          trigger_message: 'do not retarget this request',
+        }, cwd);
+
+        const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+        const mod = await import(pathToFileURL(modulePath).href);
+        const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+        assert.equal(result.failed, 1, `${name} proof should fail the request`);
+
+        const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+        assert.equal(request?.status, 'failed');
+        assert.equal(request?.last_reason, 'exact_pane_unavailable');
+
+        const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+        const commands = tmuxLog.trim().split('\n').filter(Boolean);
+        assert.match(commands[0] || '', /^list-panes -a(?:\s|$)/, `${name} must prove the global pane first`);
+        assert.doesNotMatch(tmuxLog, /display-message|capture-pane|send-keys|paste-buffer/);
+        assert.doesNotMatch(tmuxLog, /list-panes -t /, `${name} must not use the session resolver fallback`);
+        const dispatchLogPath = join(cwd, '.omx', 'logs', `team-dispatch-${new Date().toISOString().slice(0, 10)}.jsonl`);
+        const dispatchLog = (await readFile(dispatchLogPath, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        const failure = dispatchLog.find((entry) => entry.request_id === queued.request.request_id && entry.type === 'dispatch_failed');
+        assert.equal(failure?.exact_pane_proof?.status, name === 'unavailable' ? 'unavailable' : 'gone');
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        delete process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE;
+        delete process.env.OMX_TEST_EXACT_PANE_COUNTER_FILE;
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('stops explicit-pane dispatch after a later exact proof is lost', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-exact-pane-loss-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const exactPaneSequencePath = join(cwd, 'exact-pane-sequence.txt');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      await writeFile(exactPaneSequencePath, [
+        '%42\t0\t4242', // readiness: mode
+        '%42\t0\t4242', // readiness: current command
+        '%42\t0\t4242', // readiness: capture
+        '%42\t0\t4242', // send: initial identity check before buffer setup
+        '%42\t0\t4242', // send: clear composer
+        '%42\t1\t4242', // send: paste buffer must be blocked
+      ].join('\n'));
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+      process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE = exactPaneSequencePath;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: '%42',
+        trigger_message: 'stop after proof loss',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'exact_pane_unavailable');
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      const commands = tmuxLog.trim().split('\n').filter(Boolean);
+      const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
+      assert.match(commands[0] || '', exactGlobalPaneProof);
+      assert.match(tmuxLog, /send-keys -t %42 C-u/, 'the live proof should permit the clear effect');
+      assert.doesNotMatch(tmuxLog, /paste-buffer -t %42|send-keys -t %42 C-m/);
+      for (const [index, command] of commands.entries()) {
+        if (!/^(display-message|capture-pane|send-keys|paste-buffer)\b/.test(command) || !command.includes('-t %42')) continue;
+        assert.match(commands[index - 1] || '', exactGlobalPaneProof, `exact proof must immediately precede ${command}`);
+      }
+      const lastProof = commands.map((command, index) => exactGlobalPaneProof.test(command) ? index : -1).filter((index) => index >= 0).at(-1);
+      assert.notEqual(lastProof, undefined);
+      const commandsAfterLostProof = commands.slice((lastProof || 0) + 1);
+      assert.equal(commandsAfterLostProof.length, 1, 'only non-pane buffer cleanup may follow proof loss');
+      assert.match(commandsAfterLostProof[0] || '', /^delete-buffer -b /);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      delete process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE;
+      delete process.env.OMX_TEST_EXACT_PANE_COUNTER_FILE;
       await rm(cwd, { recursive: true, force: true });
     }
   });

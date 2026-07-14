@@ -20,10 +20,19 @@ function isolatedChildEnv(fakeBinDir: string): NodeJS.ProcessEnv {
   };
 }
 
+function liveExactPaneProof(): string {
+  return `if [[ "\${1:-}" == "list-panes" && "$#" -eq 4 && "\${2:-}" == "-a" && "\${3:-}" == "-F" && "\${4:-}" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+  printf '%%42\\t0\\t4242\\n'
+  exit 0
+fi`;
+}
+
 function buildFakeTmux(tmuxLogPath: string): string {
   const bufferPath = `${tmuxLogPath}.buffer`;
   return `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
+
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
@@ -53,6 +62,7 @@ function runSendPaneInputInChild(params: {
   submitKeyPresses: number;
   typePrompt: boolean;
   queueFirstSubmit?: boolean;
+  exactPaneId?: string;
 }) {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
@@ -61,6 +71,7 @@ function runSendPaneInputInChild(params: {
     tmuxBin: join(params.fakeBinDir, 'tmux'),
     typePrompt: params.typePrompt,
     queueFirstSubmit: params.queueFirstSubmit,
+    exactPaneId: params.exactPaneId,
   });
   const script = `
     const input = ${payload};
@@ -229,6 +240,8 @@ describe('notify-hook team tmux guard bridge', () => {
         join(fakeBinDir, 'tmux'),
         `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
+
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
@@ -283,6 +296,8 @@ exit 0
         join(fakeBinDir, 'tmux'),
         `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
+
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
@@ -336,6 +351,8 @@ exit 0
         join(fakeBinDir, 'tmux'),
         `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
+
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
@@ -398,6 +415,8 @@ exit 0
         join(fakeBinDir, 'tmux'),
         `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
+
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
@@ -452,6 +471,7 @@ exit 0
         join(fakeBinDir, 'tmux'),
         `#!/usr/bin/env bash
 set -eu
+${liveExactPaneProof()}
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
@@ -491,6 +511,38 @@ exit 0
       assert.equal(parsed.reason, 'ok');
       assert.equal(parsed.paneCurrentCommand, 'codex');
       assert.equal(parsed.paneCapture, '');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an invalid explicit pane identity without any tmux action', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+
+      const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+      const result = runSendPaneInputInChild({
+        fakeBinDir,
+        moduleUrl,
+        paneTarget: '%42',
+        exactPaneId: 'invalid-pane-id',
+        prompt: 'must not be sent',
+        submitKeyPresses: 1,
+        typePrompt: true,
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.ok, false);
+      assert.equal(parsed.reason, 'exact_pane_unavailable');
+      assert.equal(parsed.exactPaneProof?.reason, 'invalid_pane_id');
+      assert.equal(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), '');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

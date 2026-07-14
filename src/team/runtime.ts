@@ -9,6 +9,7 @@ import {
   isTmuxAvailable,
   hasCurrentTmuxClientContext,
   createTeamSession,
+  CreateTeamSessionPartialError,
   buildWorkerProcessLaunchSpec,
   scrubTeamWorkerHudOwnershipEnv,
   resolveTeamWorkerCli,
@@ -26,7 +27,6 @@ import {
   isWorkerAlive,
   isWorkerPaneOpen,
   getWorkerPanePid,
-  killWorkerByPaneIdAsync,
   paneHasOmxInstanceTag,
   readPaneTeamOwnerTagResult,
   restoreStandaloneHudPane,
@@ -37,6 +37,7 @@ import {
   listTeamSessions,
   resolveSharedSessionShutdownTopology,
 } from './tmux-session.js';
+import { readExactPaneProofSync, type ExactPaneProof } from './exact-pane.js';
 import {
   teamInit as initTeamState,
   DEFAULT_MAX_WORKERS,
@@ -485,6 +486,23 @@ export function shouldPrekillInteractiveShutdownProcessTrees(sessionName: string
   // including native Windows prompt-worker ancestry where pane-targeted
   // teardown alone is insufficient.
   return true;
+}
+
+interface UnavailablePaneProof {
+  paneId: string;
+  reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot';
+  detail?: string;
+}
+
+function assertPaneTeardownProofsAvailable(
+  operation: string,
+  unavailableProofs: readonly UnavailablePaneProof[],
+): void {
+  if (unavailableProofs.length === 0) return;
+  const detail = unavailableProofs
+    .map((proof) => `${proof.paneId}:${proof.reason}${proof.detail ? `:${proof.detail}` : ''}`)
+    .join(',');
+  throw new Error(`${operation}_pane_proof_unavailable:${detail}`);
 }
 
 export async function cleanupTeamWorkerLaunchOrphanedMcpProcesses(
@@ -2218,6 +2236,124 @@ async function terminateTrackedProcessTree(
   };
 }
 
+type ExactPaneUnavailableProof = Extract<ExactPaneProof, { status: 'unavailable' }>;
+
+type ExactPaneProcessTreeTeardown = {
+  terminated: boolean;
+  stopped: boolean;
+  proofUnavailable?: ExactPaneUnavailableProof;
+};
+
+type ExactPaneProcessProbe =
+  | { status: 'alive' | 'gone' | 'stopped' }
+  | { status: 'unavailable'; proof: ExactPaneUnavailableProof };
+
+/**
+ * Every operating-system effect attributed to an explicit pane must re-read
+ * the pane's global row immediately before that effect. A changed/dead row is
+ * not a fallback opportunity: it stops this pane's process-tree teardown.
+ */
+function signalExactPaneProcess(
+  paneId: string,
+  authorizedPanePid: number,
+  pid: number,
+  signal: NodeJS.Signals,
+): ExactPaneProcessProbe {
+  const proof = readExactPaneProofSync(paneId);
+  if (proof.status === 'unavailable') return { status: 'unavailable', proof };
+  if (proof.status !== 'live' || proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // A process may exit between the exact proof and its signal. The guarded
+    // wait below establishes whether the tracked tree is already gone.
+  }
+  return { status: 'alive' };
+}
+
+function probeExactPaneProcess(
+  paneId: string,
+  authorizedPanePid: number,
+  pid: number,
+): ExactPaneProcessProbe {
+  const proof = readExactPaneProofSync(paneId);
+  if (proof.status === 'unavailable') return { status: 'unavailable', proof };
+  if (proof.status !== 'live' || proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  try {
+    process.kill(pid, 0);
+    return { status: 'alive' };
+  } catch {
+    return { status: 'gone' };
+  }
+}
+
+async function waitForExactPaneTrackedPidsExit(
+  paneId: string,
+  authorizedPanePid: number,
+  pids: readonly number[],
+  timeoutMs: number,
+): Promise<ExactPaneProcessTreeTeardown> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  do {
+    let anyAlive = false;
+    for (const pid of pids) {
+      const probe = probeExactPaneProcess(paneId, authorizedPanePid, pid);
+      if (probe.status === 'unavailable') return { terminated: false, stopped: true, proofUnavailable: probe.proof };
+      if (probe.status === 'stopped') return { terminated: false, stopped: true };
+      if (probe.status === 'alive') anyAlive = true;
+    }
+    if (!anyAlive) return { terminated: true, stopped: false };
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, PROMPT_WORKER_EXIT_POLL_MS));
+  } while (Date.now() < deadline);
+
+  let anyAlive = false;
+  for (const pid of pids) {
+    const probe = probeExactPaneProcess(paneId, authorizedPanePid, pid);
+    if (probe.status === 'unavailable') return { terminated: false, stopped: true, proofUnavailable: probe.proof };
+    if (probe.status === 'stopped') return { terminated: false, stopped: true };
+    if (probe.status === 'alive') anyAlive = true;
+  }
+  return { terminated: !anyAlive, stopped: false };
+}
+
+async function terminateExactPaneProcessTree(
+  paneId: string,
+  graceMs: number = PROMPT_WORKER_SIGTERM_WAIT_MS,
+  killWaitMs: number = PROMPT_WORKER_SIGKILL_WAIT_MS,
+): Promise<ExactPaneProcessTreeTeardown> {
+  const authorization = readExactPaneProofSync(paneId);
+  if (authorization.status === 'unavailable') {
+    return { terminated: false, stopped: true, proofUnavailable: authorization };
+  }
+  if (authorization.status === 'gone') return { terminated: true, stopped: true };
+
+  const trackedPids = collectProcessTreePids(authorization.pid);
+  if (trackedPids.length === 0) return { terminated: true, stopped: false };
+
+  for (const pid of trackedPids) {
+    const signal = signalExactPaneProcess(paneId, authorization.pid, pid, 'SIGTERM');
+    if (signal.status === 'unavailable') return { terminated: false, stopped: true, proofUnavailable: signal.proof };
+    if (signal.status === 'stopped') return { terminated: false, stopped: true };
+  }
+
+  const graceful = await waitForExactPaneTrackedPidsExit(paneId, authorization.pid, trackedPids, graceMs);
+  if (graceful.terminated || graceful.stopped) return graceful;
+
+  for (const pid of trackedPids) {
+    const probe = probeExactPaneProcess(paneId, authorization.pid, pid);
+    if (probe.status === 'unavailable') return { terminated: false, stopped: true, proofUnavailable: probe.proof };
+    if (probe.status === 'stopped') return { terminated: false, stopped: true };
+    if (probe.status === 'gone') continue;
+
+    const signal = signalExactPaneProcess(paneId, authorization.pid, pid, 'SIGKILL');
+    if (signal.status === 'unavailable') return { terminated: false, stopped: true, proofUnavailable: signal.proof };
+    if (signal.status === 'stopped') return { terminated: false, stopped: true };
+  }
+
+  return waitForExactPaneTrackedPidsExit(paneId, authorization.pid, trackedPids, killWaitMs);
+}
+
 async function teardownPromptWorker(
   teamName: string,
   workerName: string,
@@ -2676,6 +2812,7 @@ export async function startTeam(
   const createdWorkerPaneIds: string[] = [];
   let createdLeaderPaneId: string | undefined;
   let config: TeamConfig | null = null;
+  const workerPaneIds = Array.from({ length: workerCount }, () => undefined as string | undefined);
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(launchEnv);
   const workerStartupEvidenceTimeoutMs = resolveWorkerStartupEvidenceTimeoutMs(
     launchEnv,
@@ -2926,7 +3063,6 @@ export async function startTeam(
       };
     });
 
-    const workerPaneIds = Array.from({ length: workerCount }, () => undefined as string | undefined);
 
     const materializeWorkerStartupState = async (
       bootstrapPlan: typeof workerBootstrapPlans[number],
@@ -3234,6 +3370,17 @@ export async function startTeam(
     };
   } catch (error) {
     const rollbackErrors: string[] = [];
+    if (error instanceof CreateTeamSessionPartialError && config) {
+      const partialSession = error.partialSession;
+      sessionName = partialSession.name;
+      sessionCreated = true;
+      createdWorkerPaneIds.push(...partialSession.workerPaneIds);
+      createdLeaderPaneId = partialSession.leaderPaneId;
+      applyCreatedInteractiveSessionToConfig(config, partialSession, workerPaneIds);
+      await saveTeamConfig(config, leaderCwd);
+      assertPaneTeardownProofsAvailable('startup_rollback', error.proofUnavailable);
+    }
+
 
     if (sessionCreated) {
       if (config?.resize_hook_name && config.resize_hook_target) {
@@ -3247,35 +3394,36 @@ export async function startTeam(
         }
       }
 
-      if (config) {
-        config.resize_hook_name = null;
-        config.resize_hook_target = null;
-        try {
-          await saveTeamConfig(config, leaderCwd);
-        } catch (cleanupError) {
-          rollbackErrors.push(`saveTeamConfig(clear resize hook): ${String(cleanupError)}`);
-        }
-      }
-
       // In split-pane topology, we must not kill the entire tmux session; kill only created panes.
       if (sessionName.includes(':')) {
-        for (const [index, paneId] of createdWorkerPaneIds.entries()) {
-          const panePid = getWorkerPanePid(sessionName, index + 1, paneId);
-          if (panePid) {
-            await terminateTrackedProcessTree(panePid);
-          }
-          try {
-            await killWorkerByPaneIdAsync(paneId, createdLeaderPaneId);
-          } catch (err) {
-            process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+        const paneProcessProofUnavailable: ExactPaneUnavailableProof[] = [];
+        for (const paneId of createdWorkerPaneIds) {
+          const teardown = await terminateExactPaneProcessTree(paneId);
+          if (teardown.proofUnavailable) {
+            paneProcessProofUnavailable.push(teardown.proofUnavailable);
+            break;
           }
         }
-        if (config?.hud_pane_id) {
-          try {
-            await killWorkerByPaneIdAsync(config.hud_pane_id, createdLeaderPaneId);
-          } catch (err) {
-            process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+        if (paneProcessProofUnavailable.length > 0) {
+          if (config) await saveTeamConfig(config, leaderCwd);
+          assertPaneTeardownProofsAvailable('startup_rollback', paneProcessProofUnavailable);
+        }
+        const rollbackPaneIds = [
+          ...createdWorkerPaneIds,
+          config?.hud_pane_id,
+        ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
+        const rollbackPaneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
+          leaderPaneId: createdLeaderPaneId,
+        });
+        if (rollbackPaneTeardown.proofUnavailable.length > 0) {
+          if (config) {
+            try {
+              await saveTeamConfig(config, leaderCwd);
+            } catch (cleanupError) {
+              rollbackErrors.push(`saveTeamConfig(preserve rollback state): ${String(cleanupError)}`);
+            }
           }
+          assertPaneTeardownProofsAvailable('startup_rollback', rollbackPaneTeardown.proofUnavailable);
         }
       } else {
         try {
@@ -3979,11 +4127,17 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       hudPaneId: effectiveHudPaneId,
     });
     if (shouldPrekillInteractiveShutdownProcessTrees(sessionName)) {
-      const workerPanePids = shutdownPaneIds
-        .map((paneId) => getWorkerPanePid(sessionName, 1, paneId))
-        .filter((pid): pid is number => typeof pid === 'number' && Number.isFinite(pid) && pid > 0);
-      for (const panePid of workerPanePids) {
-        await terminateTrackedProcessTree(panePid);
+      const paneProcessProofUnavailable: ExactPaneUnavailableProof[] = [];
+      for (const paneId of shutdownPaneIds) {
+        const teardown = await terminateExactPaneProcessTree(paneId);
+        if (teardown.proofUnavailable) {
+          paneProcessProofUnavailable.push(teardown.proofUnavailable);
+          break;
+        }
+      }
+      if (paneProcessProofUnavailable.length > 0) {
+        await saveTeamConfig(config, cwd);
+        assertPaneTeardownProofsAvailable('shutdown', paneProcessProofUnavailable);
       }
     }
 
@@ -3999,15 +4153,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         }
       }
     }
-    config.resize_hook_name = null;
-    config.resize_hook_target = null;
-    await saveTeamConfig(config, cwd);
     if (resizeHookWarning) {
       console.warn(`[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`);
     }
     let restoredHudPaneId: string | null = null;
     if (effectiveHudPaneId) {
-      await killWorkerByPaneIdAsync(effectiveHudPaneId, effectiveLeaderPaneId ?? undefined);
+      const hudTeardown = await teardownWorkerPanes([effectiveHudPaneId], {
+        leaderPaneId: effectiveLeaderPaneId,
+      });
+      assertPaneTeardownProofsAvailable('shutdown', hudTeardown.proofUnavailable);
       if (sessionName.includes(':')) {
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
           sessionId: leaderSessionId,
@@ -4035,10 +4189,14 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,
     });
-    await teardownWorkerPanes(shutdownPaneIds, {
+    const workerTeardown = await teardownWorkerPanes(shutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: restoredHudPaneId ?? effectiveHudPaneId,
     });
+    assertPaneTeardownProofsAvailable('shutdown', workerTeardown.proofUnavailable);
+    config.resize_hook_name = null;
+    config.resize_hook_target = null;
+    await saveTeamConfig(config, cwd);
 
     // 4. Destroy tmux session
     if (!sessionName.includes(':')) {

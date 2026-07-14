@@ -230,7 +230,16 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    echo "%31"',
       '    ;;',
       '  list-panes)',
-      '    echo "42424"',
+      '    case "$*" in',
+      '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+      "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
+      "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+      "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+      '        ;;',
+      '      *)',
+      '        echo "42424"',
+      '        ;;',
+      '    esac',
       '    ;;',
       '  send-keys)',
       '    ;;',
@@ -762,7 +771,16 @@ exit 0
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    case "$*" in',
+          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
+          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+          "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+          '        ;;',
+          '      *)',
+          '        echo "42424"',
+          '        ;;',
+          '    esac',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -1003,7 +1021,16 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    esac',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    case "$*" in',
+          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
+          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+          "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+          '        ;;',
+          '      *)',
+          '        echo "42424"',
+          '        ;;',
+          '    esac',
           '    ;;',
           '  kill-pane|send-keys|capture-pane)',
           '    ;;',
@@ -1485,7 +1512,16 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    case "$*" in',
+          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
+          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
+          "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+          '        ;;',
+          '      *)',
+          '        echo "42424"',
+          '        ;;',
+          '    esac',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -1603,7 +1639,16 @@ set -eu
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%21' '0' '42421'
+        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        ;;
+      *)
+        echo "42424"
+        ;;
+    esac
     ;;
   send-keys)
     exit 1
@@ -1687,7 +1732,16 @@ set -eu
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%21' '0' '42421'
+        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        ;;
+      *)
+        echo "42424"
+        ;;
+    esac
     ;;
   capture-pane)
     echo ""
@@ -1776,7 +1830,16 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%21' '0' '42421'
+        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        ;;
+      *)
+        echo "42424"
+        ;;
+    esac
     ;;
   capture-pane)
     echo ""
@@ -1859,7 +1922,16 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%21' '0' '42421'
+        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        ;;
+      *)
+        echo "42424"
+        ;;
+    esac
     ;;
   capture-pane)
     echo ""
@@ -1945,7 +2017,16 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%21' '0' '42421'
+        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        ;;
+      *)
+        echo "42424"
+        ;;
+    esac
     ;;
   capture-pane)
     echo ""
@@ -2020,7 +2101,16 @@ exit 0
           '    echo "%41"',
           '    ;;',
           '  list-panes)',
-          '    echo "45454"',
+          '    case "$*" in',
+          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '45451'",
+          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '45452'",
+          "        printf '%s\\t%s\\t%s\\n' '%41' '0' '45454'",
+          '        ;;',
+          '      *)',
+          '        echo "45454"',
+          '        ;;',
+          '    esac',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -2121,7 +2211,16 @@ exit 0
           '    echo "%42"',
           '    ;;',
           '  list-panes)',
-          '    echo "46464"',
+          '    case "$*" in',
+          '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
+          "        printf '%s\\t%s\\t%s\\n' '%11' '0' '46461'",
+          "        printf '%s\\t%s\\t%s\\n' '%21' '0' '46462'",
+          "        printf '%s\\t%s\\t%s\\n' '%42' '0' '46464'",
+          '        ;;',
+          '      *)',
+          '        echo "46464"',
+          '        ;;',
+          '    esac',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -2339,15 +2438,47 @@ describe('scaleDown worktree AGENTS cleanup', () => {
 });
 
 describe('scaleDown teardown hardening', () => {
-  it('scaleDown removes workers when pane is already dead or missing', async () => {
+  it('scaleDown removes a worker with a pane proven dead without targeting it', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-dead-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-dead-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
     try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        printf '%%405\t1\t4050\n'
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  kill-pane)
+    echo "a proven-dead pane must not be targeted" >&2
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      );
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
       await initTeamState('dead-pane', 'task', 'executor', 2, cwd);
       const config = await readTeamConfig('dead-pane', cwd);
       assert.ok(config);
       if (!config) return;
-
-      config.workers[1]!.pane_id = '%404';
+      config.workers[1]!.pane_id = '%405';
       await saveTeamConfig(config, cwd);
 
       const result = await scaleDown(
@@ -2363,8 +2494,15 @@ describe('scaleDown teardown hardening', () => {
       const updated = await readTeamConfig('dead-pane', cwd);
       assert.ok(updated);
       assert.equal(updated?.workers.some((worker) => worker.name === 'worker-2'), false);
+      const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.deepEqual(tmuxCommands, [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+      ]);
     } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
 
@@ -2380,6 +2518,18 @@ describe('scaleDown teardown hardening', () => {
         `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
+        printf '%s\t%s\t%s\n' '%11' '0' '42411'
+        printf '%s\t%s\t%s\n' '%12' '0' '42412'
+        printf '%s\t%s\t%s\n' '%13' '0' '42413'
+        printf '%s\t%s\t%s\n' '%14' '0' '42414'
+        ;;
+    esac
+    ;;
+esac
 exit 0
 `,
       );
@@ -2407,10 +2557,11 @@ exit 0
       );
       assert.equal(result.ok, true);
 
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
-      assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
-      assert.match(tmuxLog, /kill-pane -t %13/);
+      const tmuxCommands = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n');
+      assert.deepEqual(tmuxCommands, [
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'kill-pane -t %13',
+      ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

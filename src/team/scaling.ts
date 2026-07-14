@@ -29,7 +29,7 @@ import {
   tagPaneTeamOwner,
   type TeamWorkerCli,
 } from './tmux-session.js';
-import { execFileSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import {
   teamReadConfig as readTeamConfig,
   teamSaveConfig as saveTeamConfig,
@@ -427,18 +427,26 @@ export async function scaleUp(
       error: string,
       context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
+      const rollbackPaneIds = [
+        ...addedWorkers.map((worker) => worker.pane_id),
+        context.paneId,
+      ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
+      const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
+        leaderPaneId: config.leader_pane_id,
+        hudPaneId: config.hud_pane_id,
+      });
+      if (paneTeardown.proofUnavailable.length > 0) {
+        const unavailable = paneTeardown.proofUnavailable
+          .map((proof) => `${proof.paneId}:${proof.reason}`)
+          .join(',');
+        return { ok: false, error: `scale_up_rollback_pane_proof_unavailable:${unavailable}` };
+      }
+
       for (const w of addedWorkers) {
         const idx = config.workers.findIndex((worker) => worker.name === w.name);
         if (idx >= 0) {
           config.workers.splice(idx, 1);
         }
-        try {
-          if (w.pane_id) {
-            execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe',
-      windowsHide: true,
-    });
-          }
-        } catch {}
         if (w.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
         }
@@ -455,14 +463,6 @@ export async function scaleUp(
           teamStateRoot,
           context.worktreePath,
         ).catch(() => {});
-      }
-
-      if (context.paneId) {
-        try {
-          execFileSync('tmux', ['kill-pane', '-t', context.paneId], { stdio: 'pipe',
-      windowsHide: true,
-    });
-        } catch {}
       }
 
       for (const taskId of createdTaskIds) {
@@ -932,10 +932,16 @@ export async function scaleDown(
     const targetPaneIds = targetWorkers
       .map((w) => w.pane_id)
       .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    await teardownWorkerPanes(targetPaneIds, {
+    const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
       leaderPaneId,
       hudPaneId,
     });
+    if (paneTeardown.proofUnavailable.length > 0) {
+      const unavailable = paneTeardown.proofUnavailable
+        .map((proof) => `${proof.paneId}:${proof.reason}`)
+        .join(',');
+      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
+    }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
         worker.worktree_created === true
