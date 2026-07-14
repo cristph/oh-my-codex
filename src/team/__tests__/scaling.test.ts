@@ -2476,11 +2476,12 @@ exit 0
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
-  it('retains created worker metadata when rollback kill-pane fails after later target proof loss', async () => {
+  it('retains metadata for every unresolved rollback pane across mixed teardown outcomes', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-rollback-kill-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-rollback-kill-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const proofCountPath = join(fakeBinDir, 'proof-count');
+    const splitCountPath = join(fakeBinDir, 'split-count');
     const previousPath = process.env.PATH;
     try {
       await writeFile(
@@ -2492,17 +2493,30 @@ case "\${1:-}" in
   list-panes)
     count=0; [ ! -f "${proofCountPath}" ] || count=$(cat "${proofCountPath}")
     count=$((count + 1)); printf '%s' "$count" > "${proofCountPath}"
-    if [ "$count" -eq 4 ]; then
+    if [ -f "${fakeBinDir}/rollback-kill-failed" ] || [ "$count" -eq 12 ]; then
       exit 1
-    elif [ "$count" -eq 3 ] || [ "$count" -eq 5 ]; then
-      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'
-      printf '%s\\t%s\\t%s\\n' '%31' '0' '42431'
+    elif [ "$count" -ge 5 ]; then
+      printf '%s\t%s\t%s\n' '%21' '0' '42421'
+      printf '%s\t%s\t%s\n' '%31' '0' '42431'
+      printf '%s\t%s\t%s\n' '%32' '0' '42432'
+    elif [ "$count" -ge 3 ]; then
+      printf '%s\t%s\t%s\n' '%21' '0' '42421'
+      printf '%s\t%s\t%s\n' '%31' '0' '42431'
     else
-      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'
+      printf '%s\t%s\t%s\n' '%21' '0' '42421'
     fi
     ;;
-  split-window) echo '%31' ;;
-  kill-pane) exit 1 ;;
+  split-window)
+    split_count=0; [ ! -f "${splitCountPath}" ] || split_count=$(cat "${splitCountPath}")
+    split_count=$((split_count + 1)); printf '%s' "$split_count" > "${splitCountPath}"
+    if [ "$split_count" -eq 1 ]; then echo '%31'; else echo '%32'; fi
+    ;;
+  kill-pane)
+    case "$*" in
+      *"%31"*) : > "${fakeBinDir}/rollback-kill-failed"; exit 1 ;;
+      *) exit 1 ;;
+    esac
+    ;;
 esac
 `,
       );
@@ -2513,11 +2527,12 @@ esac
 
       const result = await scaleUp(
         'rollback-kill-fail',
-        2,
+        3,
         'executor',
         [
-          { subject: 'first', description: 'created before proof loss', owner: 'worker-2' },
-          { subject: 'second', description: 'never created', owner: 'worker-3' },
+          { subject: 'first', description: 'created before mixed rollback', owner: 'worker-2' },
+          { subject: 'second', description: 'created before mixed rollback', owner: 'worker-3' },
+          { subject: 'third', description: 'never created after proof loss', owner: 'worker-4' },
         ],
         cwd,
         { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
@@ -2527,18 +2542,29 @@ esac
         ok: false,
         error: 'scale_up_rollback_pane_teardown_failed:%31',
       });
+      assert.equal(await readFile(splitCountPath, 'utf-8'), '2');
       const config = await readTeamConfig('rollback-kill-fail', cwd);
       const worker = config?.workers.find((candidate) => candidate.name === 'worker-2');
       assert.equal(worker?.pane_id, '%31');
       assert.equal(worker?.index, 2);
-      assert.equal(config?.worker_count, 2);
-      assert.equal(config?.next_worker_index, 3);
+      assert.equal(config?.worker_count, 3);
+      assert.equal(config?.next_worker_index, 4);
       const identity = JSON.parse(await readFile(
         join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-2', 'identity.json'),
         'utf-8',
       )) as { pane_id?: string };
       assert.equal(identity.pane_id, '%31');
       assert.equal((await readTask('rollback-kill-fail', '1', cwd))?.owner, 'worker-2');
+      const secondWorker = config?.workers.find((candidate) => candidate.name === 'worker-3');
+      assert.equal(secondWorker?.pane_id, '%32');
+      assert.equal(secondWorker?.index, 3);
+      const secondIdentity = JSON.parse(await readFile(
+        join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', 'worker-3', 'identity.json'),
+        'utf-8',
+      )) as { pane_id?: string };
+      assert.equal(secondIdentity.pane_id, '%32');
+      assert.equal((await readTask('rollback-kill-fail', '2', cwd))?.owner, 'worker-3');
+      assert.equal(config?.workers.some((candidate) => candidate.name === 'worker-4'), false);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -2884,9 +2910,71 @@ exit 0
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+  it('prioritizes an earlier kill-pane failure over later proof loss and restores exact artifacts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-teardown-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-mixed-teardown-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const proofCountPath = join(fakeBinDir, 'proof-count');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(
+        tmuxStubPath,
+        `#!/bin/sh
+set -eu
+case "\${1:-}" in
+  list-panes)
+    count=0; [ ! -f "${proofCountPath}" ] || count=$(cat "${proofCountPath}")
+    count=$((count + 1)); printf '%s' "$count" > "${proofCountPath}"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'
+      printf '%s\\t%s\\t%s\\n' '%14' '0' '42414'
+    else
+      exit 1
+    fi
+    ;;
+  kill-pane) exit 1 ;;
+esac
+`,
+      );
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('mixed-teardown', 'task', 'executor', 3, cwd);
+      const config = await readTeamConfig('mixed-teardown', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.workers[1]!.pane_id = '%13';
+      config.workers[2]!.pane_id = '%14';
+      await saveTeamConfig(config, cwd);
+      const priorConfig = structuredClone(config);
+      const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'mixed-teardown', 'workers', 'worker-2', 'status.json');
+      const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'mixed-teardown', 'workers', 'worker-3', 'status.json');
+      const worker2Raw = '{\n "state" : "idle", "reason":"two", "updated_at":"2026-07-14T00:00:00.000Z"\n}\n';
+      const worker3Raw = '{"reason":"three",\n"updated_at":"2026-07-14T00:00:01.000Z", "state":"idle"}\n';
+      await writeFile(worker2StatusPath, worker2Raw);
+      await writeFile(worker3StatusPath, worker3Raw);
+
+      const result = await scaleDown(
+        'mixed-teardown',
+        cwd,
+        { workerNames: ['worker-2', 'worker-3'], force: true },
+        { OMX_TEAM_SCALING_ENABLED: '1' },
+      );
+
+      assert.deepEqual(result, { ok: false, error: 'scale_down_pane_teardown_failed:%13' });
+      assert.deepEqual(await readTeamConfig('mixed-teardown', cwd), priorConfig);
+      assert.equal(await readFile(worker2StatusPath, 'utf-8'), worker2Raw);
+      assert.equal(await readFile(worker3StatusPath, 'utf-8'), worker3Raw);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
   for (const [name, priorRaw] of [
     ['absent status artifact', undefined],
     ['malformed status artifact', '{"state":\n'],
+    ['noncanonical valid status artifact', '{\n  "updated_at" : "2026-07-14T00:00:00.000Z",\n "reason":"waiting for assignment", "state" : "idle"\n}\n'],
   ] as const) {
     it(`scaleDown restores the exact ${name} after kill-pane failure`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-status-artifact-'));
@@ -2929,7 +3017,7 @@ esac
         if (priorRaw === undefined) {
           assert.equal(existsSync(statusPath), false);
         } else {
-          assert.equal(await readFile(statusPath, 'utf-8'), priorRaw);
+          assert.deepEqual(await readFile(statusPath), Buffer.from(priorRaw));
         }
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;

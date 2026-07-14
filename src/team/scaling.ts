@@ -479,15 +479,15 @@ export async function scaleUp(
       }
 
       const failedPaneIds = paneTeardown.kill.failedPaneIds;
-      if (failedPaneIds.length > 0) {
-        const failedPaneIdSet = new Set(failedPaneIds);
-        const failedWorkersByName = new Map<string, WorkerInfo>();
-        for (const worker of [...addedWorkers, context.worker].filter((worker): worker is WorkerInfo => Boolean(worker))) {
-          if (typeof worker.pane_id === 'string' && failedPaneIdSet.has(worker.pane_id)) {
-            failedWorkersByName.set(worker.name, worker);
-          }
-        }
-        for (const worker of failedWorkersByName.values()) {
+      const unresolvedWorkers = [...new Map(
+        [...addedWorkers, context.worker]
+          .filter((worker): worker is WorkerInfo => Boolean(worker))
+          .map((worker): [string, WorkerInfo] => [worker.name, worker]),
+      ).values()].filter((worker) => (
+        typeof worker.pane_id === 'string' && !successfullyRemovedPaneIds.has(worker.pane_id)
+      ));
+      if (failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
+        for (const worker of unresolvedWorkers) {
           if (!config.workers.some((candidate) => candidate.name === worker.name)) {
             config.workers.push(worker);
           }
@@ -499,20 +499,9 @@ export async function scaleUp(
           ...config.workers.map((worker) => worker.index + 1),
         );
         await saveTeamConfig(config, leaderCwd);
-        return { ok: false, error: `scale_up_rollback_pane_teardown_failed:${failedPaneIds.join(',')}` };
-      }
-
-      if (paneTeardown.proofUnavailable.length > 0) {
-        if (context.worker && !config.workers.some((worker) => worker.name === context.worker!.name)) {
-          config.workers.push(context.worker);
-          await writeWorkerIdentity(sanitized, context.worker.name, context.worker, leaderCwd);
+        if (failedPaneIds.length > 0) {
+          return { ok: false, error: `scale_up_rollback_pane_teardown_failed:${failedPaneIds.join(',')}` };
         }
-        config.worker_count = config.workers.length;
-        config.next_worker_index = Math.max(
-          initialNextIndex,
-          ...config.workers.map((worker) => worker.index + 1),
-        );
-        await saveTeamConfig(config, leaderCwd);
         const unavailable = paneTeardown.proofUnavailable
           .map((proof) => `${proof.paneId}:${proof.reason}`)
           .join(',');
@@ -1076,20 +1065,19 @@ export async function scaleDown(
       leaderPaneId,
       hudPaneId,
     });
-    if (paneTeardown.proofUnavailable.length > 0) {
-      const unavailable = paneTeardown.proofUnavailable
-        .map((proof) => `${proof.paneId}:${proof.reason}`)
-        .join(',');
-      await restorePriorWorkerStatuses();
-
-      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
-    }
     if (paneTeardown.kill.failedPaneIds.length > 0) {
       await restorePriorWorkerStatuses();
       return {
         ok: false,
         error: `scale_down_pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`,
       };
+    }
+    if (paneTeardown.proofUnavailable.length > 0) {
+      const unavailable = paneTeardown.proofUnavailable
+        .map((proof) => `${proof.paneId}:${proof.reason}`)
+        .join(',');
+      await restorePriorWorkerStatuses();
+      return { ok: false, error: `scale_down_pane_proof_unavailable:${unavailable}` };
     }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
