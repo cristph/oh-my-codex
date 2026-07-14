@@ -910,6 +910,14 @@ export async function commitTeamMembershipTaskTransaction(
       await applyMembershipTransactionFiles(files.slice(0, 1), false);
       throw error;
     }
+    if (transaction.recoverToNewOnFailure) {
+      try {
+        await recoverTeamMembershipTaskTransaction(teamName, cwd);
+      } catch {
+        // Keep the committed-direction journal as durable recovery authority.
+      }
+      throw error;
+    }
     // Leave the prepared marker durable if restoring old bytes also fails. Entry
     // recovery will retry until the state has converged to the old generation.
     try {
@@ -1844,6 +1852,7 @@ export async function removeDispatchRequestsForWorkers(
     const removedRequestIds = requests
       .filter((request) => names.has(request.to_worker))
       .map((request) => request.request_id);
+    let authoritativeRemovalPerformed = false;
     if (isBridgeEnabled() && removedRequestIds.length > 0) {
       const stateDir = resolveBridgeStateDir(cwd);
       const bridge = getDefaultBridge(stateDir);
@@ -1873,6 +1882,7 @@ export async function removeDispatchRequestsForWorkers(
         if (remainingAuthoritative.some((record) => authoritativeIds.includes(record.request_id))) {
           throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
         }
+        authoritativeRemovalPerformed = true;
       }
     }
     // The legacy per-team request file is compatibility output only. Update it
@@ -1880,7 +1890,7 @@ export async function removeDispatchRequestsForWorkers(
     // shared bridge dispatch.json from this local snapshot.
     const retained = requests.filter((request) => !names.has(request.to_worker));
     await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(retained, null, 2));
-    await writeBridgeDispatchCompat(teamName, retained, cwd);
+    if (!authoritativeRemovalPerformed) await writeBridgeDispatchCompat(teamName, retained, cwd);
     const remaining = await readDispatchRequests(teamName, cwd);
     if (remaining.some((request) => names.has(request.to_worker))) {
       throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
