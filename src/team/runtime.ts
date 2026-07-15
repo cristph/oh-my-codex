@@ -2289,7 +2289,14 @@ function probeExactPaneProcess(
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') return { status: 'unavailable', proof };
   if (proof.status === 'live' && proof.pid !== authorizedPanePid) return { status: 'stopped' };
-  if (proof.status === 'gone') return { status: 'stopped' };
+  if (proof.status === 'gone') {
+    try {
+      process.kill(pid, 0);
+      return { status: 'stopped' };
+    } catch {
+      return { status: 'gone' };
+    }
+  }
   try {
     process.kill(pid, 0);
     return { status: 'alive' };
