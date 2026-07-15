@@ -1520,12 +1520,16 @@ export async function scaleDown(
             operation: 'scale_down',
             status: 'pending_teardown',
             created_at: new Date().toISOString(),
-            workers: removableWorkers.map((worker) => ({
-              name: worker.name,
-              index: worker.index,
-              pane_id: worker.pane_id ?? null,
-              pid: worker.pid ?? null,
-            })),
+            workers: removableWorkers
+              .filter((worker): worker is WorkerInfo & { pane_id: string } => (
+                typeof worker.pane_id === 'string' && /^%\d+$/.test(worker.pane_id)
+              ))
+              .map((worker) => ({
+                name: worker.name,
+                index: worker.index,
+                pane_id: worker.pane_id,
+                pid: worker.pid ?? null,
+              })),
           };
           await writeAtomic(cleanupDebtPath, JSON.stringify(cleanupDebtBase, null, 2));
           await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, membershipTransaction);
