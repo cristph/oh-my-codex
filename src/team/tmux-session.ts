@@ -1763,9 +1763,15 @@ export function createTeamSession(
     // when we can recreate the team HUD. Otherwise keep the existing HUD alive
     // instead of making it disappear on team startup failures or broken installs.
     if (canRecreateTeamHud) {
-      for (const hudPaneId of initialHudPaneIds) requireLiveExactPaneSync(hudPaneId);
+      const initialHudPanePids = new Map<string, number>();
       for (const hudPaneId of initialHudPaneIds) {
-        killExactPaneSync(hudPaneId);
+        const proof = readExactPaneProofSync(hudPaneId);
+        if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+        if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${hudPaneId}`);
+        initialHudPanePids.set(hudPaneId, proof.pid);
+      }
+      for (const hudPaneId of initialHudPaneIds) {
+        killExactPaneSync(hudPaneId, initialHudPanePids.get(hudPaneId));
       }
     }
 

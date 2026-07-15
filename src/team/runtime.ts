@@ -38,6 +38,7 @@ import {
   resolveSharedSessionShutdownTopology,
 } from './tmux-session.js';
 import { readExactPaneProofSync, type ExactPaneProof } from './exact-pane.js';
+import { reconcileScaleDownCleanupDebt } from './scaling.js';
 import {
   teamInit as initTeamState,
   DEFAULT_MAX_WORKERS,
@@ -3997,6 +3998,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     restoreTeamModelInstructionsFile(sanitized);
     return { commitHygieneArtifacts: null };
   }
+  const priorScaleDownCleanup = await reconcileScaleDownCleanupDebt(sanitized, cwd, config);
+  if (!priorScaleDownCleanup.ok) throw new Error(priorScaleDownCleanup.error);
   const manifest = await readTeamManifestV2(sanitized, cwd);
   const leaderSessionId = typeof manifest?.leader?.session_id === 'string'
     ? manifest.leader.session_id.trim()

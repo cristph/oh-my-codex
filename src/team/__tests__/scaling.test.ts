@@ -22,7 +22,7 @@ import {
   listDispatchRequests,
   readTeamManifestV2,
 } from '../state.js';
-import { isScalingEnabled, scaleUp, scaleDown } from '../scaling.js';
+import { isScalingEnabled, reconcileScaleDownCleanupDebt, scaleUp, scaleDown } from '../scaling.js';
 import { resolveCanonicalTeamStateRoot } from '../state-root.js';
 import {
   resolvePersistedApprovedTeamExecutionContinuityState,
@@ -3501,12 +3501,22 @@ set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   list-panes)
-    if [ -f "${proofLossMarkerPath}.killed" ]; then exit 1; fi
-    printf '%s\t%s\t%s\n' '%13' '0' '42413'
-    printf '%s\t%s\t%s\n' '%14' '0' '42414'
+    if [ -f "${proofLossMarkerPath}.recovery" ]; then
+      if [ ! -f "${proofLossMarkerPath}.killed-13" ]; then printf '%s\t%s\t%s\n' '%13' '0' '42413'; fi
+      if [ ! -f "${proofLossMarkerPath}.killed-14" ]; then printf '%s\t%s\t%s\n' '%14' '0' '42414'; fi
+    else
+      if [ -f "${proofLossMarkerPath}.killed" ]; then exit 1; fi
+      printf '%s\t%s\t%s\n' '%13' '0' '42413'
+      printf '%s\t%s\t%s\n' '%14' '0' '42414'
+    fi
     ;;
   kill-pane)
-    if [ "$3" = '%13' ]; then : > "${proofLossMarkerPath}.killed"; fi
+    if [ -f "${proofLossMarkerPath}.recovery" ]; then
+      if [ "$3" = '%13' ]; then : > "${proofLossMarkerPath}.killed-13"; fi
+      if [ "$3" = '%14' ]; then : > "${proofLossMarkerPath}.killed-14"; fi
+    elif [ "$3" = '%13' ]; then
+      : > "${proofLossMarkerPath}.killed"
+    fi
     ;;
 esac
 exit 0
@@ -3558,6 +3568,20 @@ exit 0
       assert.ok(killIndex > 0);
       assert.equal(tmuxCommands[killIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
       assert.equal(tmuxCommands[killIndex + 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+      await writeFile(`${proofLossMarkerPath}.recovery`, '1');
+      await rm(`${proofLossMarkerPath}.killed`, { force: true });
+      const committedConfig = await readTeamConfig('success-proof-loss', cwd);
+      assert.ok(committedConfig);
+      if (!committedConfig) return;
+      const recovered = await reconcileScaleDownCleanupDebt('success-proof-loss', cwd, committedConfig);
+      assert.deepEqual(recovered, { ok: true });
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'success-proof-loss', '.scale-down-cleanup-debt.json')), false);
+      const recoveredCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.deepEqual(recoveredCommands.filter((command) => command.startsWith('kill-pane ')), [
+        'kill-pane -t %13',
+        'kill-pane -t %13',
+        'kill-pane -t %14',
+      ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

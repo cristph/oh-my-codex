@@ -1228,6 +1228,91 @@ export interface ScaleDownOptions {
   drainTimeoutMs?: number;
 }
 
+interface ScaleDownCleanupDebtPane {
+  name?: string;
+  index?: number;
+  pane_id: string;
+  pid: number | null;
+}
+
+interface ScaleDownCleanupDebt {
+  schema_version: 1;
+  operation: 'scale_down';
+  status: string;
+  created_at?: string;
+  updated_at?: string;
+  workers?: ScaleDownCleanupDebtPane[];
+  unresolved_panes?: ScaleDownCleanupDebtPane[];
+  reasons?: string[];
+}
+
+export async function reconcileScaleDownCleanupDebt(
+  teamName: string,
+  cwd: string,
+  config: TeamConfig,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const sanitized = sanitizeTeamName(teamName);
+  const teamStateRoot = config.team_state_root ?? resolveCanonicalTeamStateRoot(resolve(cwd));
+  const cleanupDebtPath = join(teamStateRoot, 'team', sanitized, '.scale-down-cleanup-debt.json');
+  if (!existsSync(cleanupDebtPath)) return { ok: true };
+
+  let debt: ScaleDownCleanupDebt;
+  try {
+    debt = JSON.parse(await readFile(cleanupDebtPath, 'utf8')) as ScaleDownCleanupDebt;
+  } catch (error) {
+    return { ok: false, error: `scale_down_cleanup_debt_unreadable:${String(error)}` };
+  }
+  if (debt.schema_version !== 1 || debt.operation !== 'scale_down') {
+    return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
+  }
+  const candidates = Array.isArray(debt.unresolved_panes) && debt.unresolved_panes.length > 0
+    ? debt.unresolved_panes
+    : debt.workers;
+  if (!Array.isArray(candidates)) return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
+  const panes: ScaleDownCleanupDebtPane[] = [];
+  const seenPaneIds = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate.pane_id !== 'string' || !/^%\d+$/.test(candidate.pane_id)
+      || (candidate.pid !== null && (!Number.isInteger(candidate.pid) || candidate.pid <= 0))
+      || seenPaneIds.has(candidate.pane_id)) {
+      return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
+    }
+    seenPaneIds.add(candidate.pane_id);
+    panes.push(candidate);
+  }
+  if (panes.length === 0) {
+    await rm(cleanupDebtPath, { force: true });
+    return { ok: true };
+  }
+
+  const teardown = await teardownWorkerPanes(panes.map((pane) => pane.pane_id), {
+    leaderPaneId: config.leader_pane_id,
+    hudPaneId: config.hud_pane_id,
+    expectedPanePids: Object.fromEntries(panes
+      .filter((pane): pane is ScaleDownCleanupDebtPane & { pid: number } => typeof pane.pid === 'number')
+      .map((pane) => [pane.pane_id, pane.pid])),
+  });
+  const resolvedPaneIds = new Set([...teardown.provenGonePaneIds, ...teardown.killedPaneIds]);
+  const unresolvedPanes = panes.filter((pane) => !resolvedPaneIds.has(pane.pane_id));
+  if (unresolvedPanes.length === 0) {
+    await rm(cleanupDebtPath, { force: true });
+    return { ok: true };
+  }
+  const reasons = [
+    ...teardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`),
+    ...teardown.kill.failedPaneIds.map((paneId) => `${paneId}:kill_failed`),
+  ];
+  await writeAtomic(cleanupDebtPath, JSON.stringify({
+    ...debt,
+    status: 'unresolved',
+    updated_at: new Date().toISOString(),
+    unresolved_panes: unresolvedPanes,
+    reasons,
+  }, null, 2));
+  return { ok: false, error: `scale_down_cleanup_debt_unresolved:${unresolvedPanes.map((pane) => pane.pane_id).join(',')}` };
+}
+
+
 /**
  * Remove workers from a running team.
  *
@@ -1256,6 +1341,8 @@ export async function scaleDown(
       return { ok: false, error: `Team ${sanitized} not found` };
     }
     const teamStateRoot = config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd);
+    const priorCleanup = await reconcileScaleDownCleanupDebt(sanitized, leaderCwd, config);
+    if (!priorCleanup.ok) return priorCleanup;
 
     // Determine which workers to remove
     let targetWorkers: WorkerInfo[];
