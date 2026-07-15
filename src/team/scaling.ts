@@ -1244,6 +1244,7 @@ interface ScaleDownCleanupDebt {
   workers?: ScaleDownCleanupDebtPane[];
   unresolved_panes?: ScaleDownCleanupDebtPane[];
   reasons?: string[];
+  removed_worker_names?: string[];
 }
 
 export async function reconcileScaleDownCleanupDebt(
@@ -1265,6 +1266,20 @@ export async function reconcileScaleDownCleanupDebt(
   if (debt.schema_version !== 1 || debt.operation !== 'scale_down') {
     return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
   }
+  const removedWorkerNames = Array.isArray(debt.removed_worker_names)
+    ? debt.removed_worker_names
+    : (Array.isArray(debt.workers) ? debt.workers.map((worker) => worker?.name).filter((name): name is string => typeof name === 'string') : []);
+  if (removedWorkerNames.length === 0
+    || removedWorkerNames.some((name) => !/^worker-\d+$/.test(name))
+    || new Set(removedWorkerNames).size !== removedWorkerNames.length) {
+    return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
+  }
+  const stillCanonical = removedWorkerNames.filter((name) => config.workers.some((worker) => worker.name === name));
+  if (stillCanonical.length === removedWorkerNames.length) {
+    await rm(cleanupDebtPath, { force: true });
+    return { ok: true };
+  }
+  if (stillCanonical.length > 0) return { ok: false, error: 'scale_down_cleanup_debt_membership_inconsistent' };
   const candidates = Array.isArray(debt.unresolved_panes) && debt.unresolved_panes.length > 0
     ? debt.unresolved_panes
     : debt.workers;
@@ -1520,6 +1535,7 @@ export async function scaleDown(
             operation: 'scale_down',
             status: 'pending_teardown',
             created_at: new Date().toISOString(),
+            removed_worker_names: removableWorkers.map((worker) => worker.name),
             workers: removableWorkers
               .filter((worker): worker is WorkerInfo & { pane_id: string } => (
                 typeof worker.pane_id === 'string' && /^%\d+$/.test(worker.pane_id)

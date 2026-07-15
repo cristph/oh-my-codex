@@ -3486,6 +3486,31 @@ exit 0
     });
   }
 
+  it('discards precommit cleanup debt while removed workers remain canonical', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-precommit-debt-'));
+    try {
+      await initTeamState('precommit-debt', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('precommit-debt', cwd);
+      assert.ok(config);
+      if (!config) return;
+      const debtPath = join(cwd, '.omx', 'state', 'team', 'precommit-debt', '.scale-down-cleanup-debt.json');
+      await writeFile(debtPath, JSON.stringify({
+        schema_version: 1,
+        operation: 'scale_down',
+        status: 'pending_teardown',
+        removed_worker_names: ['worker-2'],
+        workers: [{ name: 'worker-2', index: 2, pane_id: '%13', pid: 42413 }],
+      }));
+
+      const recovered = await reconcileScaleDownCleanupDebt('precommit-debt', cwd, config);
+      assert.deepEqual(recovered, { ok: true });
+      assert.equal(existsSync(debtPath), false);
+      assert.equal((await readTeamConfig('precommit-debt', cwd))?.workers.some((worker) => worker.name === 'worker-2'), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('commits forward state and records unresolved debt when proof is lost after a pane kill', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-bin-'));
