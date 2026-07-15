@@ -809,6 +809,16 @@ const INJECT_VERIFY_ROUNDS = 3;
 async function injectDispatchRequest(request, config, cwd, stateDir) {
   const dispatchTarget = resolveDispatchTarget(request, config);
   if (dispatchTarget.failure) {
+    if (dispatchTarget.failure !== 'exact_pane_mismatch' && dispatchTarget.failure !== 'invalid_explicit_pane') {
+      return {
+        ok: false,
+        reason: dispatchTarget.failure,
+        pane: dispatchTarget.paneId || null,
+        pane_source: dispatchTarget.paneSource || null,
+        exact_pane_proof: null,
+        tmux_injection_attempted: false,
+      };
+    }
     const paneProof = dispatchTarget.failure === 'exact_pane_mismatch'
       ? {
         reason: 'exact_pane_mismatch',

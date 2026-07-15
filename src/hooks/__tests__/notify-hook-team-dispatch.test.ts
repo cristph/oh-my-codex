@@ -868,7 +868,7 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#{pane_start_command}" && "$target" == "%91" ]]; then
-    echo "node dist/cli/omx.js hud --watch"
+    echo "codex"
     exit 0
   fi
   if [[ "$fmt" == "#{pane_start_command}" && "$target" == "%42" ]]; then
@@ -952,6 +952,20 @@ exit 0
       assert.match(tmuxLog, /send-keys -t %91/);
       assert.doesNotMatch(tmuxLog, /send-keys -t %42/);
       assert.doesNotMatch(tmuxLog, /display-message -p -t %91 #\{pane_id\}/, 'configured leader pane must bypass the generic resolver');
+
+      cfg.hud_pane_id = '%91';
+      await saveTeamConfig(cfg, cwd);
+      const hudMsg = await sendDirectMessage('alpha', 'worker-1', 'leader-fixed', 'second leader message', cwd);
+      const hudQueued = await enqueueDispatchRequest('alpha', {
+        kind: 'mailbox',
+        to_worker: 'leader-fixed',
+        message_id: hudMsg.message_id,
+        trigger_message: 'must not target the HUD pane',
+      }, cwd);
+      const hudResult = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(hudResult.failed, 1);
+      const hudRequest = await readDispatchRequest('alpha', hudQueued.request.request_id, cwd);
+      assert.equal(hudRequest?.last_reason, 'hud_pane_target');
     } finally {
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
