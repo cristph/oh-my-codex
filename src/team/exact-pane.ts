@@ -6,7 +6,7 @@ export type ExactPaneProof =
   | {
     status: 'unavailable';
     paneId: string;
-    reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot' | 'pane_pid_changed';
+    reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot' | 'pane_pid_changed' | 'pane_proof_lost_during_process_teardown';
     detail?: string;
   };
 

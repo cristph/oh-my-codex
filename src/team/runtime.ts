@@ -499,7 +499,7 @@ export function shouldPrekillInteractiveShutdownProcessTrees(sessionName: string
 
 interface UnavailablePaneProof {
   paneId: string;
-  reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot' | 'pane_pid_changed';
+  reason: Extract<ExactPaneProof, { status: 'unavailable' }>['reason'];
   detail?: string;
 }
 
@@ -3446,6 +3446,15 @@ export async function startTeam(
             paneProcessProofUnavailable.push(teardown.proofUnavailable);
             break;
           }
+          if (!teardown.terminated && teardown.stopped) {
+            paneProcessProofUnavailable.push({
+              status: 'unavailable',
+              paneId,
+              reason: 'pane_proof_lost_during_process_teardown',
+              detail: 'exact pane authority was lost before the tracked process tree was resolved',
+            });
+            break;
+          }
         }
         if (paneProcessProofUnavailable.length > 0) {
           if (config) await saveTeamConfig(config, leaderCwd);
@@ -4207,6 +4216,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         );
         if (teardown.proofUnavailable) {
           paneProcessProofUnavailable.push(teardown.proofUnavailable);
+          break;
+        }
+        if (!teardown.terminated && teardown.stopped) {
+          paneProcessProofUnavailable.push({
+            status: 'unavailable',
+            paneId,
+            reason: 'pane_proof_lost_during_process_teardown',
+            detail: 'exact pane authority was lost before the tracked process tree was resolved',
+          });
           break;
         }
       }
