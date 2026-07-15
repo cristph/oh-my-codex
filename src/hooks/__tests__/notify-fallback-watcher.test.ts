@@ -348,6 +348,9 @@ function buildManagedRalphTmux(
       return `${paneId}\t${active}\t${currentCommand}\t${startCommand}`;
     })
     .join('\n');
+  const exactPaneOutput = panes
+    .map((pane, index) => `${pane.paneId}\t0\t${4200 + index}`)
+    .join('\n');
   const paneCommandBranches = panes
     .map((pane) => {
       const currentCommand = (pane.currentCommand || 'codex').replace(/"/g, '\\"');
@@ -413,6 +416,10 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
     shift || true
   done
+  if [[ -z "$target" ]]; then
+    printf '%s\n' "${exactPaneOutput}"
+    exit 0
+  fi
   if [[ "$target" == "${managedSessionName}" ]]; then
     printf '%s\n' "${listPaneOutput}"
     exit 0

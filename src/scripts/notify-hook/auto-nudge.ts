@@ -706,7 +706,7 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
       return;
     }
 
-    const paneGuard = await evaluatePaneInjectionReadiness(paneId, { skipIfScrolling: true });
+    const paneGuard = await evaluatePaneInjectionReadiness(paneId, { skipIfScrolling: true, exactPaneId: paneId });
     if (!paneGuard.ok) {
       await logTmuxHookEvent(logsDir, {
         timestamp: new Date().toISOString(),
@@ -747,6 +747,7 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
     try {
       const sendResult = await sendPaneInput({
         paneTarget: paneId,
+        exactPaneId: paneId,
         prompt: `${effectiveResponse} ${DEFAULT_MARKER}`,
         submitKeyPresses: 2,
         submitDelayMs: 100,

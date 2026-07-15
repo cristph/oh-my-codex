@@ -40,6 +40,7 @@ import { validateSessionId } from '../mcp/state-paths.js';
 import { TEAM_NAME_SAFE_PATTERN } from '../team/contracts.js';
 import { shouldContinueRun } from '../runtime/run-loop.js';
 import { deliverNotifyFallback, compactNotifyFallbackDeliveries, NOTIFY_FALLBACK_LEASE_MS } from './notify-fallback-delivery.js';
+import { readExactPaneProofSync } from '../team/exact-pane.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -773,18 +774,33 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
 
 async function emitRalphContinueSteer(paneId: string, message: string): Promise<void> {
   const markedText = `${message} ${DEFAULT_MARKER}`;
+  let expectedPanePid: number | null = null;
+  const proveExactPane = (): void => {
+    const proof = readExactPaneProofSync(paneId);
+    if (proof.status !== 'live') {
+      throw new Error(`exact pane proof unavailable for ${paneId}: ${proof.reason}`);
+    }
+    if (expectedPanePid !== null && proof.pid !== expectedPanePid) {
+      throw new Error(`exact pane PID changed for ${paneId}: expected ${expectedPanePid}, got ${proof.pid}`);
+    }
+    expectedPanePid ??= proof.pid;
+  };
+
+  proveExactPane();
   await new Promise<void>((resolve) => {
     const { result: typed } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, '-l', markedText], { encoding: 'utf-8' });
     if (typed.error) throw new Error(typed.error.message);
     if (typed.status !== 0) throw new Error((typed.stderr || typed.stdout || '').trim() || 'tmux send-keys failed');
     setTimeout(resolve, 100);
   });
+  proveExactPane();
   await new Promise<void>((resolve) => {
     const { result: submitA } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
     if (submitA.error) throw new Error(submitA.error.message);
     if (submitA.status !== 0) throw new Error((submitA.stderr || submitA.stdout || '').trim() || 'tmux send-keys C-m failed');
     setTimeout(resolve, 100);
   });
+  proveExactPane();
   const { result: submitB } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
   if (submitB.error) throw new Error(submitB.error.message);
   if (submitB.status !== 0) {
@@ -1226,7 +1242,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
       return { sent: false, skipped: true };
     }
 
-    const paneGuard = await checkPaneReadyForTeamSendKeys(paneId);
+    const paneGuard = await checkPaneReadyForTeamSendKeys(paneId, paneId);
     lastRalphContinueSteer.pane_id = paneId;
     lastRalphContinueSteer.pane_current_command = paneGuard.paneCurrentCommand || '';
     if (!paneGuard.ok) {

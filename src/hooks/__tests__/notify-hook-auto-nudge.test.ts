@@ -188,7 +188,7 @@ if [[ "\$cmd" == "list-panes" ]]; then
     printf '%%99\t1\tnode\tcodex --model gpt-5\n'
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 exit 0
@@ -732,7 +732,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t0\tsh\tbash\n%%100\t1\tnode\tcodex --model gpt-5\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -856,7 +856,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t0\tcodex\tcodex\\n%%100\t1\tcodex\tcodex\\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -981,7 +981,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t0\tnode\tbash\\n%%100\t1\tnode\tcodex --model gpt-5\\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1106,7 +1106,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t1\tbash\tcodex --model gpt-5\\n%%100\t0\tnode\tcodex --model gpt-5\\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1227,7 +1227,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t1\tbash\tcodex --model gpt-5\\n%%100\t0\tbash\tbash\\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1437,7 +1437,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 exit 0
@@ -1568,7 +1568,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 exit 0
@@ -1691,7 +1691,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     printf "%%99\t1\tsh\tbash\\n%%100\t0\tnode\tcodex --model gpt-5\\n"
     exit 0
   fi
-  echo "%1 12345"
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 exit 0
