@@ -2297,12 +2297,24 @@ case "\${1:-}" in
     ;;
   show-option)
     case "$*" in
+      *"-p -t %3 @omx_pane_instance_id"*) cat "${tmuxLogPath}.pane-tag" ;;
+      *"-p -t %3 @omx_team_pane_owner_id"*) cat "${tmuxLogPath}.team-owner" ;;
       *"@omx_pane_instance_id"*) printf 'live-pane-instance\n' ;;
+      *"@omx_team_pane_owner_id"*) printf 'team:pane-owner-env-isolated\n' ;;
       *) exit 1 ;;
     esac
     exit 0
     ;;
-  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane|kill-session)
+  set-option)
+    last=''
+    for value in "$@"; do last="$value"; done
+    case "$*" in
+      *"-p -t %3 @omx_pane_instance_id"*) printf '%s\n' "$last" > "${tmuxLogPath}.pane-tag" ;;
+      *"-p -t %3 @omx_team_pane_owner_id"*) printf '%s\n' "$last" > "${tmuxLogPath}.team-owner" ;;
+    esac
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane|kill-session)
     exit 0
     ;;
   *)
@@ -2315,8 +2327,8 @@ esac
             content: '#!/bin/sh\nexit 0\n',
           }],
           env: {
-            OMX_TMUX_SESSION_INSTANCE_ID: undefined,
-            OMX_TMUX_PANE_INSTANCE_ID: undefined,
+            OMX_TMUX_SESSION_INSTANCE_ID: 'live-session-instance',
+            OMX_TMUX_PANE_INSTANCE_ID: 'live-pane-instance',
           },
         },
         async ({ tmuxLogPath }) => {
@@ -4575,7 +4587,7 @@ process.on('SIGTERM', () => process.exit(0));
     }
   });
 
-  it('startTeam relaunch re-creates the HUD pane and re-registers reconcile hooks after shutdown', async () => {
+  it('startTeam relaunch reuses a preserved exact HUD and re-registers reconcile hooks after shutdown', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-relaunch-hud-'));
     const previousTmux = process.env.TMUX;
     const previousTmuxPane = process.env.TMUX_PANE;
@@ -4614,7 +4626,7 @@ case "\${1:-}" in
       *"pane_current_command"* )
         printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\tgemini\\n"
         if [ "$(cat "$hud_state")" != "absent" ]; then
-          printf "%%3\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\\n"
+          printf "%%3\tnode\texec env OMX_SESSION_ID='team-rerun-hud-session' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\tlive-pane-instance\tlive-session-instance\n";
         fi
         ;;
       *"#{pane_dead} #{pane_pid}"*)
@@ -4728,14 +4740,14 @@ exit 0
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           const teamHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t leader:0 -d -P -F #\\{pane_id\\}`, 'g');
           const standaloneHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %1 -d -P -F #\\{pane_id\\}`, 'g');
-          assert.equal(tmuxLog.match(teamHudSplitRe)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 0);
+          assert.equal(tmuxLog.match(teamHudSplitRe)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 1);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
+          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
+          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
           assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
-          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 0);
+          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 1);
         },
       );
     } finally {
@@ -6313,7 +6325,7 @@ exec "${realGit}" "$@"
     }
   });
 
-  it('shutdownTeam continues cleanup when resize hook unregister fails while session remains active', async () => {
+  it('shutdownTeam does not unregister persisted hooks without exact live HUD authority', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-gate-failed-'));
     try {
       await withMockTmuxFixture(
@@ -6359,23 +6371,23 @@ esac
           const manifestPath = teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed', 'manifest.v2.json');
           const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
           config.tmux_session = 'omx-team-team-shutdown-gate-failed';
+          config.hud_pane_id = '%9';
           config.resize_hook_name = 'omx_resize_team_shutdown_gate_failed_test';
           config.resize_hook_target = 'omx-team-team-shutdown-gate-failed:0';
           await writeFile(configPath, JSON.stringify(config, null, 2));
           const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
           manifest.tmux_session = 'omx-team-team-shutdown-gate-failed';
           manifest.resize_hook_name = 'omx_resize_team_shutdown_gate_failed_test';
+          manifest.hud_pane_id = '%9';
           manifest.resize_hook_target = 'omx-team-team-shutdown-gate-failed:0';
           await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
           process.env.TMUX_TEST_LOG = tmuxLogPath;
 
           await shutdownTeam('team-shutdown-gate-failed', cwd);
-
-          const teamRoot = teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed');
-          assert.equal(existsSync(teamRoot), false);
+          assert.equal(existsSync(teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed')), false);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /set-hook -u -t omx-team-team-shutdown-gate-failed:0 client-resized\[\d+\]/);
+          assert.doesNotMatch(tmuxLog, /set-hook -u -t omx-team-team-shutdown-gate-failed:0 client-resized\[\d+\]/);
           assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-gate-failed/);
         },
       );

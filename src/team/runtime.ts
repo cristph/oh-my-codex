@@ -3965,6 +3965,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   // 3. Force kill remaining workers
   const leaderPaneId = config.leader_pane_id;
   const hudPaneId = config.hud_pane_id;
+  let retainHudLifecycleState = false;
+
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
       ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
@@ -4069,53 +4071,91 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }).catch(() => null)
       : null;
     const ownsHudLifecycleLock = hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock;
+    const freshHudCandidate = ownsHudLifecycleLock && hudRestoreDomain && effectiveLeaderPaneId
+      ? probeExactTeamHudCandidate({
+        sessionId: hudRestoreDomain.claimant.sessionId,
+        sessionIds: hudRestoreDomain.session?.equivalentIds,
+        expectedLeaderPaneId: effectiveLeaderPaneId,
+      })
+      : null;
+    const freshHudRestoreDomain = freshHudCandidate && hudRequestedSessionId
+      ? await resolveHudControlPlaneDomain({
+        cwd,
+        env: process.env,
+        requestedSessionId: hudRequestedSessionId,
+        claimant: {
+          leaderPaneId: freshHudCandidate.leaderPaneId,
+          tmuxSessionName: freshHudCandidate.tmuxSessionName,
+          tmuxSessionInstanceId: freshHudCandidate.tmuxSessionInstanceId,
+          tmuxPaneInstanceId: freshHudCandidate.tmuxPaneInstanceId,
+        },
+      }).catch(() => null)
+      : null;
+    const hasFreshHudRestoreEvidence = Boolean(
+      freshHudRestoreDomain
+      && hudRestoreDomain
+      && freshHudCandidate
+      && freshHudRestoreDomain.domainKey === hudRestoreDomain.domainKey
+      && freshHudRestoreDomain.reconcileLockPath === hudRestoreDomain.reconcileLockPath
+      && freshHudRestoreDomain.claimant.sessionId
+      && freshHudRestoreDomain.claimant.leaderPaneId === freshHudCandidate.leaderPaneId
+      && freshHudRestoreDomain.claimant.tmuxSessionInstanceId === freshHudCandidate.tmuxSessionInstanceId
+      && freshHudRestoreDomain.claimant.tmuxPaneInstanceId === freshHudCandidate.tmuxPaneInstanceId,
+    );
+    const ownsHudTeardownAuthority = ownsHudLifecycleLock && hasFreshHudRestoreEvidence;
 
     // HUD lifecycle state is authority-bearing. Do not mutate it, its hooks,
-    // or the pane unless both live tmux evidence and this domain's lock agree.
-    if (hudPaneId && !ownsHudLifecycleLock) {
-      console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because exact HUD authority evidence or lifecycle lock was unavailable`);
+    // or the pane unless a fresh live tmux proof was obtained under this
+    // domain's lock.
+    if (hudPaneId && !ownsHudTeardownAuthority) {
+      console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority evidence or lifecycle lock was unavailable`);
     }
 
-    const clientHookTarget = effectiveHudPaneId && ownsHudLifecycleLock
+    const clientHookTarget = effectiveHudPaneId && ownsHudTeardownAuthority
       ? (config.resize_hook_target || sessionName)
       : null;
+    let hooksRemoved = false;
     if (clientHookTarget && effectiveHudPaneId) {
       const windowIndex = clientHookTarget.slice(clientHookTarget.lastIndexOf(':') + 1);
       const clientHookName = windowIndex
         ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, effectiveHudPaneId)
         : '';
-      if (!clientHookName || !unregisterClientAttachedReconcileHook(clientHookTarget, clientHookName)) {
-        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because the client-attached HUD hook could not be unregistered`);
+      const clientHookRemoved = Boolean(
+        clientHookName && unregisterClientAttachedReconcileHook(clientHookTarget, clientHookName),
+      );
+      const resizeHookRemoved = !config.resize_hook_name
+        || !config.resize_hook_target
+        || unregisterResizeHook(config.resize_hook_target, config.resize_hook_name);
+      hooksRemoved = clientHookRemoved && resizeHookRemoved;
+      if (!hooksRemoved) {
+        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because authorized HUD hook cleanup failed`);
+      } else if (config.resize_hook_name || config.resize_hook_target) {
+        config.resize_hook_name = null;
+        config.resize_hook_target = null;
+        await saveTeamConfig(config, cwd);
       }
-    }
-    if ((ownsHudLifecycleLock || !hudPaneId) && config.resize_hook_name && config.resize_hook_target) {
-      if (!unregisterResizeHook(config.resize_hook_target, config.resize_hook_name) && ownsHudLifecycleLock) {
-        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because the resize hook could not be unregistered`);
-      }
-      config.resize_hook_name = null;
-      config.resize_hook_target = null;
-      await saveTeamConfig(config, cwd);
     }
 
     try {
     let restoredHudPaneId: string | null = null;
-    if (effectiveHudPaneId && ownsHudLifecycleLock) {
+    if (effectiveHudPaneId && ownsHudTeardownAuthority && hooksRemoved) {
       await killWorkerByPaneIdAsync(effectiveHudPaneId, effectiveLeaderPaneId ?? undefined);
-      if (sessionName.includes(':') && hudRestoreDomain) {
+      if (sessionName.includes(':') && freshHudRestoreDomain) {
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
-          sessionId: hudRestoreDomain.claimant.sessionId,
-          sessionIds: hudRestoreDomain.session?.equivalentIds,
-          leaderPaneId: hudRestoreDomain.claimant.leaderPaneId,
-          tmuxSessionInstanceId: hudRestoreDomain.claimant.tmuxSessionInstanceId,
-          tmuxPaneInstanceId: hudRestoreDomain.claimant.tmuxPaneInstanceId,
-          hudRuntime: projectHudRuntimeRootEnv(hudRestoreDomain.rootSource, process.env),
+          sessionId: freshHudRestoreDomain.claimant.sessionId,
+          sessionIds: freshHudRestoreDomain.session?.equivalentIds,
+          leaderPaneId: freshHudRestoreDomain.claimant.leaderPaneId,
+          tmuxSessionInstanceId: freshHudRestoreDomain.claimant.tmuxSessionInstanceId,
+          tmuxPaneInstanceId: freshHudRestoreDomain.claimant.tmuxPaneInstanceId,
+          hudRuntime: projectHudRuntimeRootEnv(freshHudRestoreDomain.rootSource, process.env),
         });
         if (!restoredHudPaneId) {
           console.warn(`[team shutdown] ${sanitized}: failed to restore standalone HUD pane`);
         }
       }
-    } else if (effectiveHudPaneId) {
-      console.warn(`[team shutdown] ${sanitized}: skipped Team HUD teardown and standalone restore because exact HUD authority evidence or lifecycle lock was unavailable`);
+    } else if (hudPaneId) {
+      retainHudLifecycleState = Boolean(ownsHudTeardownAuthority && effectiveHudPaneId);
+      console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority, lifecycle lock, or hook cleanup was unavailable`);
     }
     shutdownPaneIds = collectShutdownPaneIds({
       config,
@@ -4134,7 +4174,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     });
     await teardownWorkerPanes(shutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
-      hudPaneId: restoredHudPaneId ?? (ownsHudLifecycleLock ? effectiveHudPaneId : undefined),
+      hudPaneId: restoredHudPaneId ?? (ownsHudTeardownAuthority && hooksRemoved ? effectiveHudPaneId : undefined),
     });
     } finally {
       if (hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock) {
@@ -4142,8 +4182,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
     }
 
-    // 4. Destroy tmux session
-    if (!sessionName.includes(':')) {
+    // 4. Destroy tmux session only when it contains preserved exact Team HUD state.
+    if (!sessionName.includes(':') && !retainHudLifecycleState) {
       try {
         destroyTeamSession(sessionName);
       } catch (err) {
@@ -4258,13 +4298,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
   }
 
-  // 7. Cleanup state
+  // 7. Retain state only when an exact Team HUD lifecycle retry remains actionable.
   let teamStateCleaned = false;
-  try {
-    await cleanupTeamState(sanitized, cwd);
-    teamStateCleaned = true;
-  } catch (err) {
-    cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
+  if (!retainHudLifecycleState) {
+    try {
+      await cleanupTeamState(sanitized, cwd);
+      teamStateCleaned = true;
+    } catch (err) {
+      cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
+    }
   }
   if (teamStateCleaned) {
     await syncTeamModeStateOnShutdown(sanitized, cwd, leaderSessionId);

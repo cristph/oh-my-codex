@@ -192,6 +192,22 @@ describe('exact tmux identity evidence', () => {
       contextStable: true,
     }, ['canonical-session', 'native-alias']), true);
   });
+
+  it('rejects a mixed pair from a broader alias set', () => {
+    assert.equal(tmuxEvidenceBindsCandidate({
+      paneTarget: '%1',
+      sessionName: 'leader',
+      paneInstanceId: 'native-alias-a',
+      sessionInstanceId: 'canonical-session-b',
+      instanceId: 'native-alias-a',
+      source: 'pane',
+      paneTagStatus: 'present',
+      sessionTagStatus: 'present',
+      sessionId: '$1',
+      windowId: '@1',
+      contextStable: true,
+    }, ['canonical-session-a', 'native-alias-a', 'canonical-session-b', 'native-alias-b']), false);
+  });
 });
 
 describe('sanitizeTeamName', () => {
@@ -4167,6 +4183,13 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "diff-gutter-redraw" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:diff-gutter-redraw" ;;
+    esac
+    exit 0
+    ;;
   set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys)
     exit 0
     ;;
@@ -4259,6 +4282,13 @@ case "\${1:-}" in
       *)
         echo "%3"
         ;;
+    esac
+    exit 0
+    ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "omx-pane-scope" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:pane-tags" ;;
     esac
     exit 0
     ;;
@@ -4365,6 +4395,13 @@ case "\${1:-}" in
       *)
         echo "%3"
         ;;
+    esac
+    exit 0
+    ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "logical-session-boundary" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:explicit-owner-boundary" ;;
     esac
     exit 0
     ;;
@@ -4640,6 +4677,13 @@ case "\${1:-}" in
         ;;
     esac
     ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "resize-hook-fallback" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:resize-hook-fallback" ;;
+    esac
+    exit 0
+    ;;
   set-option|resize-pane|select-layout|set-window-option|select-pane|run-shell)
     exit 0
     ;;
@@ -4733,6 +4777,13 @@ case "\${1:-}" in
   run-shell)
     echo "Unsupported tmux compatibility command: run-shell" >&2
     exit 1
+    ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "run-shell-fallback" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:run-shell-fallback" ;;
+    esac
+    exit 0
     ;;
   set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|send-keys)
     exit 0
@@ -4832,6 +4883,13 @@ case "\${1:-}" in
       *)
         echo "%3"
         ;;
+    esac
+    exit 0
+    ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "windows-team" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:windows-team" ;;
     esac
     exit 0
     ;;
@@ -4945,6 +5003,13 @@ case "\${1:-}" in
       *)
         echo "%3"
         ;;
+    esac
+    exit 0
+    ;;
+  show-option)
+    case "$*" in
+      *"@omx_pane_instance_id"*) echo "windows-team" ;;
+      *"@omx_team_pane_owner_id"*) echo "team:windows-team" ;;
     esac
     exit 0
     ;;

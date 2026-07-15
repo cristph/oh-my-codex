@@ -197,17 +197,27 @@ export function tmuxEvidenceBindsCandidate(
   evidence: ActualTmuxInstanceEvidence,
   candidateSessionIds: string | readonly string[],
 ): boolean {
-  const acceptedSessionIds = new Set(
+  const acceptedSessionIds = [...new Set(
     (typeof candidateSessionIds === 'string' ? [candidateSessionIds] : candidateSessionIds)
       .map((candidate) => safeString(candidate).trim())
       .filter(Boolean),
-  );
-  return acceptedSessionIds.size > 0
-    && evidence.contextStable
-    && evidence.paneTagStatus === 'present'
-    && evidence.sessionTagStatus === 'present'
-    && acceptedSessionIds.has(evidence.paneInstanceId)
-    && acceptedSessionIds.has(evidence.sessionInstanceId);
+  )];
+  if (
+    !evidence.contextStable
+    || evidence.paneTagStatus !== 'present'
+    || evidence.sessionTagStatus !== 'present'
+  ) return false;
+
+  if (acceptedSessionIds.length === 1) {
+    return evidence.paneInstanceId === acceptedSessionIds[0]
+      && evidence.sessionInstanceId === acceptedSessionIds[0];
+  }
+  // A canonical/native alias pair is one resolver-proven lineage. Do not turn
+  // a broader list of aliases into a Cartesian pane/session authorization.
+  if (acceptedSessionIds.length !== 2) return false;
+  const [firstId, secondId] = acceptedSessionIds;
+  return (evidence.paneInstanceId === firstId && evidence.sessionInstanceId === secondId)
+    || (evidence.paneInstanceId === secondId && evidence.sessionInstanceId === firstId);
 }
 
 
