@@ -64,6 +64,7 @@ import {
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
+import { tmuxEvidenceBindsCandidate } from '../../scripts/notify-hook/managed-tmux.js';
 
 const fsMutable = fs as typeof fs & {
   existsSync: typeof fs.existsSync;
@@ -174,6 +175,24 @@ function verifiedTeamHudCandidate(sessionId: string, leaderPaneId = '%1') {
   };
 }
 
+
+describe('exact tmux identity evidence', () => {
+  it('accepts distinct canonical and equivalent pane/session tags when both are resolver-approved', () => {
+    assert.equal(tmuxEvidenceBindsCandidate({
+      paneTarget: '%1',
+      sessionName: 'leader',
+      paneInstanceId: 'native-alias',
+      sessionInstanceId: 'canonical-session',
+      instanceId: 'native-alias',
+      source: 'pane',
+      paneTagStatus: 'present',
+      sessionTagStatus: 'present',
+      sessionId: '$1',
+      windowId: '@1',
+      contextStable: true,
+    }, ['canonical-session', 'native-alias']), true);
+  });
+});
 
 describe('sanitizeTeamName', () => {
   it('lowercases and strips invalid chars', () => {
@@ -5193,6 +5212,10 @@ case "\${1:-}" in
     echo "%44"
     exit 0
     ;;
+  show-option)
+    printf 'pane-instance\n'
+    exit 0
+    ;;
   run-shell|select-pane|resize-pane|set-hook|kill-pane)
     exit 0
     ;;
@@ -5229,6 +5252,37 @@ esac
     }
   });
 
+  it('rolls back a newly split standalone HUD when pane-tag readback mismatches', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-tag-rollback-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-standalone-tag-rollback-',
+        (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes) printf '%%11\\tzsh\\tzsh\\n'; exit 0 ;;
+  split-window) printf '%%44\\n'; exit 0 ;;
+  set-option) exit 0 ;;
+  show-option) printf 'wrong-instance\\n'; exit 0 ;;
+  kill-pane|run-shell|select-pane) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(restoreStandaloneHudPane('%11', cwd, {
+            sessionId: 'canonical-session',
+            leaderPaneId: '%11',
+            tmuxSessionInstanceId: 'session-instance',
+            tmuxPaneInstanceId: 'pane-instance',
+          }), null);
+          assert.match(await readFile(logPath, 'utf-8'), /kill-pane -t %44/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('preserves legacy and different-leader same-session HUD panes during standalone restore', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-owner-identity-hud-'));
 
@@ -5247,6 +5301,10 @@ case "\${1:-}" in
     ;;
   split-window)
     echo "%46"
+    exit 0
+    ;;
+  show-option)
+    printf 'pane-instance\n'
     exit 0
     ;;
   run-shell|select-pane|resize-pane|set-hook|kill-pane)

@@ -348,6 +348,34 @@ function tagPaneInstance(paneTarget: string, instanceId: string): void {
   }
 }
 
+function readPaneInstanceTag(paneTarget: string): string | null {
+  const result = runTmux(['show-option', '-qv', '-p', '-t', paneTarget, OMX_PANE_INSTANCE_OPTION]);
+  return result.ok ? result.stdout.trim() : null;
+}
+
+function readNewPaneTeamOwnerTag(paneTarget: string): string | null {
+  const result = runTmux(['show-option', '-qv', '-p', '-t', paneTarget, OMX_TEAM_PANE_OWNER_OPTION]);
+  return result.ok ? result.stdout.trim() : null;
+}
+
+function tagNewHudPaneOrRollback(
+  paneId: string,
+  instanceId: string,
+  teamOwnerId?: string,
+): boolean {
+  try {
+    tagPaneInstance(paneId, instanceId);
+    if (teamOwnerId) tagPaneTeamOwner(paneId, teamOwnerId);
+    const tagsMatch = readPaneInstanceTag(paneId) === instanceId
+      && (!teamOwnerId || readNewPaneTeamOwnerTag(paneId) === teamOwnerId);
+    if (tagsMatch) return true;
+  } catch {
+    // Roll back only the pane created by this transaction.
+  }
+  runTmux(['kill-pane', '-t', paneId]);
+  return false;
+}
+
 export function tagPaneTeamOwner(paneTarget: string, teamOwnerId: string): void {
   const target = paneTarget.trim();
   const sanitized = teamOwnerId.trim();
@@ -911,6 +939,11 @@ export function buildUnregisterClientAttachedReconcileArgs(hookTarget: string, h
 
 export function unregisterResizeHook(hookTarget: string, hookName: string): boolean {
   const result = runTmux(buildUnregisterResizeHookArgs(hookTarget, hookName));
+  return result.ok;
+}
+
+export function unregisterClientAttachedReconcileHook(hookTarget: string, hookName: string): boolean {
+  const result = runTmux(buildUnregisterClientAttachedReconcileArgs(hookTarget, hookName));
   return result.ok;
 }
 
@@ -1936,8 +1969,14 @@ export function createTeamSession(
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
-          tagPaneInstance(id, hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId);
-          tagPaneTeamOwner(id, teamPaneOwnerId);
+          if (!tagNewHudPaneOrRollback(
+            id,
+            hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId,
+            teamPaneOwnerId,
+          )) {
+            if (!retainedHudPaneId && rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
+            throw new Error(`failed to tag and verify HUD pane ${id}`);
+          }
           hudPaneId = id;
 
           if (isNativeWindows()) {
@@ -2105,7 +2144,7 @@ export function restoreStandaloneHudPane(
 
   const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
   if (!paneId.startsWith('%')) return null;
-  if (tmuxPaneInstanceId) tagPaneInstance(paneId, tmuxPaneInstanceId);
+  if (tmuxPaneInstanceId && !tagNewHudPaneOrRollback(paneId, tmuxPaneInstanceId)) return null;
 
   if (isNativeWindows()) {
     runTmux(buildHudResizeArgs(paneId));

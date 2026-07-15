@@ -195,15 +195,19 @@ export async function probeActualTmuxInstanceEvidence(paneTarget?: string): Prom
 
 export function tmuxEvidenceBindsCandidate(
   evidence: ActualTmuxInstanceEvidence,
-  candidateSessionId: string,
+  candidateSessionIds: string | readonly string[],
 ): boolean {
-  const candidate = safeString(candidateSessionId).trim();
-  if (!candidate) return false;
-  return evidence.contextStable
+  const acceptedSessionIds = new Set(
+    (typeof candidateSessionIds === 'string' ? [candidateSessionIds] : candidateSessionIds)
+      .map((candidate) => safeString(candidate).trim())
+      .filter(Boolean),
+  );
+  return acceptedSessionIds.size > 0
+    && evidence.contextStable
     && evidence.paneTagStatus === 'present'
     && evidence.sessionTagStatus === 'present'
-    && evidence.paneInstanceId === candidate
-    && evidence.sessionInstanceId === candidate;
+    && acceptedSessionIds.has(evidence.paneInstanceId)
+    && acceptedSessionIds.has(evidence.sessionInstanceId);
 }
 
 

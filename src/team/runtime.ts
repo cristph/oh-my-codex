@@ -32,6 +32,8 @@ import {
   restoreStandaloneHudPane,
   teardownWorkerPanes,
   unregisterResizeHook,
+  unregisterClientAttachedReconcileHook,
+  buildClientAttachedReconcileHookName,
   destroyTeamSession,
   listPaneIds,
   listTeamSessions,
@@ -4006,24 +4008,6 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       hudPaneId: effectiveHudPaneId,
     });
 
-    let resizeHookWarning: string | null = null;
-    if (config.resize_hook_name && config.resize_hook_target) {
-      const resizeHookName = config.resize_hook_name;
-      const unregistered = unregisterResizeHook(config.resize_hook_target, resizeHookName);
-      if (!unregistered && isTmuxAvailable()) {
-        const baseSession = sessionName.split(':')[0];
-        const sessionStillActive = listTeamSessions().includes(baseSession);
-        if (sessionStillActive) {
-          resizeHookWarning = `failed to unregister resize hook ${resizeHookName}`;
-        }
-      }
-    }
-    config.resize_hook_name = null;
-    config.resize_hook_target = null;
-    await saveTeamConfig(config, cwd);
-    if (resizeHookWarning) {
-      console.warn(`[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`);
-    }
     const hudRequestedSessionId = normalizeSessionId(leaderSessionId);
     const initialHudRestoreDomain = hudRequestedSessionId
       ? await resolveHudControlPlaneDomain({
@@ -4085,6 +4069,33 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }).catch(() => null)
       : null;
     const ownsHudLifecycleLock = hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock;
+
+    // HUD lifecycle state is authority-bearing. Do not mutate it, its hooks,
+    // or the pane unless both live tmux evidence and this domain's lock agree.
+    if (hudPaneId && !ownsHudLifecycleLock) {
+      console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because exact HUD authority evidence or lifecycle lock was unavailable`);
+    }
+
+    const clientHookTarget = effectiveHudPaneId && ownsHudLifecycleLock
+      ? (config.resize_hook_target || sessionName)
+      : null;
+    if (clientHookTarget && effectiveHudPaneId) {
+      const windowIndex = clientHookTarget.slice(clientHookTarget.lastIndexOf(':') + 1);
+      const clientHookName = windowIndex
+        ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, effectiveHudPaneId)
+        : '';
+      if (!clientHookName || !unregisterClientAttachedReconcileHook(clientHookTarget, clientHookName)) {
+        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because the client-attached HUD hook could not be unregistered`);
+      }
+    }
+    if ((ownsHudLifecycleLock || !hudPaneId) && config.resize_hook_name && config.resize_hook_target) {
+      if (!unregisterResizeHook(config.resize_hook_target, config.resize_hook_name) && ownsHudLifecycleLock) {
+        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because the resize hook could not be unregistered`);
+      }
+      config.resize_hook_name = null;
+      config.resize_hook_target = null;
+      await saveTeamConfig(config, cwd);
+    }
 
     try {
     let restoredHudPaneId: string | null = null;
