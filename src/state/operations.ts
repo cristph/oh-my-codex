@@ -56,7 +56,9 @@ import {
   clearTerminalSkillActiveMarkers,
   getSkillActiveStatePathsForStateDir,
   isTerminalSkillActiveState,
+  isTransitionCanonicalStateOwned,
   listActiveSkills,
+  listTransitionActiveSkills,
   syncCanonicalSkillStateForMode,
   type SkillActiveEntry,
   type SkillActiveStateLike,
@@ -2199,14 +2201,9 @@ export async function listActiveStateModes(scope: OperationRuntimeScope): Promis
   const canonicalState = await readVisibleSafeSkillActiveState(scope.baseStateDir, sessionId, scope.authority?.generation.root_identity);
 
   const canonicalActiveModes = new Set(
-    listActiveSkills(canonicalState ?? {})
-      .filter((entry) => {
-        const entrySessionId = typeof entry.session_id === 'string' ? entry.session_id.trim() : '';
-        return sessionId ? entrySessionId === sessionId : entrySessionId.length === 0;
-      })
-      .map((entry) => entry.skill),
+    listTransitionActiveSkills(canonicalState ?? {}, sessionId).map((entry) => entry.skill),
   );
-  const hasCanonicalVisibility = canonicalState !== null;
+  const hasCanonicalVisibility = isTransitionCanonicalStateOwned(canonicalState, sessionId);
 
   return Object.entries(statuses)
     .filter(([mode, status]) => {
@@ -2224,14 +2221,8 @@ async function readCanonicalActiveWorkflowModes(
   sessionId: string | undefined,
   expectedRootIdentity: RootFilesystemIdentity,
 ): Promise<TrackedWorkflowMode[]> {
-  const normalizedSessionId = sessionId ?? '';
   const canonicalState = await readVisibleSafeSkillActiveState(baseStateDir, sessionId, expectedRootIdentity);
-
-  const activeModes = listActiveSkills(canonicalState ?? {})
-    .filter((entry) => {
-      const entrySessionId = typeof entry.session_id === 'string' ? entry.session_id.trim() : '';
-      return normalizedSessionId ? entrySessionId === normalizedSessionId : entrySessionId.length === 0;
-    })
+  const activeModes = listTransitionActiveSkills(canonicalState ?? {}, sessionId)
     .map((entry) => entry.skill)
     .filter(isTrackedWorkflowMode);
   return [...new Set(activeModes)];
@@ -2739,19 +2730,26 @@ async function executeStateOperationInternal(
             });
 
           if (!ralplanCompletionHandled) {
-            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
-            await syncCanonicalSkillStateForMode({
-              cwd,
+            const rootSkillState = await readSafeSkillActiveState(
               baseStateDir,
-              mode,
-              active: data.active === true,
-              currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
-              sessionId: effectiveSessionId,
-              source: 'state-operations',
+              skillStatePaths.rootPath,
               expectedRootIdentity,
-            });
-            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
-            await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { sessionId: effectiveSessionId });
+            );
+            if (rootSkillState === null || isTransitionCanonicalStateOwned(rootSkillState, effectiveSessionId)) {
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: data.active === true,
+                currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
+                sessionId: effectiveSessionId,
+                source: 'state-operations',
+                expectedRootIdentity,
+              });
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
+              await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { sessionId: effectiveSessionId });
+            }
           }
         }
         }, { preparedAlreadyRecorded: options.recoveryOperation !== undefined });

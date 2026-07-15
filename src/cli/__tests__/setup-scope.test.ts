@@ -275,6 +275,7 @@ describe("omx setup scope behavior", () => {
             hooks: {
               SessionStart: [
                 {
+                  matcher: "startup|resume|clear",
                   hooks: [
                     {
                       type: "command",
@@ -321,9 +322,9 @@ describe("omx setup scope behavior", () => {
         ].join("\n"),
       );
 
-      const res = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
-      if (shouldSkipForSpawnPermissions(res.error)) return;
-      assert.equal(res.status, 0, res.stderr || res.stdout);
+      const setupResult = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(setupResult.error)) return;
+      assert.equal(setupResult.status, 0, setupResult.stderr || setupResult.stdout);
 
       const hooksJson = JSON.parse(
         await readFile(join(codexDir, "hooks.json"), "utf-8"),

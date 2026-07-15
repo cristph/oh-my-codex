@@ -21,7 +21,7 @@ import {
   type WorkflowTransitionDecision,
 } from './workflow-transition.js';
 import {
-  listActiveSkills,
+  listTransitionActiveSkills,
   readVisibleSkillActiveStateForStateDir,
   syncCanonicalSkillStateForMode,
 } from './skill-active.js';
@@ -324,17 +324,34 @@ async function assertAuthoritativeWorkflowStateReadable(
   }
 }
 
+function isActiveWorkflowDetail(state: TransitionStateLike | null): boolean {
+  if (!state || state.active !== true) return false;
+  const phase = safeString(state.current_phase).trim().toLowerCase();
+  return !['complete', 'completed', 'cancelled', 'canceled', 'failed', 'cleared'].includes(phase);
+}
+
 async function visibleTrackedModes(
   stateRoot: string,
   sessionId?: string,
 ): Promise<TrackedWorkflowMode[]> {
   const canonical = await readVisibleSkillActiveStateForStateDir(stateRoot, sessionId);
-  const canonicalModes = listActiveSkills(canonical ?? {})
-    .filter((entry) => sessionId || safeString(entry.session_id).trim().length === 0)
+  const canonicalModes = listTransitionActiveSkills(canonical ?? {}, sessionId)
     .map((entry) => entry.skill)
     .filter(isTrackedWorkflowMode);
 
-  return [...new Set(canonicalModes)];
+  if (sessionId) return [...new Set(canonicalModes)];
+
+  const activeDetailModes: TrackedWorkflowMode[] = [];
+  for (const mode of TRACKED_WORKFLOW_MODES) {
+    const path = modeStatePathForRoot(mode, stateRoot);
+    const state = await readJsonIfExists(stateRoot, path, undefined, {
+      mode,
+      throwOnParseError: true,
+    });
+    if (isActiveWorkflowDetail(state)) activeDetailModes.push(mode);
+  }
+
+  return [...new Set([...canonicalModes, ...activeDetailModes])];
 }
 
 async function assertSourceModeAdvanceAllowed(

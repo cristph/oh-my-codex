@@ -30,6 +30,7 @@ import {
   type RootFilesystemIdentity,
   type SessionAliasSet,
 } from '../state/authority.js';
+import type { PromptDiagnosticDescriptor } from './prompt-session-provenance.js';
 
 export interface SessionState {
   session_id: string;
@@ -41,6 +42,7 @@ export interface SessionState {
   native_session_switched_at?: string;
   owner_omx_session_id?: string;
   owner_codex_session_id?: string;
+  codex_session_id?: string;
   started_at: string;
   cwd: string;
   pid: number;
@@ -59,6 +61,41 @@ export function normalizeSessionId(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return SESSION_ID_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
+export interface SessionPointerContext {
+  cwd: string;
+  baseStateDir: string;
+  rootSource: 'persisted-authority';
+}
+
+export interface SessionPointerReadResult {
+  status: 'absent' | 'usable' | 'stale-dead' | 'identity-indeterminate' | 'malformed' | 'foreign-cwd';
+  state?: SessionState;
+}
+
+export function resolveSessionPointerContext(cwd: string): SessionPointerContext {
+  const workspace = resolveWorkspaceIdentity(cwd);
+  return {
+    cwd,
+    baseStateDir: join(workspace.canonical_path, '.omx', 'state'),
+    rootSource: 'persisted-authority',
+  };
+}
+
+export async function readSessionPointer(context: SessionPointerContext): Promise<SessionPointerReadResult> {
+  try {
+    const state = await readSessionState(context.cwd);
+    if (!state) return { status: 'absent' };
+    if (!isSessionStateAuthoritativeForCwd(state, context.cwd)) return { status: 'foreign-cwd', state };
+    if (isSessionStale(state)) return { status: 'stale-dead', state };
+    return { status: 'usable', state };
+  } catch (error) {
+    if (error instanceof StateAuthorityError && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) {
+      return { status: 'absent' };
+    }
+    throw error;
+  }
 }
 
 function requireSessionId(value: unknown, label = 'sessionId'): string {
@@ -1484,5 +1521,26 @@ export async function appendToLog(cwd: string, entry: Record<string, unknown>): 
   await withSessionAuthorityTransaction(authority, async (context) => {
     const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
     await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, entry);
+  });
+}
+
+export async function appendPromptSessionProvenanceRejection(
+  context: SessionPointerContext,
+  descriptor: PromptDiagnosticDescriptor,
+): Promise<void> {
+  const authority = await resolveSessionAuthorityForGuard(context.cwd);
+  if (resolve(context.baseStateDir) !== resolve(authority.canonical_state_root)) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      `prompt provenance diagnostic root ${context.baseStateDir} does not match persisted authority ${authority.canonical_state_root}`,
+    );
+  }
+  await appendToLog(context.cwd, {
+    event: 'prompt_session_provenance_rejected',
+    reason: descriptor.reason,
+    producer: descriptor.producer,
+    selected_root_status: descriptor.selectedRootStatus,
+    ...(descriptor.relation ? { relation: descriptor.relation } : {}),
+    timestamp: descriptor.timestamp,
   });
 }

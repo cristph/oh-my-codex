@@ -1661,10 +1661,13 @@ function turnKey(threadId: string, turnId: string): string {
   return `${threadId || 'no-thread'}|${turnId || 'no-turn'}`;
 }
 
-function buildNotifyPayload(threadId: string, turnId: string, lastMessage: string): Record<string, unknown> {
+async function buildNotifyPayload(threadId: string, turnId: string, lastMessage: string): Promise<Record<string, unknown>> {
+  const session = await readSessionState(cwd).catch(() => null);
+  const payloadSessionId = normalizeValidSessionId(session?.session_id) || threadId;
   return {
     type: 'agent-turn-complete',
     cwd,
+    session_id: payloadSessionId,
     'thread-id': threadId,
     'turn-id': turnId,
     'input-messages': ['[notify-fallback] synthesized from rollout task_complete'],
@@ -1736,7 +1739,11 @@ async function processLine(meta: WatcherFileMeta, line: string, filePath: string
     return;
   }
   if (seenTurnKeys.has(key)) return;
-  const payload = buildNotifyPayload(meta.threadId, turnId, safeString((parsed.payload as Record<string, unknown>).last_agent_message));
+  const payload = await buildNotifyPayload(
+    meta.threadId,
+    turnId,
+    safeString((parsed.payload as Record<string, unknown>).last_agent_message),
+  );
   let spawnResult: Awaited<ReturnType<typeof invokeNotifyHook>> | undefined;
   const deliveryPromise = deliverNotifyFallback({
     stateDir,
