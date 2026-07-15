@@ -1439,6 +1439,7 @@ export async function scaleDown(
           },
           interruptAfterFirstTaskWrite: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write',
           failRollbackPersistence: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'rollback-persistence-failure',
+          recoverToNewOnFailure: true,
         });
         const committed = await readTeamConfig(sanitized, leaderCwd);
         if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) {

@@ -3432,9 +3432,9 @@ exit 0
       const recoveredConfig = await readTeamConfig('rollback-recovery', cwd);
       const recoveredManifest = await readTeamManifestV2('rollback-recovery', cwd);
       const recoveredTask = await readTask('rollback-recovery', task.id, cwd);
-      assert.equal(recoveredConfig?.workers.some((worker) => worker.name === 'worker-2'), true);
-      assert.equal(recoveredManifest?.workers.some((worker) => worker.name === 'worker-2'), true);
-      assert.equal(recoveredTask?.owner, 'worker-2');
+      assert.equal(recoveredConfig?.workers.some((worker) => worker.name === 'worker-2'), false);
+      assert.equal(recoveredManifest?.workers.some((worker) => worker.name === 'worker-2'), false);
+      assert.equal(recoveredTask?.owner, undefined);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
