@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto';
 import { spawnSync, execFile } from 'child_process';
 import { promisify } from 'util';
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
@@ -135,14 +134,14 @@ export function establishExactTeamHudCandidate(
   if (!before || (expectedLeaderPaneId && before.leaderPaneId !== expectedLeaderPaneId)) return null;
   const sessionTag = runTmux(['show-options', '-qv', '-t', before.sessionName, OMX_INSTANCE_OPTION]);
   if (!sessionTag.ok) return null;
-  const tmuxSessionInstanceId = sessionTag.stdout.trim() || randomUUID();
+  const tmuxSessionInstanceId = sessionTag.stdout.trim() || sessionId;
   if (!sessionTag.stdout.trim() && !runTmux(['set-option', '-t', before.sessionName, OMX_INSTANCE_OPTION, tmuxSessionInstanceId]).ok) return null;
   const verifiedSessionTag = runTmux(['show-options', '-qv', '-t', before.sessionName, OMX_INSTANCE_OPTION]);
   if (!verifiedSessionTag.ok || verifiedSessionTag.stdout.trim() !== tmuxSessionInstanceId) return null;
 
   const paneTag = runTmux(['show-option', '-qv', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
   if (!paneTag.ok) return null;
-  const tmuxPaneInstanceId = paneTag.stdout.trim() || randomUUID();
+  const tmuxPaneInstanceId = paneTag.stdout.trim() || sessionIds.find((value) => value !== sessionId) || sessionId;
   if (!paneTag.stdout.trim() && !runTmux(['set-option', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION, tmuxPaneInstanceId]).ok) return null;
   const verifiedPaneTag = runTmux(['show-option', '-qv', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
   if (!verifiedPaneTag.ok || verifiedPaneTag.stdout.trim() !== tmuxPaneInstanceId) return null;
@@ -1969,12 +1968,12 @@ export function createTeamSession(
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
-          if (!tagNewHudPaneOrRollback(
+          if (!retainedHudPaneId && !tagNewHudPaneOrRollback(
             id,
             hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId,
             teamPaneOwnerId,
           )) {
-            if (!retainedHudPaneId && rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
+            if (rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
             throw new Error(`failed to tag and verify HUD pane ${id}`);
           }
           hudPaneId = id;
