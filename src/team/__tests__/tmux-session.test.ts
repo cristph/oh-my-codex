@@ -6301,6 +6301,20 @@ describe('isWorkerAlive', () => {
     });
   });
 
+  it('treats blank persisted pane IDs as absent and uses the compatibility target', async () => {
+    await withMockTmuxFixture(
+      'omx-blank-pane-fallback-',
+      () => `#!/bin/sh
+if [ "$1" = "list-panes" ] && [ "$2" = "-t" ]; then printf '0 %s\n' "$PPID"; exit 0; fi
+exit 1
+`,
+      async () => {
+        assert.equal(isWorkerAlive('compat-session', 1, ''), true);
+        assert.equal(isWorkerAlive('compat-session', 1, '   '), true);
+      },
+    );
+  });
+
   it('uses the exact global row for explicit pane liveness and fails closed for dead rows', async () => {
     await withMockTmuxFixture(
       'omx-pane-id-liveness-',

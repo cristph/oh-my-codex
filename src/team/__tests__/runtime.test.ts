@@ -2563,6 +2563,23 @@ esac
       assert.deepEqual(workerPaneIds, ['%2', '%3']);
       assert.equal(config.workers[0]?.pane_id, '%2');
       assert.equal(config.workers[1]?.pane_id, '%3');
+
+      const partialWorkerPaneIds = Array.from({ length: 2 }, () => undefined as string | undefined);
+      applyCreatedInteractiveSessionToConfig(config, {
+        name: 'leader:0',
+        workerCount: 2,
+        cwd,
+        workerPaneIds: ['%30'],
+        workerPaneIdsByIndex: [null, '%30'],
+        leaderPaneId: '%1',
+        hudPaneId: '%4',
+        resizeHookName: 'resize-hook',
+        resizeHookTarget: 'leader:0',
+        teamPaneOwnerId: 'team:team-pane-persist-race',
+      }, partialWorkerPaneIds);
+      assert.deepEqual(partialWorkerPaneIds, [undefined, '%30']);
+      assert.equal(config.workers[0]?.pane_id, '%2');
+      assert.equal(config.workers[1]?.pane_id, '%30');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4069,7 +4086,7 @@ esac
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
             )),
-            /exact_pane_proof_unavailable:%1:malformed_snapshot/,
+            /tmux pane is not proven live: %2/,
           );
 
           const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-no-resource-create-proof');
@@ -7114,7 +7131,7 @@ esac
     }
   });
 
-  it('scaleDown preserves worker state when global pane proof is unavailable', async () => {
+  it('scaleDown commits forward membership and durable debt when global pane proof is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-scale-down-pane-proof-'));
     try {
       await withMockTmuxFixture(
@@ -7168,9 +7185,11 @@ esac
           if (result.ok) return;
           assert.match(result.error, /scale_down_pane_proof_unavailable:%405:query_failed/);
 
-          const preservedConfig = await readTeamConfig('team-scale-down-pane-proof', cwd);
-          assert.equal(preservedConfig?.workers.length, 2);
-          assert.equal(preservedConfig?.workers[1]?.pane_id, '%405');
+          const committedConfig = await readTeamConfig('team-scale-down-pane-proof', cwd);
+          assert.equal(committedConfig?.workers.length, 1);
+          const debt = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'team-scale-down-pane-proof', '.scale-down-cleanup-debt.json'), 'utf8'));
+          assert.equal(debt.status, 'unresolved');
+          assert.equal(debt.unresolved_panes[0]?.pane_id, '%405');
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/m);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %405/);

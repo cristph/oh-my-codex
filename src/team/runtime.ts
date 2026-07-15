@@ -370,12 +370,20 @@ export function applyCreatedInteractiveSessionToConfig(
   config.tmux_pane_owner_id = createdSession.teamPaneOwnerId;
   config.resize_hook_name = createdSession.resizeHookName;
   config.resize_hook_target = createdSession.resizeHookTarget;
+  const paneIdsByIndex = createdSession.workerPaneIdsByIndex;
+  if (paneIdsByIndex) {
+    for (let i = 0; i < paneIdsByIndex.length; i++) {
+      const paneId = paneIdsByIndex[i];
+      if (!paneId) continue;
+      workerPaneIds[i] = paneId;
+      if (config.workers[i]) config.workers[i].pane_id = paneId;
+    }
+    return;
+  }
   for (let i = 0; i < createdSession.workerPaneIds.length; i++) {
     const paneId = createdSession.workerPaneIds[i];
     workerPaneIds[i] = paneId;
-    if (config.workers[i]) {
-      config.workers[i].pane_id = paneId;
-    }
+    if (config.workers[i]) config.workers[i].pane_id = paneId;
   }
 }
 

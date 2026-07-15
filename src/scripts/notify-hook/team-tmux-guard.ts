@@ -211,6 +211,19 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
     }
   }
 
+  if (exactPaneIdentityProvided) {
+    const paneProof = await verifyExplicitPane();
+    if (!paneProof.ok) return exactPaneFailure(paneProof);
+    try {
+      const startCommandResult = await runProcess('tmux', ['display-message', '-p', '-t', target, '#{pane_start_command}'], 3000);
+      if (/\bomx\b.*\bhud\b.*--watch/i.test(safeString(startCommandResult.stdout))) {
+        return buildReadinessResult(false, 'hud_pane_target', '', 'hud_pane_rejected');
+      }
+    } catch {
+      return buildReadinessResult(false, PANE_READINESS_UNVERIFIED_REASON, '', 'start_command_failed');
+    }
+  }
+
   {
     const paneProof = await verifyExplicitPane();
     if (!paneProof.ok) return exactPaneFailure(paneProof);
@@ -316,6 +329,23 @@ export async function sendPaneInput({
   };
   const initialProof = await verifyExplicitPane();
   if (!initialProof.ok) return exactPaneUnavailableResult(target, initialProof);
+  try {
+    const startCommandResult = await runProcess('tmux', ['display-message', '-p', '-t', target, '#{pane_start_command}'], 3000);
+    if (/\bomx\b.*\bhud\b.*--watch/i.test(safeString(startCommandResult.stdout))) {
+      return { ok: false, sent: false, reason: 'hud_pane_target', paneTarget: target, exactPaneProof };
+    }
+  } catch {
+    return {
+      ok: false,
+      sent: false,
+      reason: PANE_READINESS_UNVERIFIED_REASON,
+      paneTarget: target,
+      exactPaneProof,
+      readinessEvidence: 'start_command_failed',
+    };
+  }
+  const postHudProof = await verifyExplicitPane();
+  if (!postHudProof.ok) return exactPaneUnavailableResult(target, postHudProof);
 
   const normalizedSubmitKeyPresses = Number.isFinite(submitKeyPresses)
     ? Math.max(0, Math.floor(submitKeyPresses))

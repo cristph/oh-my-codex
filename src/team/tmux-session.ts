@@ -53,6 +53,8 @@ export interface TeamSession {
   workerCount: number;
   cwd: string;
   workerPaneIds: string[];
+  /** Original worker-index slots for partial recovery; null means no unresolved pane at that index. */
+  workerPaneIdsByIndex?: Array<string | null>;
   /** Leader's own pane ID — must never be targeted by worker cleanup routines. */
   leaderPaneId: string;
   /** HUD pane spawned below the leader column, or null if creation failed. */
@@ -536,7 +538,7 @@ async function runTmuxAsync(args: string[]): Promise<{ok: true; stdout: string} 
 }
 
 function hasExplicitWorkerPaneId(workerPaneId: string | undefined): workerPaneId is string {
-  return workerPaneId !== undefined;
+  return typeof workerPaneId === 'string' && workerPaneId.trim().length > 0;
 }
 
 function resolveWorkerPaneTargetSync(
@@ -1720,6 +1722,7 @@ export function createTeamSession(
   let partialLeaderPaneId: string | null = null;
   let partialTeamPaneOwnerId = '';
   const partialWorkerPaneIds: string[] = [];
+  const partialWorkerPaneIdsByIndex: Array<string | null> = Array.from({ length: workerCount }, () => null);
   let partialHudPaneId: string | null = null;
   try {
     const tmuxPaneTarget = process.env.TMUX_PANE;
@@ -1760,6 +1763,7 @@ export function createTeamSession(
     // when we can recreate the team HUD. Otherwise keep the existing HUD alive
     // instead of making it disappear on team startup failures or broken installs.
     if (canRecreateTeamHud) {
+      for (const hudPaneId of initialHudPaneIds) requireLiveExactPaneSync(hudPaneId);
       for (const hudPaneId of initialHudPaneIds) {
         killExactPaneSync(hudPaneId);
       }
@@ -1818,6 +1822,7 @@ export function createTeamSession(
       }
       rollbackPaneIds.push(paneId);
       partialWorkerPaneIds.push(paneId);
+      partialWorkerPaneIdsByIndex[i - 1] = paneId;
       if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, paneId)) {
         throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
       }
@@ -1978,6 +1983,8 @@ export function createTeamSession(
     }
 
     const unresolvedWorkerPaneIds = partialWorkerPaneIds.filter((paneId) => unresolvedPaneIds.has(paneId));
+    const unresolvedWorkerPaneIdsByIndex = partialWorkerPaneIdsByIndex
+      .map((paneId) => paneId && unresolvedPaneIds.has(paneId) ? paneId : null);
     const unresolvedHudPaneId = partialHudPaneId && unresolvedPaneIds.has(partialHudPaneId)
       ? partialHudPaneId
       : null;
@@ -1992,6 +1999,7 @@ export function createTeamSession(
           workerCount,
           cwd,
           workerPaneIds: unresolvedWorkerPaneIds,
+          workerPaneIdsByIndex: unresolvedWorkerPaneIdsByIndex,
           leaderPaneId: partialLeaderPaneId,
           hudPaneId: unresolvedHudPaneId,
           resizeHookName: registeredResizeHook?.name ?? null,

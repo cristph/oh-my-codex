@@ -44,6 +44,7 @@ import {
   recoverTeamMembershipTaskTransaction,
   commitTeamMembershipTaskTransaction,
   finalizeTeamMembershipTaskTransaction,
+  writeAtomic,
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
   teamListTasks as listTasks,
@@ -1389,41 +1390,6 @@ export async function scaleDown(
           const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
           if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
 
-          const targetPaneIds = removableWorkers
-            .map((worker) => worker.pane_id)
-            .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-          const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
-            leaderPaneId: config.leader_pane_id,
-            hudPaneId: config.hud_pane_id,
-            expectedPanePids: Object.fromEntries(removableWorkers
-              .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
-              .map((worker) => [worker.pane_id as string, worker.pid as number])),
-          });
-          const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
-          const unresolvedWorkers = removableWorkers.filter((worker) => (
-            typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
-          ));
-          if (unresolvedWorkers.length > 0) {
-            await restorePriorWorkerStatuses(removableWorkers);
-            if (paneTeardown.proofUnavailable.length > 0) {
-              const detail = paneTeardown.proofUnavailable
-                .map((proof) => `${proof.paneId}:${proof.reason}`)
-                .join(',');
-              teardownFailure = { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
-              return;
-            }
-            const debt = [
-              paneTeardown.kill.failedPaneIds.length > 0
-                ? `pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`
-                : null,
-              ...unresolvedWorkers
-                .filter((worker) => !paneTeardown.kill.failedPaneIds.includes(worker.pane_id ?? ''))
-                .map((worker) => `pane_teardown_unresolved:${worker.pane_id}`),
-            ].filter((entry): entry is string => entry !== null);
-            teardownFailure = { ok: false, error: `scale_down_cleanup_debt:${debt.join(';')}` };
-            return;
-          }
-
           const currentConfig = JSON.parse(configSnapshot.toString('utf8')) as TeamConfig;
           const nextConfig: TeamConfig = {
             ...currentConfig,
@@ -1437,7 +1403,7 @@ export async function scaleDown(
               worker_count: nextConfig.worker_count,
             }, null, 2)
             : null;
-          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+          const membershipTransaction = {
             tasks: reconciledTasks.map((task) => ({
               taskId: task.id,
               oldBytes: taskSnapshots.get(task.id)?.toString('utf8') ?? null,
@@ -1460,7 +1426,22 @@ export async function scaleDown(
             interruptAfterFirstTaskWrite: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write',
             failRollbackPersistence: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'rollback-persistence-failure',
             recoverToNewOnFailure: true,
-          });
+          };
+          const cleanupDebtPath = join(teamStateRoot, 'team', sanitized, '.scale-down-cleanup-debt.json');
+          const cleanupDebtBase = {
+            schema_version: 1,
+            operation: 'scale_down',
+            status: 'pending_teardown',
+            created_at: new Date().toISOString(),
+            workers: removableWorkers.map((worker) => ({
+              name: worker.name,
+              index: worker.index,
+              pane_id: worker.pane_id ?? null,
+              pid: worker.pid ?? null,
+            })),
+          };
+          await writeAtomic(cleanupDebtPath, JSON.stringify(cleanupDebtBase, null, 2));
+          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, membershipTransaction);
           const committed = await readTeamConfig(sanitized, leaderCwd);
           if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) {
             throw new Error('canonical_scale_down_config_verification_failed');
@@ -1473,6 +1454,56 @@ export async function scaleDown(
               throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
             }
           }
+
+          const targetPaneIds = removableWorkers
+            .map((worker) => worker.pane_id)
+            .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
+          const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
+            leaderPaneId: config.leader_pane_id,
+            hudPaneId: config.hud_pane_id,
+            expectedPanePids: Object.fromEntries(removableWorkers
+              .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
+              .map((worker) => [worker.pane_id as string, worker.pid as number])),
+          });
+          const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
+          const unresolvedWorkers = removableWorkers.filter((worker) => (
+            typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
+          ));
+          if (unresolvedWorkers.length > 0) {
+            await restorePriorWorkerStatuses(unresolvedWorkers);
+            const proofDebt = paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`);
+            const killDebt = paneTeardown.kill.failedPaneIds.map((paneId) => `${paneId}:kill_failed`);
+            await writeAtomic(cleanupDebtPath, JSON.stringify({
+              ...cleanupDebtBase,
+              status: 'unresolved',
+              updated_at: new Date().toISOString(),
+              unresolved_panes: unresolvedWorkers.map((worker) => ({
+                name: worker.name,
+                pane_id: worker.pane_id,
+                pid: worker.pid ?? null,
+              })),
+              reasons: [...proofDebt, ...killDebt],
+            }, null, 2));
+            if (paneTeardown.proofUnavailable.length > 0) {
+              teardownFailure = { ok: false, error: `scale_down_pane_proof_unavailable:${proofDebt.join(',')}` };
+              return;
+            }
+            const unresolvedDebt = unresolvedWorkers
+              .map((worker) => `pane_teardown_unresolved:${worker.pane_id}`)
+              .join(';');
+            const failedDebt = paneTeardown.kill.failedPaneIds.length > 0
+              ? `pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')};`
+              : '';
+            teardownFailure = { ok: false, error: `scale_down_cleanup_debt:${failedDebt}${unresolvedDebt}` };
+            return;
+          }
+          await writeAtomic(cleanupDebtPath, JSON.stringify({
+            ...cleanupDebtBase,
+            status: 'resolved',
+            updated_at: new Date().toISOString(),
+            unresolved_panes: [],
+          }, null, 2));
+          await rm(cleanupDebtPath, { force: true });
         });
       });
     } catch (error) {

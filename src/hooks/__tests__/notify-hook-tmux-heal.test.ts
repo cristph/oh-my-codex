@@ -1121,6 +1121,10 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "codex"
     exit 0
   fi
+  if [[ "$format" == "#{pane_start_command}" && "$target" == "%42" ]]; then
+    echo "codex"
+    exit 0
+  fi
   echo "bad display target: $target / $format" >&2
   exit 1
 fi
@@ -1401,6 +1405,10 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
+    echo "codex"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_start_command}" && "$target" == "%99" ]]; then
     echo "codex"
     exit 0
   fi
@@ -1983,6 +1991,10 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "codex"
     exit 0
   fi
+  if [[ "$format" == "#{pane_start_command}" && "$target" == "%99" ]]; then
+    echo "codex"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_in_mode}" && "$target" == "%99" ]]; then
     echo "0"
     exit 0
@@ -2111,6 +2123,10 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%42" ]]; then
+    echo "codex"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_start_command}" && "$target" == "%42" ]]; then
     echo "codex"
     exit 0
   fi

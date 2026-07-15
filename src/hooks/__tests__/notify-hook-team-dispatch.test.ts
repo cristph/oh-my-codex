@@ -1892,9 +1892,11 @@ exit 0
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
       await writeFile(exactPaneSequencePath, [
         '%42\t0\t4242', // readiness: mode
+        '%42\t0\t4242', // readiness: HUD start-command guard
         '%42\t0\t4242', // readiness: current command
         '%42\t0\t4242', // readiness: capture
-        '%42\t0\t4242', // send: initial identity check before buffer setup
+        '%42\t0\t4242', // send: initial identity check before HUD guard
+        '%42\t0\t4242', // send: reproof after HUD guard before buffer setup
         '%42\t0\t4242', // send: clear composer
         '%42\t1\t4242', // send: paste buffer must be blocked
       ].join('\n'));

@@ -3153,9 +3153,7 @@ exit 0
       );
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /pane_teardown_unresolved:%11.*pane_teardown_unresolved:%12/);
-      assert.deepEqual((await readTeamConfig('exclusions', cwd))?.workers.map((worker) => worker.name), [
-        'worker-1', 'worker-2', 'worker-3', 'worker-4',
-      ]);
+      assert.deepEqual((await readTeamConfig('exclusions', cwd))?.workers.map((worker) => worker.name), ['worker-4']);
 
       const tmuxCommands = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n');
       assert.deepEqual(tmuxCommands, [
@@ -3171,7 +3169,7 @@ exit 0
     }
   });
 
-  it('scaleDown preserves canonical generation and artifacts when kill-pane exits zero but pane ID is reused', async () => {
+  it('scaleDown commits forward membership and retains artifacts/debt when pane ID is reused', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-kill-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-kill-fail-bin-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -3236,13 +3234,16 @@ exit 0
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
       const committed = await readTeamConfig('kill-fail', cwd);
-      assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1', 'worker-2']);
+      assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), true);
       assert.equal(await readFile(join(workerDir, 'identity.json'), 'utf8'), '{"worker":"worker-2"}');
       assert.equal(await readFile(join(workerDir, 'inbox.md'), 'utf8'), 'retryable inbox');
       assert.equal(await readFile(join(worktreePath, 'keep.txt'), 'utf8'), 'retryable worktree');
       assert.equal(await readFile(startupScriptPath, 'utf8'), '#!/bin/sh\n');
       assert.deepEqual(await readWorkerStatus('kill-fail', 'worker-2', cwd), priorStatus);
+      const debt = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'kill-fail', '.scale-down-cleanup-debt.json'), 'utf8'));
+      assert.equal(debt.status, 'unresolved');
+      assert.equal(debt.unresolved_panes[0]?.pane_id, '%13');
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
@@ -3315,7 +3316,7 @@ esac
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
-  it('preserves proof-unavailable scale-down workers and their tasks before canonical commit', async () => {
+  it('commits forward membership and durable debt when scale-down pane proof is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-proof-unavailable-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-proof-unavailable-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3340,9 +3341,12 @@ esac
         OMX_TEAM_SCALING_ENABLED: '1',
       });
       assert.equal(result.ok, false);
-      assert.deepEqual((await readTeamConfig('proof-unavailable', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2']);
-      assert.equal((await readTask('proof-unavailable', task.id, cwd))?.owner, 'worker-2');
+      assert.deepEqual((await readTeamConfig('proof-unavailable', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.equal((await readTask('proof-unavailable', task.id, cwd))?.owner, undefined);
       assert.equal(await readFile(statusPath, 'utf8'), statusRaw);
+      const debt = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'proof-unavailable', '.scale-down-cleanup-debt.json'), 'utf8'));
+      assert.equal(debt.status, 'unresolved');
+      assert.equal(debt.unresolved_panes[0]?.pane_id, '%13');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -3482,7 +3486,7 @@ exit 0
     });
   }
 
-  it('preserves canonical state when proof is lost immediately after a successful pane kill', async () => {
+  it('commits forward state and records unresolved debt when proof is lost after a pane kill', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3525,7 +3529,6 @@ exit 0
       }, cwd);
       const resolvedClaim = await claimTask('success-proof-loss', resolvedTask.id, 'worker-2', resolvedTask.version ?? 1, cwd);
       assert.equal(resolvedClaim.ok, true);
-      const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'success-proof-loss', 'workers', 'worker-3', 'status.json');
       const worker3Raw = '{"reason":"three",\n"updated_at":"2026-07-14T00:00:01.000Z", "state":"idle"}\n';
       await writeFile(worker3StatusPath, worker3Raw);
@@ -3539,15 +3542,16 @@ exit 0
 
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /^scale_down_pane_proof_unavailable:%13:query_failed/);
-      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
-      assert.equal(existsSync(worker2StatusPath), false);
+      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker3StatusPath), true);
       assert.equal(await readFile(worker3StatusPath, 'utf8'), worker3Raw);
-      assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, 'worker-2');
-      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, undefined);
+      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, undefined);
       const retainedTask = await readTask('success-proof-loss', resolvedTask.id, cwd);
-      assert.equal(retainedTask?.status, 'in_progress');
-      assert.equal(retainedTask?.claim?.owner, 'worker-2');
+      assert.equal(retainedTask?.status, 'pending');
+      assert.equal(retainedTask?.claim, undefined);
+      const debt = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'success-proof-loss', '.scale-down-cleanup-debt.json'), 'utf8'));
+      assert.deepEqual(debt.unresolved_panes.map((pane: { pane_id: string }) => pane.pane_id), ['%13', '%14']);
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands.filter((command) => command.startsWith('kill-pane ')), ['kill-pane -t %13']);
       const killIndex = tmuxCommands.indexOf('kill-pane -t %13');
@@ -3562,7 +3566,7 @@ exit 0
     }
   });
 
-  it('preserves the entire canonical generation when a later pane teardown fails after an earlier pane is gone', async () => {
+  it('commits forward membership and retains exact debt when a later pane teardown fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-gone-kill-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-gone-kill-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3607,7 +3611,6 @@ esac
       }, cwd);
       const resolvedClaim = await claimTask('gone-kill-fail', resolvedTask.id, 'worker-2', resolvedTask.version ?? 1, cwd);
       assert.equal(resolvedClaim.ok, true);
-      const worker2StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-2', 'status.json');
       const worker3StatusPath = join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', 'workers', 'worker-3', 'status.json');
       await writeFile(worker3StatusPath, '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n');
 
@@ -3620,15 +3623,16 @@ esac
 
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%14/);
-      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
-      assert.equal(existsSync(worker2StatusPath), false);
+      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
       assert.equal(existsSync(worker3StatusPath), true);
       assert.equal(await readFile(worker3StatusPath, 'utf8'), '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n');
-      assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, 'worker-2');
-      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, undefined);
+      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, undefined);
       const retainedTask = await readTask('gone-kill-fail', resolvedTask.id, cwd);
-      assert.equal(retainedTask?.status, 'in_progress');
-      assert.equal(retainedTask?.claim?.owner, 'worker-2');
+      assert.equal(retainedTask?.status, 'pending');
+      assert.equal(retainedTask?.claim, undefined);
+      const debt = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'gone-kill-fail', '.scale-down-cleanup-debt.json'), 'utf8'));
+      assert.deepEqual(debt.unresolved_panes.map((pane: { pane_id: string }) => pane.pane_id), ['%14']);
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
