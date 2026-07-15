@@ -1043,6 +1043,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     const retrySend = await sendPaneInput({
       paneTarget: resolution.paneTarget,
       exactPaneId,
+      expectedPanePid: dispatchTarget.expectedPanePid,
       prompt: request.trigger_message,
       submitKeyPresses,
       typePrompt: false,
