@@ -1,5 +1,5 @@
-import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir, open } from 'fs/promises';
-import { join, dirname, resolve, sep } from 'path';
+import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir, open, realpath } from 'fs/promises';
+import { basename, join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
@@ -872,6 +872,63 @@ async function applyMembershipTransactionFiles(files: readonly MembershipTransac
   }
 }
 
+async function validateMembershipTransactionFiles(
+  teamName: string,
+  cwd: string,
+  files: readonly MembershipTransactionFile[],
+): Promise<void> {
+  const expectedConfigPath = resolve(teamConfigPath(teamName, cwd));
+  const expectedManifestPath = resolve(teamManifestV2Path(teamName, cwd));
+  const expectedTasksDir = resolve(teamDir(teamName, cwd), 'tasks');
+  const seenPaths = new Set<string>();
+  let configCount = 0;
+  const canonicalStateRoot = await realpath(resolveTeamStateRoot(cwd));
+  const canonicalTeamRoot = await realpath(teamDir(teamName, cwd));
+  if (canonicalTeamRoot !== canonicalStateRoot && !canonicalTeamRoot.startsWith(`${canonicalStateRoot}${sep}`)) {
+    throw new Error(`Membership transaction team root escapes canonical state root for ${teamName}`);
+  }
+  const canonicalTasksDir = await realpath(resolve(teamDir(teamName, cwd), 'tasks'));
+  if (!canonicalTasksDir.startsWith(`${canonicalTeamRoot}${sep}`)) {
+    throw new Error(`Membership transaction tasks root escapes canonical team root for ${teamName}`);
+  }
+
+  for (const file of files) {
+    if (!file || typeof file.path !== 'string'
+      || (file.oldBytes !== null && typeof file.oldBytes !== 'string')
+      || (file.newBytes !== null && typeof file.newBytes !== 'string')) {
+      throw new Error(`Invalid membership transaction file entry for ${teamName}`);
+    }
+    const resolvedPath = resolve(file.path);
+    if (resolvedPath !== file.path || seenPaths.has(resolvedPath)) {
+      throw new Error(`Invalid membership transaction path for ${teamName}`);
+    }
+    seenPaths.add(resolvedPath);
+    let expectedParent: string;
+    if (resolvedPath === expectedConfigPath) {
+      configCount += 1;
+      expectedParent = canonicalTeamRoot;
+    } else if (resolvedPath === expectedManifestPath) {
+      expectedParent = canonicalTeamRoot;
+    } else {
+      if (dirname(resolvedPath) !== expectedTasksDir) {
+        throw new Error(`Membership transaction path escapes expected team files for ${teamName}`);
+      }
+      const match = basename(resolvedPath).match(/^task-([A-Za-z0-9_-]+)\.json$/);
+      if (!match || resolve(taskFilePath(teamName, match[1]!, cwd)) !== resolvedPath) {
+        throw new Error(`Invalid membership transaction task path for ${teamName}`);
+      }
+      expectedParent = canonicalTasksDir;
+    }
+    const canonicalParent = await realpath(dirname(resolvedPath));
+    if (canonicalParent !== expectedParent) {
+      throw new Error(`Membership transaction path traverses a symlink for ${teamName}`);
+    }
+  }
+  if (configCount !== 1) {
+    throw new Error(`Membership transaction must contain exactly one config path for ${teamName}`);
+  }
+}
+
 /**
  * Resolve an interrupted membership/task commit before a reader or writer observes
  * its files. Prepared transactions roll back; committed transactions roll forward.
@@ -892,6 +949,7 @@ export async function recoverTeamMembershipTaskTransaction(
   if (journal.schemaVersion !== 1 || (journal.phase !== 'prepared' && journal.phase !== 'committed') || !Array.isArray(journal.files)) {
     throw new Error(`Invalid membership transaction journal for ${teamName}`);
   }
+  await validateMembershipTransactionFiles(teamName, cwd, journal.files);
   await applyMembershipTransactionFiles(journal.files, journal.phase === 'committed');
   if (!options.retainJournal) await removeAndSync(journalPath);
 }
@@ -903,6 +961,7 @@ export async function finalizeTeamMembershipTaskTransaction(teamName: string, cw
   if (journal.schemaVersion !== 1 || journal.phase !== 'committed' || !Array.isArray(journal.files)) {
     throw new Error(`Cannot finalize non-committed membership transaction for ${teamName}`);
   }
+  await validateMembershipTransactionFiles(teamName, cwd, journal.files);
   await removeAndSync(journalPath);
 }
 

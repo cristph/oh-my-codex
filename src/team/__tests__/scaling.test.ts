@@ -2651,7 +2651,7 @@ esac
       );
 
       assert.equal(result.ok, false);
-      if (!result.ok) assert.match(result.error, /^scale_up_rollback_cleanup_debt:.*pane_teardown_failed:%31,%32/);
+      if (!result.ok) assert.match(result.error, /^scale_up_rollback_cleanup_debt:.*pane_teardown_failed:%31.*pane_teardown_unresolved:%32/);
       assert.equal(await readFile(splitCountPath, 'utf-8'), '2');
       const config = await readTeamConfig('rollback-kill-fail', cwd);
       assert.deepEqual(config?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
@@ -2682,7 +2682,6 @@ esac
         'split-window -v -t %21 -d -P -F #{pane_id}',
         'split-window -v -t %31 -d -P -F #{pane_id}',
         'kill-pane -t %31',
-        'kill-pane -t %32',
       ]);
       for (const mutationCommand of mutationCommands) {
         const mutationIndex = tmuxCommands.findIndex((command) => (
@@ -2694,7 +2693,7 @@ esac
       assert.ok(tmuxCommands.some((command) => command.startsWith('split-window -v -t %21 ')));
       assert.ok(tmuxCommands.some((command) => command.startsWith('split-window -v -t %31 ')));
       assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
-      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %32'));
+      assert.equal(tmuxCommands.some((command) => command === 'kill-pane -t %32'), false);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

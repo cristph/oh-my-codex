@@ -617,7 +617,7 @@ export async function scaleUp(
       try {
         await removeDispatchRequestsForWorkers(sanitized, [...rollbackWorkerNames], leaderCwd);
       } catch (rollbackError) {
-        return { ok: false, error: `scale_up_rollback_cleanup_debt:authoritative_dispatch_cleanup_failed:${String(rollbackError)}` };
+        cleanupDebt.push(`authoritative_dispatch_cleanup_failed:${String(rollbackError)}`);
       }
       const rollbackPaneIds = [
         ...rollbackWorkers.map((worker) => worker.pane_id),
@@ -629,6 +629,9 @@ export async function scaleUp(
         const paneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
           leaderPaneId: config.leader_pane_id,
           hudPaneId: config.hud_pane_id,
+          expectedPanePids: Object.fromEntries(rollbackWorkers
+            .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
+            .map((worker) => [worker.pane_id as string, worker.pid as number])),
         });
         for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
         for (const paneId of paneTeardown.kill.failedPaneIds) unresolvedPaneIds.add(paneId);
@@ -636,6 +639,17 @@ export async function scaleUp(
         if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
         if (paneTeardown.proofUnavailable.length > 0) {
           cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
+        }
+        if (paneTeardown.kill.failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
+          for (const paneId of rollbackPaneIds) {
+            if (!resolvedPaneIds.has(paneId)) unresolvedPaneIds.add(paneId);
+          }
+          const unresolvedWithoutDirectFailure = [...unresolvedPaneIds].filter((paneId) =>
+            !paneTeardown.kill.failedPaneIds.includes(paneId)
+            && !paneTeardown.proofUnavailable.some((proof) => proof.paneId === paneId));
+          if (unresolvedWithoutDirectFailure.length > 0) {
+            cleanupDebt.push(`pane_teardown_unresolved:${unresolvedWithoutDirectFailure.join(',')}`);
+          }
         }
       } catch (cleanupError) {
         for (const paneId of rollbackPaneIds) unresolvedPaneIds.add(paneId);
@@ -1381,6 +1395,9 @@ export async function scaleDown(
           const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
             leaderPaneId: config.leader_pane_id,
             hudPaneId: config.hud_pane_id,
+            expectedPanePids: Object.fromEntries(removableWorkers
+              .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
+              .map((worker) => [worker.pane_id as string, worker.pid as number])),
           });
           const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
           const unresolvedWorkers = removableWorkers.filter((worker) => (

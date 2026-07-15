@@ -728,6 +728,7 @@ export async function maybeNudgeTeamLeader({
     let leaderPaneId = '';
     let ownerSessionId = '';
     let workers = [];
+    let hudPaneId = '';
     try {
       const manifestPath = join(omxDir, 'state', 'team', teamName, 'manifest.v2.json');
       const configPath = join(omxDir, 'state', 'team', teamName, 'config.json');
@@ -736,6 +737,7 @@ export async function maybeNudgeTeamLeader({
         const raw = JSON.parse(await readFile(srcPath, 'utf-8'));
         tmuxSession = safeString(raw && raw.tmux_session ? raw.tmux_session : '').trim();
         leaderPaneId = safeString(raw && raw.leader_pane_id ? raw.leader_pane_id : '').trim();
+        hudPaneId = safeString(raw && raw.hud_pane_id ? raw.hud_pane_id : '').trim();
         ownerSessionId = safeString(raw && raw.leader && raw.leader.session_id ? raw.leader.session_id : '').trim();
         if (Array.isArray(raw && raw.workers)) workers = raw.workers;
       }
@@ -760,7 +762,10 @@ export async function maybeNudgeTeamLeader({
     const workerPaneIds = Array.isArray(workers)
       ? workers.map((w) => safeString(w && w.pane_id ? w.pane_id : '')).filter(Boolean)
       : [];
-    const canonicalLeaderPaneId = normalizeExactPaneId(leaderPaneId);
+    const normalizedLeaderPaneId = normalizeExactPaneId(leaderPaneId);
+    const canonicalLeaderPaneId = normalizedLeaderPaneId && normalizedLeaderPaneId !== normalizeExactPaneId(hudPaneId)
+      ? normalizedLeaderPaneId
+      : '';
     if (!tmuxSession && !canonicalLeaderPaneId) continue;
     const tmuxTarget = canonicalLeaderPaneId;
     const paneStatus = tmuxSession

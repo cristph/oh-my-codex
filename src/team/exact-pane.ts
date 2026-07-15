@@ -6,7 +6,7 @@ export type ExactPaneProof =
   | {
     status: 'unavailable';
     paneId: string;
-    reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot';
+    reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot' | 'pane_pid_changed';
     detail?: string;
   };
 
@@ -51,7 +51,10 @@ function parseExactPaneProof(paneId: string, stdout: string): ExactPaneProof {
     if (paneDead !== '0' && paneDead !== '1') {
       return unavailable(paneId, 'malformed_snapshot');
     }
-    if (parsePositiveSafeInteger(pid) === null) {
+    if (pid === '' && snapshotPaneId !== paneId) {
+      // tmux empty panes may have no first-process PID. They do not weaken
+      // authority for a different exact target.
+    } else if (parsePositiveSafeInteger(pid) === null) {
       return unavailable(paneId, 'malformed_snapshot');
     }
 
@@ -60,10 +63,9 @@ function parseExactPaneProof(paneId: string, stdout: string): ExactPaneProof {
   }
 
   if (matched === null) return { status: 'gone', paneId, reason: 'absent' };
-  if (matched.paneDead !== '0') return { status: 'gone', paneId, reason: 'dead' };
-
   const pid = parsePositiveSafeInteger(matched.pid);
   if (pid === null) return unavailable(paneId, 'malformed_snapshot');
+  if (matched.paneDead !== '0') return { status: 'gone', paneId, reason: 'dead' };
   return { status: 'live', paneId, pid };
 }
 

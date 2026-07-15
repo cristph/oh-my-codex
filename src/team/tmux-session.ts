@@ -356,8 +356,8 @@ function listPanesResult(target: string): PaneListResult {
 
   const panes: TmuxPaneInfo[] = [];
   for (const rawLine of result.stdout.split('\n')) {
-    const line = rawLine.trim();
-    if (line.length === 0) continue;
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line.trim().length === 0) continue;
 
     const firstSeparator = line.indexOf('\t');
     const secondSeparator = firstSeparator >= 0 ? line.indexOf('\t', firstSeparator + 1) : -1;
@@ -2959,6 +2959,7 @@ export interface PaneTeardownOptions {
   leaderPaneId?: string | null;
   hudPaneId?: string | null;
   graceMs?: number;
+  expectedPanePids?: Readonly<Record<string, number>>;
 }
 
 export type SharedSessionShutdownTopology =
@@ -3241,12 +3242,22 @@ export async function teardownWorkerPanes(
 
   for (const paneId of killablePaneIds) {
     const proof = await readExactPaneProof(paneId);
+    const expectedPid = options.expectedPanePids?.[paneId];
     if (proof.status === 'gone') {
       summary.provenGonePaneIds.push(proof.paneId);
       continue;
     }
     if (proof.status === 'unavailable') {
       summary.proofUnavailable.push(proof);
+      break;
+    }
+    if (typeof expectedPid === 'number' && proof.pid !== expectedPid) {
+      summary.proofUnavailable.push({
+        status: 'unavailable',
+        paneId,
+        reason: 'pane_pid_changed',
+        detail: `expected ${expectedPid}, got ${proof.pid}`,
+      });
       break;
     }
 
@@ -3256,7 +3267,7 @@ export async function teardownWorkerPanes(
       summary.kill.failed += 1;
       summary.kill.failedPaneIds.push(proof.paneId);
       await sleep(perPaneGrace);
-      continue;
+      break;
     }
 
     const afterKill = await readExactPaneProof(proof.paneId);
@@ -3269,6 +3280,8 @@ export async function teardownWorkerPanes(
     } else {
       summary.kill.failed += 1;
       summary.kill.failedPaneIds.push(proof.paneId);
+      await sleep(perPaneGrace);
+      break;
     }
     await sleep(perPaneGrace);
   }

@@ -7082,3 +7082,43 @@ describe('leader mailbox-only boundary', () => {
     assert.equal('sendToLeaderPane' in tmuxSessionModule, false);
   });
 });
+
+describe('exact pane PID authority regressions', () => {
+  it('ignores an unrelated PID-less pane while requiring the matched target PID', async () => {
+    await withMockTmuxFixture(
+      'omx-exact-pane-empty-unrelated-',
+      () => `#!/bin/sh
+set -eu
+if [ "$1" = "list-panes" ]; then
+  printf '%%42\t0\t4242\n%%99\t0\t\n'
+fi
+`,
+      async () => {
+        const proof = await readExactPaneProof('%42');
+        assert.deepEqual(proof, { status: 'live', paneId: '%42', pid: 4242 });
+        const emptyTarget = await readExactPaneProof('%99');
+        assert.equal(emptyTarget.status, 'unavailable');
+        if (emptyTarget.status === 'unavailable') assert.equal(emptyTarget.reason, 'malformed_snapshot');
+      },
+    );
+  });
+
+  it('does not kill a stale pane ID whose live PID differs from persisted identity', async () => {
+    await withMockTmuxFixture(
+      'omx-teardown-pid-changed-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4343\n'; fi
+`,
+      async ({ logPath }) => {
+        const summary = await teardownWorkerPanes(['%42'], {
+          graceMs: 1,
+          expectedPanePids: { '%42': 4242 },
+        });
+        assert.deepEqual(summary.proofUnavailable.map((proof) => proof.reason), ['pane_pid_changed']);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /kill-pane/);
+      },
+    );
+  });
+});

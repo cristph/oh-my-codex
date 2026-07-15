@@ -4271,7 +4271,8 @@ process.on('SIGTERM', () => process.exit(0));
 
           assert.equal(
             existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
-            false,
+            true,
+            'failed pane teardown must retain retryable startup state',
           );
         },
       );

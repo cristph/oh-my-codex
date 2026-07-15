@@ -490,7 +490,7 @@ export function shouldPrekillInteractiveShutdownProcessTrees(sessionName: string
 
 interface UnavailablePaneProof {
   paneId: string;
-  reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot';
+  reason: 'invalid_pane_id' | 'query_failed' | 'malformed_snapshot' | 'pane_pid_changed';
   detail?: string;
 }
 
@@ -2261,7 +2261,8 @@ function signalExactPaneProcess(
 ): ExactPaneProcessProbe {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') return { status: 'unavailable', proof };
-  if (proof.status !== 'live' || proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  if (proof.status === 'live' && proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  if (proof.status === 'gone' && pid === authorizedPanePid) return { status: 'gone' };
   try {
     process.kill(pid, signal);
   } catch {
@@ -2278,7 +2279,8 @@ function probeExactPaneProcess(
 ): ExactPaneProcessProbe {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') return { status: 'unavailable', proof };
-  if (proof.status !== 'live' || proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  if (proof.status === 'live' && proof.pid !== authorizedPanePid) return { status: 'stopped' };
+  if (proof.status === 'gone' && pid === authorizedPanePid) return { status: 'gone' };
   try {
     process.kill(pid, 0);
     return { status: 'alive' };
@@ -2319,6 +2321,7 @@ async function waitForExactPaneTrackedPidsExit(
 
 async function terminateExactPaneProcessTree(
   paneId: string,
+  expectedPanePid?: number,
   graceMs: number = PROMPT_WORKER_SIGTERM_WAIT_MS,
   killWaitMs: number = PROMPT_WORKER_SIGKILL_WAIT_MS,
 ): Promise<ExactPaneProcessTreeTeardown> {
@@ -2327,6 +2330,18 @@ async function terminateExactPaneProcessTree(
     return { terminated: false, stopped: true, proofUnavailable: authorization };
   }
   if (authorization.status === 'gone') return { terminated: true, stopped: true };
+  if (typeof expectedPanePid === 'number' && authorization.pid !== expectedPanePid) {
+    return {
+      terminated: false,
+      stopped: true,
+      proofUnavailable: {
+        status: 'unavailable',
+        paneId,
+        reason: 'pane_pid_changed',
+        detail: `expected ${expectedPanePid}, got ${authorization.pid}`,
+      },
+    };
+  }
 
   const trackedPids = collectProcessTreePids(authorization.pid);
   if (trackedPids.length === 0) return { terminated: true, stopped: false };
@@ -3414,7 +3429,10 @@ export async function startTeam(
       if (sessionName.includes(':')) {
         const paneProcessProofUnavailable: ExactPaneUnavailableProof[] = [];
         for (const paneId of createdWorkerPaneIds) {
-          const teardown = await terminateExactPaneProcessTree(paneId);
+          const teardown = await terminateExactPaneProcessTree(
+            paneId,
+            config?.workers.find((worker) => worker.pane_id === paneId)?.pid,
+          );
           if (teardown.proofUnavailable) {
             paneProcessProofUnavailable.push(teardown.proofUnavailable);
             break;
@@ -3430,7 +3448,19 @@ export async function startTeam(
         ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%'));
         const rollbackPaneTeardown = await teardownWorkerPanes(rollbackPaneIds, {
           leaderPaneId: createdLeaderPaneId,
+          expectedPanePids: Object.fromEntries((config?.workers ?? [])
+            .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
+            .map((worker) => [worker.pane_id as string, worker.pid as number])),
         });
+        const resolvedRollbackPaneIds = new Set([
+          ...rollbackPaneTeardown.provenGonePaneIds,
+          ...rollbackPaneTeardown.killedPaneIds,
+        ]);
+        if (config && (rollbackPaneTeardown.proofUnavailable.length > 0 || rollbackPaneTeardown.kill.failed > 0)) {
+          config.workers = config.workers.filter((worker) => !worker.pane_id || !resolvedRollbackPaneIds.has(worker.pane_id));
+          config.worker_count = config.workers.length;
+          if (config.hud_pane_id && resolvedRollbackPaneIds.has(config.hud_pane_id)) config.hud_pane_id = null;
+        }
         if (rollbackPaneTeardown.proofUnavailable.length > 0) {
           if (config) {
             try {
@@ -3440,6 +3470,11 @@ export async function startTeam(
             }
           }
           assertPaneTeardownProofsAvailable('startup_rollback', rollbackPaneTeardown.proofUnavailable);
+        }
+        if (rollbackPaneTeardown.kill.failed > 0) {
+          if (config) await saveTeamConfig(config, leaderCwd);
+          const originalMessage = error instanceof Error ? error.message : String(error);
+          throw new Error(`${originalMessage}; rollback encountered errors: paneTeardown:${rollbackPaneTeardown.kill.failedPaneIds.join(',')}`);
         }
       } else {
         try {
@@ -4125,15 +4160,18 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         legacyInstanceId: leaderSessionId,
       }) ? effectiveLeaderPaneId : null)
       : effectiveLeaderPaneId;
-    const effectiveHudPaneId = sharedSessionTopology
-      ? (sharedSessionTopology.hudPaneIds.find((paneId) => isSharedSessionHudPaneReclaimable({
+    const reclaimableHudPaneIds = sharedSessionTopology
+      ? sharedSessionTopology.hudPaneIds.filter((paneId) => isSharedSessionHudPaneReclaimable({
         paneId,
         persistedHudPaneId: hudPaneId,
         leaderOwnedHudPaneIds: sharedSessionTopology.leaderOwnedHudPaneIds,
         teamPaneOwnerId: tmuxPaneOwnerId,
-        onOwnerReadError: (hudPaneId, error) => warnOwnerReadError('HUD pane', hudPaneId, error),
-      })) ?? null)
-      : hudPaneId;
+        onOwnerReadError: (candidateHudPaneId, error) => {
+          warnOwnerReadError('HUD pane', candidateHudPaneId, error);
+        },
+      }))
+      : (hudPaneId ? [hudPaneId] : []);
+    const effectiveHudPaneId = reclaimableHudPaneIds[0] ?? null;
     const shutdownCandidatePaneIds = sharedSessionTopology
       ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
         sharedSessionTopology.teamWorkerPaneIds,
@@ -4152,7 +4190,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     if (shouldPrekillInteractiveShutdownProcessTrees(sessionName)) {
       const paneProcessProofUnavailable: ExactPaneUnavailableProof[] = [];
       for (const paneId of shutdownPaneIds) {
-        const teardown = await terminateExactPaneProcessTree(paneId);
+        const teardown = await terminateExactPaneProcessTree(
+          paneId,
+          config.workers.find((worker) => worker.pane_id === paneId)?.pid,
+        );
         if (teardown.proofUnavailable) {
           paneProcessProofUnavailable.push(teardown.proofUnavailable);
           break;
@@ -4200,6 +4241,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           console.warn(`[team shutdown] ${sanitized}: ${reason}`);
         }
       }
+      if (restoredHudPaneId) {
+        config.hud_pane_id = restoredHudPaneId;
+        await saveTeamConfig(config, cwd);
+      }
     }
     shutdownPaneIds = collectShutdownPaneIds({
       config,
@@ -4219,6 +4264,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     const workerTeardown = await teardownWorkerPanes(shutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: restoredHudPaneId ?? effectiveHudPaneId,
+      expectedPanePids: Object.fromEntries(config.workers
+        .filter((worker) => typeof worker.pane_id === 'string' && typeof worker.pid === 'number')
+        .map((worker) => [worker.pane_id as string, worker.pid as number])),
     });
     assertPaneTeardownProofsAvailable('shutdown', workerTeardown.proofUnavailable);
     if (workerTeardown.kill.failed > 0) {

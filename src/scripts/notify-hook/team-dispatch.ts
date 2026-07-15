@@ -488,9 +488,13 @@ function resolveConfiguredPaneIdentity(request, config) {
 function resolveDispatchTarget(request, config) {
   const requestPane = explicitPaneIdentity(request?.pane_id);
   const configuredPane = resolveConfiguredPaneIdentity(request, config);
+  const hudPaneId = explicitPaneIdentity(config?.hud_pane_id).paneId;
   if (requestPane.provided) {
     if (!requestPane.paneId) {
       return { failure: 'invalid_explicit_pane', paneId: requestPane.paneId, paneSource: 'request_pane_id', rawPaneId: requestPane.rawPaneId };
+    }
+    if (requestPane.paneId === hudPaneId) {
+      return { failure: 'hud_pane_target', paneId: requestPane.paneId, paneSource: 'request_pane_id' };
     }
     if (configuredPane.provided) {
       if (!configuredPane.paneId) {
@@ -510,6 +514,9 @@ function resolveDispatchTarget(request, config) {
   if (configuredPane.provided) {
     if (!configuredPane.paneId) {
       return { failure: 'invalid_explicit_pane', paneId: configuredPane.paneId, paneSource: configuredPane.source, rawPaneId: configuredPane.rawPaneId };
+    }
+    if (configuredPane.paneId === hudPaneId) {
+      return { failure: 'hud_pane_target', paneId: configuredPane.paneId, paneSource: configuredPane.source };
     }
     return { target: { type: 'pane', value: configuredPane.paneId }, exactPaneId: configuredPane.paneId, source: configuredPane.source, reason: configuredPane.source };
   }
@@ -847,7 +854,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     return { ok: false, reason: `target_resolution_failed:${resolution.reason}` };
   }
 
-  const exactPaneId = dispatchTarget.exactPaneId;
+  const exactPaneId = dispatchTarget.exactPaneId || normalizeExactPaneId(resolution.paneTarget);
   const exactPaneFailure = (paneProof, tmuxInjectionAttempted) => ({
     ok: false,
     reason: paneProof.reason,

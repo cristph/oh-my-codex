@@ -294,7 +294,10 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
   const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
   if (!teamInfo) return { ok: false, result: 'unresolved' };
   ({ tmuxSession, leaderPaneId } = teamInfo);
-  const tmuxTarget = await resolveCanonicalLeaderPaneId(leaderPaneId);
+  const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(leaderPaneId);
+  const tmuxTarget = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(teamInfo.hudPaneId)
+    ? resolvedLeaderPaneId
+    : '';
 
   if (!tmuxTarget) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {

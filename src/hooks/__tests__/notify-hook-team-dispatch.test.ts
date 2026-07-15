@@ -1801,7 +1801,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /list-panes -t omx-team-session-target/);
       assert.match(tmuxLog, /send-keys -t %42 -l dispatch ping/);
-      assert.doesNotMatch(tmuxLog, /list-panes -a/, 'session-only targets must not gain exact-pane proof resolution');
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/, 'resolved pane targets must bind exact proof before effects');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

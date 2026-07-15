@@ -23,7 +23,37 @@ export function normalizeExactPaneId(value: any): string {
   return explicitPaneIdentity(value).paneId;
 }
 
-export async function verifyExactPaneLive(exactPaneId: any): Promise<any> {
+function exactPaneBindingFailure(target: string, exactPaneId: any): any | null {
+  const identity = explicitPaneIdentity(exactPaneId);
+  const targetIsExactPane = EXACT_PANE_ID_RE.test(target);
+  if (targetIsExactPane && !identity.provided) {
+    return {
+      ok: false,
+      reason: EXACT_PANE_UNAVAILABLE_REASON,
+      paneId: target,
+      proof: { status: 'unavailable', paneId: target, reason: 'missing_exact_pane_id' },
+    };
+  }
+  if (identity.provided && !identity.paneId) {
+    return {
+      ok: false,
+      reason: EXACT_PANE_UNAVAILABLE_REASON,
+      paneId: '',
+      proof: { status: 'unavailable', paneId: safeString(exactPaneId).trim(), reason: 'invalid_pane_id' },
+    };
+  }
+  if (identity.paneId && identity.paneId !== target) {
+    return {
+      ok: false,
+      reason: EXACT_PANE_UNAVAILABLE_REASON,
+      paneId: identity.paneId,
+      proof: { status: 'unavailable', paneId: identity.paneId, reason: 'pane_target_mismatch' },
+    };
+  }
+  return null;
+}
+
+export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: number): Promise<any> {
   const identity = explicitPaneIdentity(exactPaneId);
   if (!identity.provided) return { ok: true, paneId: '', proof: null };
   if (!identity.paneId) {
@@ -42,6 +72,14 @@ export async function verifyExactPaneLive(exactPaneId: any): Promise<any> {
   try {
     const proof = await readExactPaneProof(identity.paneId);
     if (proof.status === 'live' && proof.paneId === identity.paneId) {
+      if (typeof expectedPanePid === 'number' && proof.pid !== expectedPanePid) {
+        return {
+          ok: false,
+          reason: EXACT_PANE_UNAVAILABLE_REASON,
+          paneId: identity.paneId,
+          proof: { ...proof, status: 'unavailable', reason: 'pane_pid_changed', expectedPid: expectedPanePid },
+        };
+      }
       return { ok: true, paneId: identity.paneId, proof };
     }
     return { ok: false, reason: EXACT_PANE_UNAVAILABLE_REASON, paneId: identity.paneId, proof };
@@ -121,13 +159,17 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       paneCapture: '',
     };
   }
+  const bindingFailure = exactPaneBindingFailure(target, exactPaneId);
+  if (bindingFailure) return exactPaneUnavailableResult(target, bindingFailure);
 
   const exactPaneIdentity = safeString(exactPaneId).trim();
   const exactPaneIdentityProvided = explicitPaneIdentity(exactPaneId).provided;
   let exactPaneProof: any = null;
+  let expectedPanePid: number | undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, expectedPanePid);
     exactPaneProof = paneProof.proof || null;
+    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') expectedPanePid ??= paneProof.proof.pid;
     return paneProof;
   };
   let paneCurrentCommand = '';
@@ -260,12 +302,16 @@ export async function sendPaneInput({
   if (!target) {
     return { ok: false, sent: false, reason: 'missing_pane_target', paneTarget: '' };
   }
+  const bindingFailure = exactPaneBindingFailure(target, exactPaneId);
+  if (bindingFailure) return exactPaneUnavailableResult(target, bindingFailure);
 
   const exactPaneIdentity = safeString(exactPaneId).trim();
   let exactPaneProof: any = null;
+  let expectedPanePid: number | undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, expectedPanePid);
     exactPaneProof = paneProof.proof || null;
+    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') expectedPanePid ??= paneProof.proof.pid;
     return paneProof;
   };
   const initialProof = await verifyExplicitPane();
@@ -416,6 +462,8 @@ export async function queuePaneInput({
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
   const exactPaneIdentity = safeString(exactPaneId).trim();
+  const bindingFailure = exactPaneBindingFailure(target, exactPaneId);
+  if (bindingFailure) return exactPaneUnavailableResult(target, bindingFailure);
   const sendResult = await sendPaneInput({
     paneTarget,
     prompt,
@@ -425,9 +473,11 @@ export async function queuePaneInput({
   if (!sendResult.ok) return sendResult;
 
   let exactPaneProof = sendResult.exactPaneProof || null;
+  let expectedPanePid = typeof sendResult.exactPaneProof?.pid === 'number' ? sendResult.exactPaneProof.pid : undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, expectedPanePid);
     exactPaneProof = paneProof.proof || null;
+    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') expectedPanePid ??= paneProof.proof.pid;
     return paneProof;
   };
   const submitArgv = [

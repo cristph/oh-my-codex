@@ -215,7 +215,8 @@ export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
       if (!Array.isArray(workers) || workers.length === 0) continue;
       const tmuxSession = safeString(parsed.tmux_session || '').trim();
       const leaderPaneId = safeString(parsed.leader_pane_id || '').trim();
-      const result = { workers, tmuxSession, leaderPaneId };
+      const hudPaneId = safeString(parsed.hud_pane_id || '').trim();
+      const result = { workers, tmuxSession, leaderPaneId, hudPaneId };
       if (leaderPaneId) return result;
       if (!fallback) fallback = result;
     } catch {
@@ -356,8 +357,11 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   // Read team config to get worker list and leader tmux target
   const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
   if (!teamInfo) return;
-  const { workers, tmuxSession, leaderPaneId } = teamInfo;
-  const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
+  const { workers, tmuxSession, leaderPaneId, hudPaneId } = teamInfo;
+  const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
+  const canonicalLeaderPaneId = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(hudPaneId)
+    ? resolvedLeaderPaneId
+    : '';
 
   // Check cooldown to prevent notification spam
   const idleStatePath = join(stateDir, 'team', teamName, 'all-workers-idle.json');
@@ -581,8 +585,11 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
   // Read team config for tmux target
   const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
   if (!teamInfo) return;
-  const { tmuxSession, leaderPaneId } = teamInfo;
-  const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
+  const { tmuxSession, leaderPaneId, hudPaneId } = teamInfo;
+  const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
+  const canonicalLeaderPaneId = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(hudPaneId)
+    ? resolvedLeaderPaneId
+    : '';
 
   if (!canonicalLeaderPaneId) {
     await emitLeaderPaneMissingDeferred({

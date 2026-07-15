@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, open, utimes } from 'fs/promises';
+import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, open, utimes, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -18,6 +18,7 @@ import {
   readTask,
   readTeamConfig,
   saveTeamConfig,
+  recoverTeamMembershipTaskTransaction,
   readTeamManifestV2,
   transitionTaskStatus,
   releaseTaskClaim,
@@ -3029,6 +3030,66 @@ exit 1
       assert.equal(existsSync(teamRoot), false, 'post-cleanup operations must not recreate a fake team root');
     } finally {
       releaseScale?.();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('membership transaction recovery path authority', () => {
+  it('rejects foreign absolute paths before mutating any victim or canonical file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-membership-foreign-path-'));
+    try {
+      const teamName = 'foreign-path';
+      await initTeamState(teamName, 'task', 'executor', 1, cwd);
+      const teamDir = join(cwd, '.omx', 'state', 'team', teamName);
+      const configPath = join(teamDir, 'config.json');
+      const configBytes = await readFile(configPath, 'utf8');
+      const victimPath = join(cwd, 'victim.txt');
+      await writeFile(victimPath, 'ORIGINAL');
+      await writeFile(join(teamDir, '.membership-task-transaction.json'), JSON.stringify({
+        schemaVersion: 1,
+        phase: 'committed',
+        files: [
+          { path: configPath, oldBytes: configBytes, newBytes: configBytes },
+          { path: victimPath, oldBytes: 'ORIGINAL', newBytes: 'PWNED' },
+        ],
+      }));
+
+      await assert.rejects(recoverTeamMembershipTaskTransaction(teamName, cwd), /escapes expected team files/);
+      assert.equal(await readFile(victimPath, 'utf8'), 'ORIGINAL');
+      assert.equal(await readFile(configPath, 'utf8'), configBytes);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a symlinked tasks directory before writing through it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-membership-symlink-path-'));
+    try {
+      const teamName = 'symlink-path';
+      await initTeamState(teamName, 'task', 'executor', 1, cwd);
+      const teamDir = join(cwd, '.omx', 'state', 'team', teamName);
+      const configPath = join(teamDir, 'config.json');
+      const configBytes = await readFile(configPath, 'utf8');
+      const tasksDir = join(teamDir, 'tasks');
+      const outsideTasksDir = join(cwd, 'outside-tasks');
+      await rm(tasksDir, { recursive: true, force: true });
+      await mkdir(outsideTasksDir);
+      await writeFile(join(outsideTasksDir, 'task-1.json'), 'ORIGINAL');
+      await symlink(outsideTasksDir, tasksDir, 'dir');
+      await writeFile(join(teamDir, '.membership-task-transaction.json'), JSON.stringify({
+        schemaVersion: 1,
+        phase: 'committed',
+        files: [
+          { path: configPath, oldBytes: configBytes, newBytes: configBytes },
+          { path: join(tasksDir, 'task-1.json'), oldBytes: 'ORIGINAL', newBytes: 'PWNED' },
+        ],
+      }));
+
+      await assert.rejects(recoverTeamMembershipTaskTransaction(teamName, cwd), /tasks root escapes canonical team root/);
+      assert.equal(await readFile(join(outsideTasksDir, 'task-1.json'), 'utf8'), 'ORIGINAL');
+      assert.equal(await readFile(configPath, 'utf8'), configBytes);
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

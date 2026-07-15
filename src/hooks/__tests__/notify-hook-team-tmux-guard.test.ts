@@ -128,6 +128,7 @@ describe('notify-hook team tmux guard bridge', () => {
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'hello bridge',
         submitKeyPresses: 2,
         typePrompt: false,
@@ -164,6 +165,7 @@ describe('notify-hook team tmux guard bridge', () => {
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'Read /tmp/team/mailbox/leader-fixed.json; new msg from worker-1. Review it; decide next step.',
         submitKeyPresses: 2,
         typePrompt: true,
@@ -205,6 +207,7 @@ describe('notify-hook team tmux guard bridge', () => {
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'hello bridge',
         submitKeyPresses: 1,
         typePrompt: true,
@@ -263,6 +266,7 @@ exit 0
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'intended supervisor handoff',
         submitKeyPresses: 1,
         typePrompt: true,
@@ -319,6 +323,7 @@ exit 0
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'supervisor handoff after setup',
         submitKeyPresses: 1,
         typePrompt: true,
@@ -382,6 +387,7 @@ exit 0
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        exactPaneId: '%42',
         prompt: 'supervisor handoff after verify',
         submitKeyPresses: 1,
         typePrompt: true,
@@ -446,6 +452,7 @@ exit 0
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
+        options: { exactPaneId: '%42' },
       });
 
       assert.equal(result.status, 0, result.stderr);
@@ -605,4 +612,74 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
+});
+
+it('rejects omitted and mismatched exact pane identities before any tmux effect', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-binding-'));
+  const fakeBinDir = join(cwd, 'fake-bin');
+  try {
+    await mkdir(fakeBinDir, { recursive: true });
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const omitted = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      prompt: 'must not send',
+      submitKeyPresses: 1,
+      typePrompt: false,
+    });
+    assert.equal(omitted.status, 0, omitted.stderr);
+    assert.equal(JSON.parse(omitted.stdout).exactPaneProof.reason, 'missing_exact_pane_id');
+
+    const mismatched = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      exactPaneId: '%43',
+      prompt: 'must not send',
+      submitKeyPresses: 1,
+      typePrompt: false,
+    });
+    assert.equal(mismatched.status, 0, mismatched.stderr);
+    assert.equal(JSON.parse(mismatched.stdout).exactPaneProof.reason, 'pane_target_mismatch');
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+it('stops before input when a repeated exact proof observes a new pane PID', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-pid-change-'));
+  const fakeBinDir = join(cwd, 'fake-bin');
+  const tmuxLogPath = join(cwd, 'tmux.log');
+  const countPath = join(cwd, 'proof-count');
+  try {
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+if [ "$1" = "list-panes" ]; then
+  count=0; [ ! -f "${countPath}" ] || count=$(cat "${countPath}")
+  count=$((count + 1)); printf '%s' "$count" > "${countPath}"
+  if [ "$count" -eq 1 ]; then printf '%%42\t0\t4242\n'; else printf '%%42\t0\t4343\n'; fi
+fi
+`);
+    await chmod(join(fakeBinDir, 'tmux'), 0o755);
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const result = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      exactPaneId: '%42',
+      prompt: 'must not send',
+      submitKeyPresses: 1,
+      typePrompt: false,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.exactPaneProof.reason, 'pane_pid_changed');
+    assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
