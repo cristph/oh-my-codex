@@ -179,6 +179,31 @@ fn exec_with_state_dir_persists() {
 }
 
 #[test]
+fn exec_ignores_dispatch_compat_without_authoritative_runtime_state() {
+    let dir = std::env::temp_dir().join("omx-runtime-test-dispatch-compat-only");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dispatch.json"), "[]\n").unwrap();
+
+    let cmd_json = r#"{"command":"CaptureSnapshot"}"#;
+    let state_arg = format!("--state-dir={}", dir.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+        .args(["exec", cmd_json, &state_arg])
+        .output()
+        .expect("ran omx-runtime");
+
+    assert!(
+        output.status.success(),
+        "dispatch compatibility output must not poison fresh authoritative state: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.join("events.json").exists());
+    assert!(dir.join("snapshot.json").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn snapshot_from_state_dir_reads_persisted_state() {
     let dir = std::env::temp_dir().join("omx-runtime-test-snapshot-statedir");
     let _ = std::fs::remove_dir_all(&dir);

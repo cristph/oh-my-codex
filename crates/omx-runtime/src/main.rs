@@ -86,14 +86,9 @@ fn run() -> Result<(), String> {
                 Some(dir) => match RuntimeEngine::load(dir) {
                     Ok(engine) => engine,
                     Err(error) => {
-                        let has_persisted_state = [
-                            "events.json",
-                            "snapshot.json",
-                            "mailbox.json",
-                            "dispatch.json",
-                        ]
-                        .iter()
-                        .any(|name| std::path::Path::new(dir).join(name).exists());
+                        let has_persisted_state = ["events.json", "snapshot.json", "mailbox.json"]
+                            .iter()
+                            .any(|name| std::path::Path::new(dir).join(name).exists());
                         if has_persisted_state {
                             return Err(format!(
                                 "failed to load authoritative runtime state: {error}"
