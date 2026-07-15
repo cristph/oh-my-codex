@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -7,12 +7,11 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
 import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
-import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import {
   canonicalizeExistingAuthorityPath,
-  initializeStateAuthority,
-  mintStateAuthorityTransportCapability,
 } from '../../state/authority.js';
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
 
@@ -95,22 +94,6 @@ function escapeRegExp(value: string): string {
 }
 
 
-async function authenticatedLaunchTransport(
-  cwd: string,
-  launchId: string,
-): Promise<{ env: Record<string, string>; capability: string }> {
-  const authority = await initializeStateAuthority({
-    startup_cwd: cwd,
-    observed_cwd: cwd,
-    launch_id: launchId,
-    session_binding: { canonical_session_id: `${launchId}-session` },
-  });
-  await mintStateAuthorityTransportCapability(authority);
-  const env = buildStateAuthorityTransportEnv(authority, {});
-  const capability = env.OMX_STATE_AUTHORITY_CAPABILITY;
-  if (!capability) throw new Error('expected authenticated state-authority capability');
-  return { env: env as Record<string, string>, capability };
-}
 
 
 
@@ -567,7 +550,7 @@ exit 0
 });
 
 describe('omx launcher when tmux is available', () => {
-  it('rejects a detached madmax record unless it matches the current committed authority', async () => {
+  it('does not reuse detached madmax records, even when a launch context repeats', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
     try {
       const runs = join(wd, 'runs');
@@ -1104,6 +1087,9 @@ exit 0
       const tmuxFixtureProgramPath = join(fakeBin, 'tmux-fixture.cjs');
       const codexFixtureProgramPath = join(fakeBin, 'codex-fixture.cjs');
       const injectionCanaryPath = join(wd, 'provider-injection-canary');
+      const restorationCanaryPath = join(wd, 'restoration-injection-canary');
+      const previousImportValue =
+        `previous import "quoted" \\ $HOME $(touch ${restorationCanaryPath}); literal-end`;
       const providerSecret =
         `provider secret "quoted" \\ $HOME $(touch ${injectionCanaryPath}); literal-end`;
       const inheritedCiEnvironment = Object.fromEntries(
@@ -1159,6 +1145,7 @@ const command = args[0] || '';
 const statePath = ${JSON.stringify(tmuxFixtureStatePath)};
 const logPath = ${JSON.stringify(tmuxLogPath)};
 const restoreMarkerPath = ${JSON.stringify(restoreMarkerPath)};
+const previousImportValue = ${JSON.stringify(previousImportValue)};
 const readState = () => { try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return {}; } };
 const writeState = (state) => fs.writeFileSync(statePath, JSON.stringify(state));
 const parseLine = (line) => {
@@ -1204,8 +1191,9 @@ if (command === 'new-session') {
 if (command === 'source-file') {
   const input = fs.readFileSync(0, 'utf8');
   const state = readState();
+  const wasStartupRan = Boolean(state.startupRan);
   const sourceValues = {};
-  let restored = false;
+  const restoreActions = {};
   for (const line of input.split(/\\r?\\n/).filter(Boolean)) {
     const tokens = parseLine(line);
     if (tokens[0] !== 'set-environment') continue;
@@ -1213,10 +1201,15 @@ if (command === 'source-file') {
     const name = separator >= 0 ? tokens[separator + 1] : '';
     const value = separator >= 0 ? tokens[separator + 2] : undefined;
     if (!name.startsWith('OMX_TMUX_IMPORT_')) continue;
-    if (tokens.includes('-u') || tokens.includes('-r')) restored = true;
-    else if (value !== undefined) sourceValues[name] = value;
+    if (wasStartupRan) {
+      restoreActions[name] = tokens.includes('-u') || tokens.includes('-r')
+        ? { kind: 'unset' }
+        : { kind: 'set', value };
+    } else if (value !== undefined) {
+      sourceValues[name] = value;
+    }
   }
-  if (Object.keys(sourceValues).length > 0 && !state.startupRan) {
+  if (Object.keys(sourceValues).length > 0 && !wasStartupRan) {
     const childEnv = { ...process.env };
     const manifestEntry = Object.entries(sourceValues).find(([sourceName]) => sourceName.endsWith('_MANIFEST'));
     const manifestMatch = manifestEntry?.[1].match(/^v1:([0-9]+):(.*)$/);
@@ -1240,14 +1233,42 @@ if (command === 'source-file') {
     state.startupRan = true;
     writeState(state);
   }
-  if (restored) fs.writeFileSync(restoreMarkerPath, 'restored');
+  if (wasStartupRan && Object.keys(restoreActions).length > 0) {
+    const requestedNames = Array.isArray(state.requestedNames) ? state.requestedNames : [];
+    if (requestedNames.length === 0 || Object.keys(restoreActions).length !== requestedNames.length) process.exit(94);
+    for (const name of requestedNames) {
+      const action = restoreActions[name];
+      if (!action) process.exit(94);
+      if (name === state.seededName) {
+        if (action.kind !== 'set' || action.value !== previousImportValue) process.exit(93);
+      } else if (action.kind !== 'unset') {
+        process.exit(93);
+      }
+    }
+    fs.writeFileSync(restoreMarkerPath, 'restored');
+  }
   process.exit(0);
 }
 if (command === 'show-environment') {
   const requestedName = args.at(-1) || '';
-  const value = process.env['OMX_TEST_TMUX_SOURCE_' + requestedName];
-  if (value !== undefined) console.log(requestedName + '=' + value);
-  else {
+  if (requestedName.startsWith('OMX_TMUX_IMPORT_')) {
+    const value = process.env['OMX_TEST_TMUX_SOURCE_' + requestedName];
+    if (value !== undefined) console.log(requestedName + '=' + value);
+    else console.log('-' + requestedName);
+  } else {
+    const state = readState();
+    const manifestName = state.startupCommand?.match(/OMX_TMUX_IMPORT_[0-9a-f]+_MANIFEST/)?.[0] || '';
+    const sourcePrefix = manifestName.replace(/_MANIFEST$/, '');
+    const sourceCount = Number(state.startupCommand?.match(/omx_environment_expected_count=([0-9]+)/)?.[1] || '0');
+    if (manifestName && sourcePrefix && Number.isSafeInteger(sourceCount) && sourceCount > 0) {
+      state.requestedNames = [
+        manifestName,
+        ...Array.from({ length: sourceCount }, (_, index) => sourcePrefix + '_' + index),
+      ];
+      state.seededName = sourcePrefix + '_0';
+      writeState(state);
+      console.log(state.seededName + '=' + previousImportValue);
+    }
     console.log('CUSTOM_LLM_API_KEY=previous-provider-baseline');
     console.log('-OMX_STATE_AUTHORITY_CAPABILITY');
   }
@@ -1324,6 +1345,7 @@ exec "${process.execPath}" "${tmuxFixtureProgramPath}" "$@"
       assert.doesNotMatch(tmuxScript, new RegExp(escapeRegExp(providerSecret)));
       assert.doesNotMatch(tmuxState, new RegExp(escapeRegExp(providerSecret)));
       assert.equal(existsSync(injectionCanaryPath), false);
+      assert.equal(existsSync(restorationCanaryPath), false);
       assert.equal(await readFile(restoreMarkerPath, 'utf-8'), 'restored');
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -1646,7 +1668,7 @@ exit 1
     }
   });
 
-  it('rolls back and falls back directly when attaching the detached tmux session fails', async () => {
+  it('falls back directly when detached tmux setup is unavailable before attach', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-attach-fail-'));
     try {
       const home = join(wd, 'home');
@@ -1697,6 +1719,10 @@ case "$1" in
     printf 'error connecting to /tmp/tmux-1000/default (Operation not permitted)\n' >&2
     exit 1
     ;;
+  has-session)
+    printf 'can't find session\n' >&2
+    exit 1
+    ;;
   set-option|set-hook|kill-session|run-shell|resize-pane|select-pane)
     exit 0
     ;;
@@ -1729,14 +1755,82 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
-      assert.match(tmuxLog, /tmux:attach-session -t /);
-      assert.match(tmuxLog, /tmux:kill-session -t /);
+      assert.doesNotMatch(tmuxLog, /tmux:(?:new-session|attach-session|kill-session|has-session) /);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('rolls back with guidance when WSL Windows Terminal attach exits without attaching', async () => {
+  it('fails closed without a second leader when rollback cannot be verified after leader release', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-rollback-fail-'));
+    try {
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V|list-sessions)
+    exit 0
+    ;;
+  new-session)
+    printf '%%12\n'
+    exit 0
+    ;;
+  split-window)
+    printf 'hud-pane\n'
+    exit 0
+    ;;
+  display-message)
+    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\n'
+    else
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  show-options)
+    printf 'off\n'
+    exit 0
+    ;;
+  attach-session)
+    printf 'forced attach failure\n' >&2
+    exit 1
+    ;;
+  kill-session)
+    printf 'forced rollback failure\n' >&2
+    exit 1
+    ;;
+  has-session)
+    exit 0
+    ;;
+  set-option|set-hook|run-shell|resize-pane|select-pane)
+    exit 0
+    ;;
+esac
+exit 0
+`,
+      );
+
+      const result = runOmx(wd, ['--madmax', '--tmux'], {
+        ...env,
+        TMUX: '',
+        TMUX_PANE: '',
+      });
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.notEqual(result.status, 0, result.error || result.stderr || result.stdout);
+      assert.match(result.stderr, /rollback was not verified.*direct fallback is refused/i);
+      assert.doesNotMatch(result.stdout, /fake-codex:/);
+      assert.equal((tmuxLog.match(/tmux:new-session /g) || []).length, 1);
+      assert.match(tmuxLog, /tmux:attach-session -t /);
+      assert.match(tmuxLog, /tmux:kill-session -t /);
+      assert.match(tmuxLog, /tmux:has-session -t /);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back directly when a WSL Windows Terminal attach cannot be established', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-attach-noop-'));
     try {
       const { env, tmuxLogPath } = await createLaunchFixture(
@@ -1767,6 +1861,10 @@ case "$1" in
     printf 'off\n'
     exit 0
     ;;
+  has-session)
+    printf 'can't find session\n' >&2
+    exit 1
+    ;;
   set-option|set-hook|attach-session|kill-session|run-shell|resize-pane|select-pane)
     exit 0
     ;;
@@ -1792,11 +1890,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
-      assert.match(result.stderr, /attach-session returned immediately without attaching a client/i);
-      assert.match(result.stderr, /Falling back to direct Codex launch/i);
-      assert.match(tmuxLog, /tmux:attach-session -t /);
-      assert.match(tmuxLog, /tmux:display-message -p -t .* #\{session_attached\}/);
-      assert.match(tmuxLog, /tmux:kill-session -t /);
+      assert.doesNotMatch(tmuxLog, /tmux:(?:new-session|attach-session|kill-session|has-session) /);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

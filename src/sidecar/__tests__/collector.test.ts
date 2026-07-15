@@ -176,8 +176,9 @@ describe('collectSidecarSnapshot', () => {
 describe('collectSidecarSnapshot canonical Team state root authority', () => {
   async function withBoxedTeam(
     envKey: 'OMX_ROOT' | 'OMX_STATE_ROOT',
-    test: (params: { cwd: string; env: NodeJS.ProcessEnv; boxedRoot: string }) => Promise<void>,
+    test: (params: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<void>,
   ): Promise<void> {
+
     const cwd = await mkdtemp(join(tmpdir(), 'omx-sidecar-boxed-'));
     try {
       const boxedRoot = join(cwd, 'box');
@@ -190,7 +191,7 @@ describe('collectSidecarSnapshot canonical Team state root authority', () => {
         tmux_session: 'omx-demo',
         workers: [{ name: 'worker-1', index: 1, role: 'executor' }],
       });
-      await test({ cwd, env, boxedRoot });
+      await test({ cwd, env });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -50,6 +50,7 @@ import {
   teamListTasks as listTasks,
   teamUpdateTask as updateTask,
   teamReadManifest as readTeamManifestV2,
+  teamWriteManifest,
   teamNormalizeGovernance as normalizeTeamGovernance,
   teamNormalizePolicy as normalizeTeamPolicy,
   teamClaimTask as claimTask,
@@ -138,7 +139,11 @@ import {
   shouldHonorAgentExactModel,
   type TeamReasoningEffort,
 } from './model-contract.js';
-import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import {
+  resolveCanonicalTeamStateRoot,
+  resolveValidatedTeamAuthority,
+} from './state-root.js';
+
 import {
   buildInternalTeamName,
   resolveTeamIdentityScope,
@@ -152,7 +157,6 @@ import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
-import { readModeState, updateModeState } from '../modes/base.js';
 import {
   resolveWorktreeToolContext,
   worktreeToolContextEnv,
@@ -160,11 +164,9 @@ import {
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
   StateAuthorityError,
-  resolveStateAuthority,
   stateAuthorityTransportCapabilityForChild,
   type ResolvedStateAuthorityContext,
 } from '../state/authority.js';
-import { resolveAuthenticatedTransportAuthority } from '../hooks/session.js';
 
 export { resolveTeamWorkerCliForResolvedLaunchArgs };
 import {
@@ -250,63 +252,6 @@ export interface TeamSnapshot {
   };
 }
 
-async function syncRootTeamModeStateOnTerminalPhase(
-  teamName: string,
-  phase: TeamPhase | TerminalPhase,
-  cwd: string,
-): Promise<void> {
-  if (phase !== 'complete' && phase !== 'failed' && phase !== 'cancelled')
-    return;
-
-  try {
-    const localStatePath = join(
-      resolve(cwd),
-      '.omx',
-      'state',
-      'team-state.json',
-    );
-    const localTeamState = existsSync(localStatePath)
-      ? (JSON.parse(await readFile(localStatePath, 'utf-8')) as Record<
-          string,
-          unknown
-        >)
-      : null;
-    const teamState = localTeamState ?? (await readModeState('team', cwd));
-    if (!teamState) return;
-
-    const stateTeamName =
-      typeof teamState.team_name === 'string' ? teamState.team_name.trim() : '';
-    if (stateTeamName && stateTeamName !== teamName) return;
-
-    const alreadySynced =
-      teamState.active === false &&
-      teamState.current_phase === phase &&
-      typeof teamState.completed_at === 'string' &&
-      teamState.completed_at.length > 0;
-    if (alreadySynced) return;
-
-    const updates: Record<string, unknown> = {
-      active: false,
-      current_phase: phase,
-      team_name: teamName,
-    };
-    if (typeof teamState.completed_at !== 'string' || !teamState.completed_at) {
-      updates.completed_at = new Date().toISOString();
-    }
-
-    if (localTeamState) {
-      await writeFile(
-        localStatePath,
-        JSON.stringify({ ...localTeamState, ...updates }, null, 2),
-        'utf-8',
-      );
-    } else {
-      await updateModeState('team', updates, cwd);
-    }
-  } catch {
-    // Best-effort compatibility sync only.
-  }
-}
 
 function matchesTeamModeStateForShutdown(
   state: Record<string, unknown> | null,
@@ -2011,8 +1956,7 @@ async function writeTeamPreflightContextPacket(params: {
       'Resume Team monitoring with omx team status before dispatching follow-up work.',
     ],
   };
-  await mkdir(dirname(packetPath), { recursive: true });
-  await writeFile(packetPath, `${JSON.stringify(packet, null, 2)}\n`, 'utf-8');
+  await writeAtomic(packetPath, `${JSON.stringify(packet, null, 2)}\n`);
   return packetPath;
 }
 
@@ -2077,6 +2021,23 @@ export function teamRuntimeSessionPath(cwd: string): string {
   return join(resolveCanonicalTeamStateRoot(cwd), 'session.json');
 }
 
+function resolveAuthoritativeTeamStateRoot(
+  config: Pick<TeamConfig, 'team_state_root'>,
+  cwd: string,
+): string {
+  const authoritativeRoot = resolveCanonicalTeamStateRoot(cwd);
+  const diagnosticRoot = config.team_state_root?.trim();
+  if (
+    diagnosticRoot
+    && resolve(cwd, diagnosticRoot) !== resolve(authoritativeRoot)
+  ) {
+    throw new Error(
+      `team_state_root_authority_conflict:${resolve(cwd, diagnosticRoot)}:${resolve(authoritativeRoot)}; restart the session from the intended workspace or rebind the session authority before retrying`,
+    );
+  }
+  return authoritativeRoot;
+}
+
 function buildTeamWorkerAuthorityTransport(
   authority: ResolvedStateAuthorityContext,
 ): Record<string, string> {
@@ -2095,34 +2056,13 @@ async function resolveTeamWorkerAuthorityTransport(
   leaderCwd: string,
   env: NodeJS.ProcessEnv,
 ): Promise<Record<string, string>> {
-  const inherited = await resolveAuthenticatedTransportAuthority(
-    leaderCwd,
-    env,
-  );
+  const inherited = await resolveValidatedTeamAuthority(leaderCwd, env);
   if (inherited) return buildTeamWorkerAuthorityTransport(inherited);
 
-  const resolution = await resolveStateAuthority({
-    startup_cwd: leaderCwd,
-    observed_cwd: leaderCwd,
-    session_id: env.OMX_SESSION_ID?.trim() || undefined,
-  });
-  if (resolution.context && resolution.can_mutate) {
-    throw new StateAuthorityError(
-      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
-      'a committed leader authority requires complete authenticated transport before team workers can launch',
-    );
-  }
-  const blockingDiagnostic = resolution.diagnostics.find(
-    (diagnostic) =>
-      diagnostic.code !== AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+  throw new StateAuthorityError(
+    AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+    'team worker launch requires a complete authenticated authority transport',
   );
-  if (blockingDiagnostic) {
-    throw new StateAuthorityError(
-      blockingDiagnostic.code,
-      blockingDiagnostic.message,
-    );
-  }
-  return {};
 }
 
 function createStartupTimingRecorder(
@@ -2153,7 +2093,7 @@ function createStartupTimingRecorder(
           null,
           2,
         ),
-      ).catch(() => {});
+      );
       for (const event of events) {
         await appendTeamDeliveryLogForCwd(cwd, {
           event: 'dispatch_result',
@@ -2314,12 +2254,7 @@ type WorkerStartupEvidence =
   | 'none';
 
 function resolveStartupEvidenceStateRoots(cwd: string): string[] {
-  return [
-    ...new Set([
-    resolve(cwd, '.omx', 'state'),
-    resolveCanonicalTeamStateRoot(cwd),
-    ]),
-  ];
+  return [resolveCanonicalTeamStateRoot(cwd)];
 }
 
 async function readStartupEvidenceWorkerStatus(
@@ -2523,7 +2458,7 @@ async function recordRecoverableStartupIssue(params: {
       updated_at: updatedAt,
     },
     cwd,
-  ).catch(() => {});
+  );
   await appendTeamEvent(
     teamName,
     {
@@ -2535,7 +2470,7 @@ async function recordRecoverableStartupIssue(params: {
       reason,
     },
     cwd,
-  ).catch(() => {});
+  );
 }
 
 async function recordPromptStartupWorkerStopped(params: {
@@ -2557,7 +2492,7 @@ async function recordPromptStartupWorkerStopped(params: {
       updated_at: updatedAt,
     },
     cwd,
-  ).catch(() => {});
+  );
   await appendTeamEvent(
     teamName,
     {
@@ -2567,7 +2502,7 @@ async function recordPromptStartupWorkerStopped(params: {
       reason,
     },
     cwd,
-  ).catch(() => {});
+  );
 }
 
 function setTeamModelInstructionsFile(
@@ -3147,19 +3082,16 @@ async function writeDecompositionArtifacts(
   metadata: TeamDecompositionMetadata,
 ): Promise<void> {
   const root = join(resolveCanonicalTeamStateRoot(cwd), 'team', teamName);
-  await mkdir(root, { recursive: true });
-  await writeFile(
+  await writeAtomic(
     join(root, 'decomposition-report.json'),
     JSON.stringify(metadata, null, 2),
-    'utf8',
   );
 
   const manifest = await readTeamManifestV2(teamName, cwd);
   if (manifest) {
-    await writeFile(
-      join(root, 'manifest.v2.json'),
-      JSON.stringify({ ...manifest, team_decomposition: metadata }, null, 2),
-      'utf8',
+    await teamWriteManifest(
+      { ...manifest, team_decomposition: { ...metadata } },
+      cwd,
     );
   }
 }
@@ -3438,6 +3370,7 @@ export async function startTeam(
   let sessionCreated = false;
   const createdWorkerPaneIds: string[] = [];
   let createdLeaderPaneId: string | undefined;
+  let restorePreTeamHudOnRollback = false;
   let config: TeamConfig | null = null;
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(launchEnv);
   const workerStartupEvidenceTimeoutMs = resolveWorkerStartupEvidenceTimeoutMs(
@@ -3982,6 +3915,7 @@ export async function startTeam(
       sessionCreated = true;
       createdWorkerPaneIds.push(...createdSession.workerPaneIds);
       createdLeaderPaneId = createdSession.leaderPaneId;
+      restorePreTeamHudOnRollback = Boolean(createdSession.hadStandaloneHudBeforeStart);
       applyCreatedInteractiveSessionToConfig(
         config,
         createdSession,
@@ -4224,7 +4158,14 @@ export async function startTeam(
             reason: dispatchOutcome.reason,
             cwd: leaderCwd,
           });
-          return { ok: true, workerIndex, workerName };
+          return {
+            ok: false,
+            workerIndex,
+            workerName,
+            error: new Error(
+              `prompt_worker_stopped:${workerName}:${dispatchOutcome.reason}`,
+            ),
+          };
         }
         return {
           ok: false,
@@ -4329,6 +4270,20 @@ export async function startTeam(
         } catch (cleanupError) {
           rollbackErrors.push(`destroyTeamSession: ${String(cleanupError)}`);
         }
+      }
+    }
+    if (restorePreTeamHudOnRollback && createdLeaderPaneId) {
+      try {
+        const restoredHudPaneId = restoreStandaloneHudPane(
+          createdLeaderPaneId,
+          leaderCwd,
+          { sessionId: leaderSessionId },
+        );
+        if (!restoredHudPaneId) {
+          rollbackErrors.push('restorePreTeamHud: returned null');
+        }
+      } catch (cleanupError) {
+        rollbackErrors.push(`restorePreTeamHud: ${String(cleanupError)}`);
       }
     }
     if (workerLaunchMode === 'prompt' && config) {
@@ -4601,7 +4556,6 @@ export async function monitorTeam(
   );
   await writeTeamPhaseState(sanitized, phaseState, cwd);
   const phase: TeamPhase | TerminalPhase = phaseState.current_phase;
-  await syncRootTeamModeStateOnTerminalPhase(sanitized, phase, cwd);
 
   if (deadWorkerStall) {
     recommendations.push(
@@ -4742,6 +4696,7 @@ export async function assignTask(
   if (!config) throw new Error(`Team ${sanitized} not found`);
   const workerInfo = config.workers.find((w) => w.name === workerName);
   if (!workerInfo) throw new Error(`Worker ${workerName} not found in team`);
+  const authoritativeTeamStateRoot = resolveAuthoritativeTeamStateRoot(config, cwd);
   const dispatchPolicy = resolveDispatchPolicy(
     manifest?.policy,
     config.worker_launch_mode,
@@ -4764,19 +4719,17 @@ export async function assignTask(
   }
 
   try {
-    // Retry dispatch up to 2 times to handle trust prompts during assignment (fixes #393).
+    // Persisted team_state_root is diagnostic-only; current session authority owns the artifact root.
     const approvedExecutionState =
       await resolvePersistedApprovedTeamExecutionContinuityState(
-      sanitized,
-      config.leader_cwd ?? cwd,
-        config.team_state_root ??
-          resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
-    );
+        sanitized,
+        config.leader_cwd ?? cwd,
+        authoritativeTeamStateRoot,
+      );
     const persistedUltragoalContext = await readPersistedTeamUltragoalContext(
       sanitized,
       config.leader_cwd ?? cwd,
-      config.team_state_root ??
-        resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
+      authoritativeTeamStateRoot,
     );
     const approvedContextSection = joinContextSections(
       approvedExecutionState.status === 'valid'
@@ -5458,12 +5411,16 @@ export async function resumeTeam(
   if (!config) return null;
   config.lifecycle_profile = 'default';
   const leaderCwd = config.leader_cwd ?? cwd;
+  const authoritativeTeamStateRoot = resolveAuthoritativeTeamStateRoot(
+    config,
+    leaderCwd,
+  );
   const approvedExecutionState =
     await resolvePersistedApprovedTeamExecutionContinuityState(
-    sanitized,
-    leaderCwd,
-    config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
-  );
+      sanitized,
+      leaderCwd,
+      authoritativeTeamStateRoot,
+    );
   if (approvedExecutionState.status === 'malformed') {
     throw new Error(`approved_execution_binding_malformed:${sanitized}`);
   }
@@ -6971,7 +6928,7 @@ async function sendLeaderMailboxMessage(params: {
   const triggerDirective = buildLeaderMailboxTriggerDirective(
     teamName,
     fromWorker,
-    config.team_state_root || undefined,
+    resolveAuthoritativeTeamStateRoot(config, cwd),
   );
   const transportPreference =
     resolveLeaderMailboxTransportPreference(dispatchPolicy);

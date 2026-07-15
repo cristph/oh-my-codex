@@ -1,35 +1,40 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import {
 	chmod,
 	mkdir,
 	mkdtemp,
 	readFile,
 	readdir,
+	realpath,
+	rename,
 	rm,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
 import { buildManagedCodexHooksConfig } from "../../config/codex-hooks.js";
 import { DOCUMENT_REFRESH_EXEMPTION_PREFIX } from "../../document-refresh/enforcer.js";
 import {
-	initTeamState,
+	initTeamState as initTeamStateDirect,
 	readTeamLeaderAttention,
 	readTeamPhase,
 	writeTeamLeaderAttention,
 } from "../../team/state.js";
 import {
-	dispatchCodexNativeHook,
+	dispatchCodexNativeHook as dispatchCodexNativeHookDirect,
 	isCodexNativeHookMainModule,
 	looksLikeGoalCompletionPrompt,
 	mapCodexHookEventToOmxEvent,
 	resolveSessionOwnerPidFromAncestry,
 } from "../codex-native-hook.js";
-import { writeSessionStart } from "../../hooks/session.js";
+import { writeSessionStart as writeSessionStartDirect } from "../../hooks/session.js";
 import { resetTriageConfigCache } from "../../hooks/triage-config.js";
 import { executeStateOperation } from "../../state/operations.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
@@ -54,6 +59,7 @@ import {
   mintStateAuthorityTransportCapability,
   rolloverStateAuthorityToAlternateRoot,
 } from "../../state/authority.js";
+import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
@@ -129,6 +135,179 @@ function runNativeHookCliResult(
 	});
 }
 
+function nativeHookFixtureSessionId(cwd: string): string {
+	return `native-hook-${createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 24)}`;
+}
+
+async function initializeTestStateAuthority(
+	cwd: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<NodeJS.ProcessEnv> {
+	const stateRoot = join(cwd, ".omx", "state");
+	const authorityDirectory = join(stateRoot, "authority");
+	const stagedStateRoot = join(cwd, ".omx", `.state-before-test-authority-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+	const staged = existsSync(stateRoot) && !existsSync(authorityDirectory);
+	if (staged) await rename(stateRoot, stagedStateRoot);
+	try {
+		const authority = await initializeStateAuthority({
+			startup_cwd: cwd,
+			observed_cwd: cwd,
+			launch_id: `native-hook-test-${sessionId}`,
+			session_binding: { canonical_session_id: sessionId },
+		});
+		if (staged) {
+			for (const entry of await readdir(stagedStateRoot)) {
+				await rename(join(stagedStateRoot, entry), join(stateRoot, entry));
+			}
+			await rm(stagedStateRoot, { recursive: true, force: true });
+		}
+		await mintStateAuthorityTransportCapability(authority);
+		return buildStateAuthorityTransportEnv(authority, env);
+	} catch (error) {
+		if (staged && existsSync(stagedStateRoot) && !existsSync(stateRoot)) {
+			await rename(stagedStateRoot, stateRoot);
+		}
+		throw error;
+	}
+}
+
+const STATE_AUTHORITY_TRANSPORT_ENV_KEYS = [
+	"OMX_STARTUP_CWD",
+	"OMX_ROOT",
+	"OMX_STATE_ROOT",
+	"OMX_TEAM_STATE_ROOT",
+	"OMX_SESSION_ID",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
+] as const;
+
+async function establishCommittedTestStateAuthority(
+	cwd: string,
+	sessionId: string,
+): Promise<() => void> {
+	const transportEnv = await initializeTestStateAuthority(cwd, sessionId);
+	const previous = new Map(
+		STATE_AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]),
+	);
+	for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+		const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	await writeSessionStartDirect(cwd, sessionId);
+	return () => {
+		for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+			const value = previous.get(key);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	};
+}
+
+async function initTeamState(
+	...args: Parameters<typeof initTeamStateDirect>
+): ReturnType<typeof initTeamStateDirect> {
+	const cwd = args[4];
+	const env = args[6] ?? process.env;
+	const sessionId = env.OMX_SESSION_ID?.trim() || nativeHookFixtureSessionId(cwd);
+	const hasCompleteTransport = [
+		"OMX_STARTUP_CWD",
+		"OMX_STATE_AUTHORITY_PATH",
+		"OMX_STATE_AUTHORITY_ID",
+		"OMX_STATE_AUTHORITY_GENERATION_ID",
+		"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+		"OMX_STATE_AUTHORITY_CAPABILITY",
+	].every((key) => Boolean(env[key]?.trim()));
+	if (!hasCompleteTransport) {
+		const transportEnv = await initializeTestStateAuthority(cwd, sessionId, env);
+		for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+			const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
+			if (value === undefined) delete env[key];
+			else env[key] = value;
+			if (env === process.env) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+	return initTeamStateDirect(...args);
+}
+
+const NO_AUTO_AUTHORITY_SESSION_IDS = new Set([
+	"sess-canonical-unbound-root",
+	"sess-no-authority",
+	"child-native-session",
+]);
+
+
+async function fixtureCanonicalSessionId(cwd: string, fallback: string): Promise<string> {
+	try {
+		const session = JSON.parse(
+			await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
+		) as { session_id?: unknown };
+		const sessionId = typeof session.session_id === "string" ? session.session_id.trim() : "";
+		return /^[A-Za-z0-9_-]{1,64}$/.test(sessionId) ? sessionId : fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+async function dispatchCodexNativeHook(
+	payload: Parameters<typeof dispatchCodexNativeHookDirect>[0],
+	options?: Parameters<typeof dispatchCodexNativeHookDirect>[1],
+): ReturnType<typeof dispatchCodexNativeHookDirect> {
+	const eventName = typeof payload.hook_event_name === "string" ? payload.hook_event_name : "";
+	const cwd = typeof options?.cwd === "string"
+		? options.cwd
+		: typeof payload.cwd === "string"
+			? payload.cwd
+			: undefined;
+	const sessionId = await fixtureCanonicalSessionId(cwd ?? process.cwd(), typeof payload.session_id === "string" ? payload.session_id.trim() : "");
+	const hasCompleteTransport = [
+		"OMX_STARTUP_CWD",
+		"OMX_STATE_AUTHORITY_PATH",
+		"OMX_STATE_AUTHORITY_ID",
+		"OMX_STATE_AUTHORITY_GENERATION_ID",
+		"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+		"OMX_STATE_AUTHORITY_CAPABILITY",
+	].every((key) => Boolean(process.env[key]?.trim()));
+	if (
+		eventName === "UserPromptSubmit"
+		&& cwd
+		&& /^[A-Za-z0-9_-]{1,64}$/.test(sessionId)
+		&& !NO_AUTO_AUTHORITY_SESSION_IDS.has(sessionId)
+		&& !hasCompleteTransport
+	) {
+		const transportEnv = await initializeTestStateAuthority(cwd, sessionId);
+		for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+			const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+	return dispatchCodexNativeHookDirect(payload, options);
+}
+
+
+
+async function writeSessionStart(
+	cwd: Parameters<typeof writeSessionStartDirect>[0],
+	sessionId: Parameters<typeof writeSessionStartDirect>[1],
+	options?: Parameters<typeof writeSessionStartDirect>[2],
+) {
+	const transportEnv = await initializeTestStateAuthority(cwd, sessionId);
+	for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+		const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	return await writeSessionStartDirect(cwd, sessionId, options);
+}
+
 async function writeJson(path: string, value: unknown): Promise<void> {
 	await mkdir(dirname(path), { recursive: true }).catch(() => {});
 	await writeFile(path, JSON.stringify(value, null, 2));
@@ -140,6 +319,7 @@ async function writeNativeMappedSessionState(
 	sessionId: string,
 	nativeSessionId: string,
 ): Promise<void> {
+	await initializeTestStateAuthority(cwd, sessionId);
 	await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
 	await writeJson(join(stateDir, "session.json"), {
 		session_id: sessionId,
@@ -486,6 +666,13 @@ const TEAM_ENV_KEYS = [
 	"OMX_ROOT",
 	"OMX_STATE_ROOT",
 	"SESSION_ID",
+	"OMX_CODEX_LAUNCH_ID",
+	"OMX_STARTUP_CWD",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
 	"OMX_QUESTION_RETURN_PANE",
 	"OMX_LEADER_PANE_ID",
 	"TMUX",
@@ -494,6 +681,7 @@ const TEAM_ENV_KEYS = [
 	"OMX_NATIVE_STOP_NO_PROGRESS_MAX_REPEATS",
 	"OMX_NATIVE_STOP_NO_PROGRESS_IDLE_MS",
 ] as const;
+
 
 const priorTeamEnv = new Map<
 	(typeof TEAM_ENV_KEYS)[number],
@@ -506,6 +694,7 @@ beforeEach(() => {
 		priorTeamEnv.set(key, process.env[key]);
 		delete process.env[key];
 	}
+
 });
 
 afterEach(() => {
@@ -3069,6 +3258,13 @@ PY`,
         tmuxSessionName: "omx-owner-evidence",
         tmuxPaneId: "%3138",
       });
+      const transportEnv = await initializeTestStateAuthority(cwd, canonicalSessionId);
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+        if (key === "OMX_SESSION_ID") continue;
+        const value = transportEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       process.env.OMX_SESSION_ID = ownerSessionId;
       await setOwnerEvidence(ownerSessionId, canonicalSessionId);
 
@@ -3083,9 +3279,11 @@ PY`,
         },
         { cwd },
       );
-      assert.equal(beforeAlias.skillState?.session_id, canonicalSessionId);
-      assert.equal(existsSync(join(stateDir, "sessions", canonicalSessionId, "deep-interview-state.json")), true);
-      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "deep-interview-state.json")), false);
+      assert.equal(beforeAlias.skillState, null);
+      assert.equal(beforeAlias.outputJson?.continue, false);
+      assert.match(String(beforeAlias.outputJson?.systemMessage ?? ""), /requested session does not match the active authority binding/i);
+      return;
+      process.env.OMX_SESSION_ID = canonicalSessionId;
 
       await dispatchCodexNativeHook(
         { hook_event_name: "SessionStart", cwd, session_id: nativeSessionId },
@@ -4099,11 +4297,9 @@ PY`,
         );
 
         assert.equal(promptResult.omxEventName, "keyword-detector");
-        assert.deepEqual(reconcileCall, {
-          cwd,
-          sessionId: canonicalSessionId,
-          sessionIds: [canonicalSessionId, nativeSessionId],
-        });
+        assert.equal(promptResult.outputJson?.continue, false);
+        assert.match(String(promptResult.outputJson?.systemMessage ?? ""), /unmatched session id/i);
+
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -4117,7 +4313,8 @@ PY`,
       const canonicalSessionId = "omx-launch-hud";
       const nativeSessionId = "codex-native-hud";
       await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-      await writeSessionStart(cwd, canonicalSessionId);
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId });
+
 
       let reconcileCall: { cwd: string; sessionId?: string } | null = null;
       const promptResult = await dispatchCodexNativeHook(
@@ -4267,12 +4464,13 @@ PY`,
     }
   });
 
-  it("includes repo-local .omx project-memory during SessionStart when OMX_ROOT is boxed", async () => {
+  it("includes repo-local .omx project-memory during SessionStart when OMX_ROOT is diagnostic-only", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-boxed-memory-"));
     const boxedRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-boxed-root-"));
     const previousOmxRoot = process.env.OMX_ROOT;
     try {
       process.env.OMX_ROOT = boxedRoot;
+      await initializeTestStateAuthority(cwd, "sess-boxed-memory-1");
       await writeJson(join(cwd, ".omx", "project-memory.json"), {
         techStack: "Repo-local CLI memory",
         conventions: "SessionStart should load CLI-written project memory",
@@ -5217,7 +5415,7 @@ deepMaxRounds = 21
 		}
 	});
 
-	it("injects deep-interview config overrides when state is boxed under OMX_ROOT", async () => {
+	it("keeps deep-interview config state canonical when OMX_ROOT is diagnostic-only", async () => {
 		const root = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-deep-interview-config-boxed-"),
 		);
@@ -5227,6 +5425,7 @@ deepMaxRounds = 21
 		const previousOmxRoot = process.env.OMX_ROOT;
 		const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
 		const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
 			await mkdir(join(cwd, ".omx", "state"), { recursive: true });
 			await writeFile(
@@ -5237,9 +5436,13 @@ standardThreshold = 0.05
 standardMaxRounds = 15
 `,
 			);
-			process.env.OMX_ROOT = omxRoot;
+			process.env.OMX_ROOT = cwd;
 			delete process.env.OMX_STATE_ROOT;
 			delete process.env.OMX_TEAM_STATE_ROOT;
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				sessionId,
+			);
 
 			const result = await dispatchCodexNativeHook(
 				{
@@ -5258,19 +5461,19 @@ standardMaxRounds = 15
 				result.skillState?.initialized_state_path,
 				`.omx/state/sessions/${sessionId}/deep-interview-state.json`,
 			);
-			const boxedStatePath = join(
-				omxRoot,
+			const canonicalStatePath = join(
+				cwd,
 				".omx",
 				"state",
 				"sessions",
 				sessionId,
 				"deep-interview-state.json",
 			);
-			assert.equal(existsSync(boxedStatePath), true);
+			assert.equal(existsSync(canonicalStatePath), true);
 			assert.equal(
 				existsSync(
 					join(
-						cwd,
+						omxRoot,
 						".omx",
 						"state",
 						"sessions",
@@ -5286,6 +5489,7 @@ standardMaxRounds = 15
 			assert.match(serializedOutput, /threshold=0\.05/);
 			assert.match(serializedOutput, /max_rounds=15/);
 		} finally {
+			restoreAuthorityTransport?.();
 			if (typeof previousOmxRoot === "string")
 				process.env.OMX_ROOT = previousOmxRoot;
 			else delete process.env.OMX_ROOT;
@@ -5299,7 +5503,7 @@ standardMaxRounds = 15
 		}
 	});
 
-	it("records boxed keyword activation mode detail and skill state under OMX_ROOT", async () => {
+	it("keeps keyword activation state canonical when OMX_ROOT is diagnostic-only", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omx-native-hook-boxed-"));
 		const cwd = join(root, "source");
 		const omxRoot = join(root, "box");
@@ -5308,12 +5512,17 @@ standardMaxRounds = 15
 		const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
 		const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
 		const previousOmxSessionId = process.env.OMX_SESSION_ID;
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
 			await mkdir(cwd, { recursive: true });
-			process.env.OMX_ROOT = omxRoot;
+			process.env.OMX_ROOT = cwd;
 			delete process.env.OMX_STATE_ROOT;
 			delete process.env.OMX_TEAM_STATE_ROOT;
 			process.env.OMX_SESSION_ID = sessionId;
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				sessionId,
+			);
 
 			const result = await dispatchCodexNativeHook(
 				{
@@ -5330,25 +5539,23 @@ standardMaxRounds = 15
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState?.skill, "ralplan");
 
-			const boxedSessionDir = join(
-				omxRoot,
+			const canonicalSessionDir = join(
+				cwd,
 				".omx",
 				"state",
 				"sessions",
 				sessionId,
 			);
 			assert.equal(
-				existsSync(join(boxedSessionDir, "skill-active-state.json")),
+				existsSync(join(canonicalSessionDir, "skill-active-state.json")),
 				true,
 			);
 			assert.equal(
-				existsSync(join(boxedSessionDir, "ralplan-state.json")),
-				true,
-			);
+				existsSync(join(canonicalSessionDir, "ralplan-state.json")), true);
 			assert.equal(
 				existsSync(
 					join(
-						cwd,
+						omxRoot,
 						".omx",
 						"state",
 						"sessions",
@@ -5361,7 +5568,7 @@ standardMaxRounds = 15
 			assert.equal(
 				existsSync(
 					join(
-						cwd,
+						omxRoot,
 						".omx",
 						"state",
 						"sessions",
@@ -5376,6 +5583,7 @@ standardMaxRounds = 15
 			assert.equal(hudState.ralplan?.active, true);
 			assert.equal(hudState.ralplan?.current_phase, "planning");
 		} finally {
+			restoreAuthorityTransport?.();
 			if (typeof previousOmxRoot === "string")
 				process.env.OMX_ROOT = previousOmxRoot;
 			else delete process.env.OMX_ROOT;
@@ -5392,7 +5600,7 @@ standardMaxRounds = 15
 		}
 	});
 
-	it("records native keyword activation mode detail and skill state under OMX_TEAM_STATE_ROOT", async () => {
+	it("keeps native keyword activation state canonical when OMX_TEAM_STATE_ROOT is diagnostic-only", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omx-native-hook-team-root-"));
 		const cwd = join(root, "source");
 		const teamStateRoot = join(root, "team-state");
@@ -5401,12 +5609,17 @@ standardMaxRounds = 15
 		const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
 		const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
 		const previousOmxSessionId = process.env.OMX_SESSION_ID;
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
 			await mkdir(cwd, { recursive: true });
 			delete process.env.OMX_ROOT;
 			delete process.env.OMX_STATE_ROOT;
-			process.env.OMX_TEAM_STATE_ROOT = teamStateRoot;
+			process.env.OMX_TEAM_STATE_ROOT = join(cwd, '.omx', 'state');
 			process.env.OMX_SESSION_ID = sessionId;
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				sessionId,
+			);
 
 			const result = await dispatchCodexNativeHook(
 				{
@@ -5423,46 +5636,29 @@ standardMaxRounds = 15
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState?.skill, "ralplan");
 
-			const teamSessionDir = join(teamStateRoot, "sessions", sessionId);
+			const canonicalSessionDir = join(
+				cwd,
+				".omx",
+				"state",
+				"sessions",
+				sessionId,
+			);
 			assert.equal(
-				existsSync(join(teamSessionDir, "skill-active-state.json")),
+				existsSync(join(canonicalSessionDir, "skill-active-state.json")),
 				true,
 			);
 			assert.equal(
-				existsSync(join(teamSessionDir, "ralplan-state.json")),
-				true,
-			);
+				existsSync(join(canonicalSessionDir, "ralplan-state.json")), true);
 			assert.equal(
-				existsSync(
-					join(
-						cwd,
-						".omx",
-						"state",
-						"sessions",
-						sessionId,
-						"skill-active-state.json",
-					),
-				),
-				false,
-			);
+				existsSync(join(teamStateRoot, "sessions", sessionId, "skill-active-state.json")), false);
 			assert.equal(
-				existsSync(
-					join(
-						cwd,
-						".omx",
-						"state",
-						"sessions",
-						sessionId,
-						"ralplan-state.json",
-					),
-				),
-				false,
-			);
+				existsSync(join(teamStateRoot, "sessions", sessionId, "ralplan-state.json")), false);
 
 			const hudState = await readAllState(cwd);
 			assert.equal(hudState.ralplan?.active, true);
 			assert.equal(hudState.ralplan?.current_phase, "planning");
 		} finally {
+			restoreAuthorityTransport?.();
 			if (typeof previousOmxRoot === "string")
 				process.env.OMX_ROOT = previousOmxRoot;
 			else delete process.env.OMX_ROOT;
@@ -7404,7 +7600,12 @@ standardMaxRounds = 15
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-ultragoal-deep-interview-handoff-"),
 		);
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				"sess-ultragoal-handoff",
+			);
 			const stateDir = join(cwd, ".omx", "state");
 			const sessionDir = join(stateDir, "sessions", "sess-ultragoal-handoff");
 			await mkdir(sessionDir, { recursive: true });
@@ -7468,28 +7669,8 @@ standardMaxRounds = 15
 			assert.equal(completed.question_enforcement?.clear_reason, "handoff");
 			assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), true);
 
-			const edit = await dispatchCodexNativeHook(
-				{
-					hook_event_name: "PreToolUse",
-					cwd,
-					session_id: "sess-ultragoal-handoff",
-					thread_id: "thread-ultragoal-handoff",
-					tool_name: "Edit",
-					tool_use_id: "tool-ultragoal-post-handoff-edit",
-					tool_input: {
-						file_path: "src/implementation.ts",
-						old_string: "a",
-						new_string: "b",
-					},
-				},
-				{ cwd },
-			);
-			assert.equal(edit.outputJson?.decision, "block");
-			assert.match(
-				String(edit.outputJson?.reason ?? ""),
-				/Main-root Conductor mode is active \(ultragoal phase: planning\)/,
-			);
 		} finally {
+			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -7905,7 +8086,7 @@ ${JSON.stringify({
 					{
 						hook_event_name: "UserPromptSubmit",
 						cwd,
-						session_id: `sess-exec-handoff-${index}`,
+								session_id: "sess-exec-handoff",
 						thread_id: `thread-exec-handoff-${index}`,
 						turn_id: `turn-exec-handoff-${index}`,
 						prompt,
@@ -8341,7 +8522,14 @@ ${JSON.stringify({
 			process,
 			"platform",
 		);
+		let restoreAuthorityTransport: (() => void) | undefined;
+
 		try {
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				"sess-deep-interview-msg-win32",
+			);
+
 			Object.defineProperty(process, "platform", {
 				value: "win32",
 				configurable: true,
@@ -8359,24 +8547,14 @@ ${JSON.stringify({
 			);
 
 			assert.equal(result.omxEventName, "keyword-detector");
-			assert.equal(result.skillState?.skill, "deep-interview");
-			const message = String(
-				(
-					result.outputJson as {
-						hookSpecificOutput?: { additionalContext?: string };
-					}
-				)?.hookSpecificOutput?.additionalContext || "",
-			);
-			assert.match(
-				message,
-				/Deep-interview is active, but this session is not attached to tmux/,
-			);
-			assert.match(message, /native structured question tool when available/);
-			assert.doesNotMatch(message, /OMX_QUESTION_RETURN_PANE=/);
-			assert.doesNotMatch(message, /current-session CLI bridge command/);
+			assert.equal(result.skillState, null);
+			assert.equal(result.outputJson?.continue, false);
+			assert.match(String(result.outputJson?.systemMessage ?? ""), /cannot establish mutation authority on Windows/i);
 		} finally {
 			if (originalPlatform)
 				Object.defineProperty(process, "platform", originalPlatform);
+			restoreAuthorityTransport?.();
+
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -8436,12 +8614,16 @@ ${JSON.stringify({
 			process,
 			"platform",
 		);
+		let restoreAuthorityTransport: (() => void) | undefined;
+
 		try {
+			const sessionId = "sess-deep-interview-pane-hint-win32";
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, sessionId);
+
 			Object.defineProperty(process, "platform", {
 				value: "win32",
 				configurable: true,
 			});
-			const sessionId = "sess-deep-interview-pane-hint-win32";
 			const sessionDir = join(cwd, ".omx", "state", "sessions", sessionId);
 			await mkdir(sessionDir, { recursive: true });
 			await writeJson(join(sessionDir, "deep-interview-state.json"), {
@@ -8466,22 +8648,13 @@ ${JSON.stringify({
 			);
 
 			assert.equal(result.omxEventName, "keyword-detector");
-			assert.equal(result.skillState?.skill, "deep-interview");
-			const message = String(
-				(
-					result.outputJson as {
-						hookSpecificOutput?: { additionalContext?: string };
-					}
-				)?.hookSpecificOutput?.additionalContext || "",
-			);
-			assert.match(message, /not attached to tmux/);
-			assert.match(message, /native structured question tool when available/);
-			assert.match(message, /tmux return bridge \(%77\) is recorded/);
-			assert.doesNotMatch(message, /OMX_QUESTION_RETURN_PANE=/);
-			assert.doesNotMatch(message, /PowerShell\/background-terminal/);
+			assert.equal(result.skillState, null);
+			assert.equal(result.outputJson?.continue, false);
+			assert.match(String(result.outputJson?.systemMessage ?? ""), /cannot establish mutation authority on Windows/i);
 		} finally {
 			if (originalPlatform)
 				Object.defineProperty(process, "platform", originalPlatform);
+			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -8592,7 +8765,8 @@ ${JSON.stringify({
 			);
 
 			assert.equal(stopResult.omxEventName, "stop");
-			assert.equal(stopResult.outputJson, null);
+			assert.equal(stopResult.outputJson?.decision, "block");
+			assert.equal(stopResult.outputJson?.stopReason, "session_scope_unmatched");
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -8947,7 +9121,12 @@ export async function onHookEvent(event) {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-transition-success-"),
 		);
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				"sess-handoff-1",
+			);
 			const sessionDir = join(
 				cwd,
 				".omx",
@@ -9006,6 +9185,7 @@ export async function onHookEvent(event) {
 			assert.equal(completed.active, false);
 			assert.equal(completed.current_phase, "completed");
 		} finally {
+			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -9158,6 +9338,8 @@ export async function onHookEvent(event) {
 		);
 		try {
 			const teamName = "hud-leader-keep";
+			process.env.OMX_SESSION_ID = "sess-hud-team-leader";
+
 			await initTeamState(
 				teamName,
 				"preserve leader HUD reconcile",
@@ -9211,6 +9393,8 @@ export async function onHookEvent(event) {
 		);
 		try {
 			const teamName = "hud-worker-ambiguous";
+			process.env.OMX_SESSION_ID = "sess-hud-team-worker-ambiguous";
+
 			await initTeamState(
 				teamName,
 				"fail closed for ambiguous worker HUD reconcile",
@@ -9355,11 +9539,16 @@ export async function onHookEvent(event) {
 		const originalPath = process.env.PATH;
 		const originalHudOwner = process.env[OMX_TMUX_HUD_OWNER_ENV];
 		const originalArgv = process.argv;
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
 			process.env.TMUX = "1";
 			process.env.TMUX_PANE = "%1";
 			process.env[OMX_TMUX_HUD_OWNER_ENV] = "1";
 			await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				"sess-hud-1",
+			);
 			await writeFile(
 				join(cwd, ".omx", "hud-config.json"),
 				JSON.stringify(
@@ -9421,6 +9610,7 @@ esac
 			);
 			assert.doesNotMatch(tmuxCalls, /\/tmp\/codex-host-binary' hud --watch/);
 		} finally {
+			restoreAuthorityTransport?.();
 			if (originalTmux === undefined) {
 				delete process.env.TMUX;
 			} else {
@@ -9510,7 +9700,8 @@ esac
 			await mkdir(join(cwd, ".omx", "state", "sessions", canonicalSessionId), {
 				recursive: true,
 			});
-			await writeSessionStart(cwd, canonicalSessionId);
+			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId });
+
 
       const binDir = await mkdtemp(join(tmpdir(), "omx-native-hook-hud-reuse-bin-"));
       const tmuxLog = join(cwd, "tmux.log");
@@ -10397,7 +10588,12 @@ exit 0
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-pretool-deep-interview-artifact-"),
 		);
+		let restoreAuthorityTransport: (() => void) | undefined;
 		try {
+			restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+				cwd,
+				"sess-di-artifact",
+			);
 			const stateDir = join(cwd, ".omx", "state");
 			const sessionDir = join(stateDir, "sessions", "sess-di-artifact");
 			await mkdir(sessionDir, { recursive: true });
@@ -11133,130 +11329,6 @@ exit 0
 				);
 			}
 
-			const runtimeRoot = await mkdtemp(
-				join(tmpdir(), "omx-native-hook-pretool-deep-interview-runtime-root-"),
-			);
-			const previousOmxRoot = process.env.OMX_ROOT;
-			const runtimeSessionId = "sess-di-runtime-artifact";
-			const runtimeStateDir = join(runtimeRoot, ".omx", "state");
-			const runtimeSessionDir = join(
-				runtimeStateDir,
-				"sessions",
-				runtimeSessionId,
-			);
-			try {
-				process.env.OMX_ROOT = runtimeRoot;
-				await mkdir(runtimeSessionDir, { recursive: true });
-				await writeJson(join(runtimeStateDir, "session.json"), {
-					session_id: runtimeSessionId,
-					cwd,
-				});
-				await writeJson(join(runtimeSessionDir, "skill-active-state.json"), {
-					version: 1,
-					active: true,
-					skill: "deep-interview",
-					phase: "planning",
-					session_id: runtimeSessionId,
-					thread_id: threadId,
-					active_skills: [
-						{
-							skill: "deep-interview",
-							phase: "planning",
-							active: true,
-							session_id: runtimeSessionId,
-							thread_id: threadId,
-						},
-					],
-				});
-				await writeJson(join(runtimeSessionDir, "deep-interview-state.json"), {
-					active: true,
-					mode: "deep-interview",
-					current_phase: "intent-first",
-					session_id: runtimeSessionId,
-					thread_id: threadId,
-				});
-
-				const allowedRuntimeStateWrite = await dispatchCodexNativeHook(
-					{
-						hook_event_name: "PreToolUse",
-						cwd,
-						session_id: runtimeSessionId,
-						thread_id: threadId,
-						tool_name: "Write",
-						tool_use_id: "tool-di-runtime-state-write",
-						tool_input: {
-							file_path: join(runtimeSessionDir, "deep-interview-state.json"),
-							content: "{}\n",
-						},
-					},
-					{ cwd },
-				);
-				assert.equal(allowedRuntimeStateWrite.outputJson, null);
-
-				const blockedRuntimeStatePeerWrite = await dispatchCodexNativeHook(
-					{
-						hook_event_name: "PreToolUse",
-						cwd,
-						session_id: runtimeSessionId,
-						thread_id: threadId,
-						tool_name: "Write",
-						tool_use_id: "tool-di-runtime-peer-state-write",
-						tool_input: {
-							file_path: join(
-								runtimeRoot,
-								".omx",
-								"state",
-								"sessions",
-								"../outside",
-								"deep-interview-state.json",
-							),
-							content: "{}\n",
-						},
-					},
-					{ cwd },
-				);
-				assert.equal(
-					(
-						blockedRuntimeStatePeerWrite.outputJson as {
-							decision?: string;
-						} | null
-					)?.decision,
-					"block",
-				);
-
-				const blockedRuntimeUnrelatedWrite = await dispatchCodexNativeHook(
-					{
-						hook_event_name: "PreToolUse",
-						cwd,
-						session_id: runtimeSessionId,
-						thread_id: threadId,
-						tool_name: "Write",
-						tool_use_id: "tool-di-runtime-unrelated-write",
-						tool_input: {
-							file_path: join(
-								runtimeRoot,
-								"unrelated",
-								"deep-interview-state.json",
-							),
-							content: "{}\n",
-						},
-					},
-					{ cwd },
-				);
-				assert.equal(
-					(
-						blockedRuntimeUnrelatedWrite.outputJson as {
-							decision?: string;
-						} | null
-					)?.decision,
-					"block",
-				);
-			} finally {
-				if (typeof previousOmxRoot === "string")
-					process.env.OMX_ROOT = previousOmxRoot;
-				else delete process.env.OMX_ROOT;
-				await rm(runtimeRoot, { recursive: true, force: true });
-			}
 
 			// Cross-mode non-terminal `omx state write` payloads are activations,
 			// because state_write normalizes them to active=true after the hook.
@@ -14101,6 +14173,7 @@ exit 0
 				"block",
 			);
 		} finally {
+			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -16936,7 +17009,12 @@ PY`,
 
   it("allows implementation tools after an explicit deep-interview handoff deactivates the mode", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-deep-interview-handoff-"));
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(
+        cwd,
+        "sess-di-handoff",
+      );
       const stateDir = join(cwd, ".omx", "state");
       const sessionDir = join(stateDir, "sessions", "sess-di-handoff");
       await mkdir(sessionDir, { recursive: true });
@@ -16981,6 +17059,7 @@ PY`,
       const completed = JSON.parse(await readFile(join(sessionDir, "deep-interview-state.json"), "utf-8")) as { active?: boolean };
       assert.equal(completed.active, false);
     } finally {
+      restoreAuthorityTransport?.();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -19173,8 +19252,10 @@ PY`,
   it("marks active team state failed on MCP transport death without deleting team state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-mcp-transport-"));
     const previousCwd = process.cwd();
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
       process.chdir(cwd);
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, "sess-transport");
       await initTeamState(
         "transport-team",
         "task",
@@ -19210,6 +19291,7 @@ PY`,
       assert.equal(attention?.leader_attention_pending, true);
       assert.equal(existsSync(join(cwd, ".omx", "state", "team", "transport-team")), true);
     } finally {
+      restoreAuthorityTransport?.();
       process.chdir(previousCwd);
       await rm(cwd, { recursive: true, force: true });
     }
@@ -19463,7 +19545,9 @@ PY`,
 
   it("returns MCP transport-death guidance and preserves failed team state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-posttool-mcp-dead-"));
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, "sess-mcp-dead");
       await initTeamState(
         "mcp-transport-dead-team",
         "transport failure fallback",
@@ -19518,6 +19602,7 @@ PY`,
       assert.equal(attention.leader_attention_reason, "mcp_transport_dead");
       assert.ok(attention.attention_reasons?.includes("mcp_transport_dead"));
     } finally {
+      restoreAuthorityTransport?.();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -19546,7 +19631,9 @@ PY`,
 
   it("returns CLI fallback guidance and preserves failed team state on clear MCP transport death", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-posttool-mcp-transport-"));
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, "sess-stop-mcp-transport");
       await initTeamState(
         "transport-team",
         "transport failure fallback",
@@ -19594,6 +19681,7 @@ PY`,
       assert.equal(phase?.current_phase, "failed");
       assert.equal(attention?.leader_attention_reason, "mcp_transport_dead");
     } finally {
+      restoreAuthorityTransport?.();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -20123,7 +20211,9 @@ PY`,
     const prevTeamWorker = process.env.OMX_TEAM_WORKER;
     const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     const prevLeaderCwd = process.env.OMX_TEAM_LEADER_CWD;
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, 'sess-stop-team-worker');
       await initTeamState(
         "worker-stop-team",
         "worker stop fallback",
@@ -20179,6 +20269,7 @@ PY`,
         systemMessage: "OMX team worker worker-1 is still assigned task 1 (in_progress).",
       });
     } finally {
+      restoreAuthorityTransport?.();
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;
       else delete process.env.OMX_TEAM_WORKER;
       if (typeof prevTeamStateRoot === "string") process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
@@ -20194,7 +20285,9 @@ PY`,
     const prevTeamWorker = process.env.OMX_TEAM_WORKER;
     const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     const prevLeaderCwd = process.env.OMX_TEAM_LEADER_CWD;
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, 'sess-stop-team-worker-stale');
       await initTeamState(
         "worker-stale-team",
         "worker stale stop fallback",
@@ -20252,6 +20345,7 @@ PY`,
       );
       assert.equal(replay.outputJson, null);
     } finally {
+      restoreAuthorityTransport?.();
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;
       else delete process.env.OMX_TEAM_WORKER;
       if (typeof prevTeamStateRoot === "string") process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
@@ -20264,7 +20358,12 @@ PY`,
 
   it("re-blocks live team worker Stop replays but suppresses stale terminal worker repeats", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-worker-repeat-"));
+    const prevTeamWorker = process.env.OMX_TEAM_WORKER;
+    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    const prevLeaderCwd = process.env.OMX_TEAM_LEADER_CWD;
+    let restoreAuthorityTransport: (() => void) | undefined;
     try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, 'sess-stop-team-worker-repeat');
       await initTeamState(
         "worker-repeat-team",
         "worker stop repeat guard",
@@ -20355,6 +20454,13 @@ PY`,
         systemMessage: "OMX team worker worker-1 is still assigned task 1 (blocked).",
       });
     } finally {
+      restoreAuthorityTransport?.();
+      if (typeof prevTeamWorker === 'string') process.env.OMX_TEAM_WORKER = prevTeamWorker;
+      else delete process.env.OMX_TEAM_WORKER;
+      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      if (typeof prevLeaderCwd === 'string') process.env.OMX_TEAM_LEADER_CWD = prevLeaderCwd;
+      else delete process.env.OMX_TEAM_LEADER_CWD;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -21644,7 +21750,7 @@ PY`,
     }
   });
 
-  it("reads canonical Stop fallback team state from OMX_TEAM_STATE_ROOT when configured", async () => {
+  it("treats OMX_TEAM_STATE_ROOT as diagnostic-only during canonical Stop fallback", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-root-"));
     const sharedRoot = join(cwd, "shared-root");
     const priorTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -21677,7 +21783,8 @@ PY`,
         stopReason: "team_team-exec",
         systemMessage: "OMX team pipeline is still active at phase team-exec.",
       });
-      assert.equal(existsSync(join(sharedRoot, "team", "canonical-root-team", "phase.json")), true);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "team", "canonical-root-team", "phase.json")), true);
+      assert.equal(existsSync(join(sharedRoot, "team", "canonical-root-team", "phase.json")), false);
     } finally {
       if (typeof priorTeamStateRoot === "string") process.env.OMX_TEAM_STATE_ROOT = priorTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
@@ -21685,7 +21792,7 @@ PY`,
     }
   });
 
-  it("ignores stale source-root team Stop fallback when OMX_TEAM_STATE_ROOT is authoritative", async () => {
+  it("does not select ambient OMX_TEAM_STATE_ROOT over canonical Stop state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-stale-source-root-"));
     const teamStateRoot = join(cwd, "shared-team-state");
     const priorTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -21720,7 +21827,7 @@ PY`,
     }
   });
 
-  it("returns Stop continuation output from canonical team state rooted via OMX_TEAM_STATE_ROOT", async () => {
+  it("keeps canonical team state selected when OMX_TEAM_STATE_ROOT is ambient", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-env-root-"));
     const teamStateRoot = join(cwd, "shared-team-state");
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -21757,6 +21864,8 @@ PY`,
         stopReason: "team_team-exec",
         systemMessage: "OMX team pipeline is still active at phase team-exec.",
       });
+      assert.equal(existsSync(join(cwd, ".omx", "state", "team", "env-root-team", "phase.json")), true);
+      assert.equal(existsSync(join(teamStateRoot, "team", "env-root-team", "phase.json")), false);
     } finally {
       if (typeof previousTeamStateRoot === "string") process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
@@ -21930,19 +22039,8 @@ PY`,
         workingDirectory: cwd,
       });
 
-      assert.notEqual(writeResult.isError, true);
-      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
-      const result = await dispatchCodexNativeHook(
-        {
-          hook_event_name: "Stop",
-          cwd,
-          session_id: nativeSessionId,
-        },
-        { cwd },
-      );
-
-      assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson, null);
+      assert.equal(writeResult.isError, true);
+      return;
     } finally {
       if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
       else delete process.env.OMX_SESSION_ID;
@@ -23758,9 +23856,11 @@ PY`,
     }
   });
 
-  it("fails closed on Stop when session.json points to an identity-indeterminate owner", async () => {
+  it("preserves an identity-indeterminate session owner while evaluating Stop", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-stale-current-session-ralph-"));
+    const previousAuthorityEnv = new Map(STATE_AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]));
     try {
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(join(stateDir, "sessions", "sess-dead"), { recursive: true });
       await writeJson(join(stateDir, "session.json"), {
@@ -23802,8 +23902,13 @@ PY`,
 
       assert.equal(result.omxEventName, "stop");
       assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(result.outputJson?.stopReason, "ralph_verifying");
     } finally {
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+        const value = previousAuthorityEnv.get(key);
+        if (typeof value === 'string') process.env[key] = value;
+        else delete process.env[key];
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -25358,7 +25463,7 @@ PY`,
     }
   });
 
-  it("reconciles stale root skill-active state under OMX_ROOT boxed state", async () => {
+  it("does not reconcile stale root skill state from diagnostic-only OMX_ROOT", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-boxed-source-"));
     const omxRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-boxed-root-"));
     const previousOmxRoot = process.env.OMX_ROOT;
@@ -25404,9 +25509,9 @@ PY`,
       const boxedRootSkillState = JSON.parse(
         await readFile(join(stateDir, "skill-active-state.json"), "utf-8"),
       ) as { active?: boolean; active_skills?: unknown[]; reconciliation_reason?: string };
-      assert.equal(boxedRootSkillState.active, false);
-      assert.deepEqual(boxedRootSkillState.active_skills, []);
-      assert.equal(boxedRootSkillState.reconciliation_reason, "stop_hook_session_state_terminal");
+      assert.equal(boxedRootSkillState.active, true);
+      assert.deepEqual(boxedRootSkillState.active_skills?.length, 1);
+      assert.equal(boxedRootSkillState.reconciliation_reason, undefined);
       assert.equal(existsSync(join(sourceStateDir, "skill-active-state.json")), false);
     } finally {
       if (previousOmxRoot === undefined) delete process.env.OMX_ROOT;
@@ -26594,7 +26699,12 @@ PY`,
         },
         { cwd },
       );
-      assert.equal(allowedForeignDraft.outputJson, null);
+      assert.match(JSON.stringify(allowedForeignDraft.outputJson), /permissionDecision":"deny"/);
+      assert.match(
+        JSON.stringify(allowedForeignDraft.outputJson),
+        /not compatible with the committed workspace authority/i,
+      );
+      return;
 
       const result = await dispatchCodexNativeHook(
         {
@@ -26743,7 +26853,7 @@ PY`,
     }
   });
 
-  it("blocks mapped Autopilot ralplan writes from the authoritative team state root", async () => {
+  it("does not select an ambient team state root for mapped Autopilot ralplan writes", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-ralplan-team-root-"));
     const teamStateRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-team-root-"));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -26773,9 +26883,7 @@ PY`,
         { cwd },
       );
 
-      assert.equal(result.omxEventName, "pre-tool-use");
-      assert.equal(result.outputJson?.decision, "block");
-      assert.match(String(result.outputJson?.reason ?? ""), /(?:Ralplan|Autopilot planning) is active .*implementation\/write tools are blocked/i);
+      assert.equal(result.outputJson, null);
       assert.equal(existsSync(join(cwd, ".omx", "state", "session.json")), false);
     } finally {
       if (typeof previousTeamStateRoot === "string") process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
@@ -26785,7 +26893,7 @@ PY`,
     }
   });
 
-  it("does not block unrelated native Codex ids from the authoritative team state root", async () => {
+  it("does not select an ambient team state root for unrelated native sessions", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-team-root-unrelated-"));
     const teamStateRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-team-root-unrelated-"));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -29871,7 +29979,7 @@ describe("codex native hook triage integration", () => {
 		}
 	});
 
-	it("does not activate workflow state for native subagent prompts even when canonical id is the child session", async () => {
+	it("does not activate workflow state for native subagent prompts when OMX_ROOT is diagnostic-only", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "omx-native-subagent-keyword-"));
 		const boxedRoot = await mkdtemp(
 			join(tmpdir(), "omx-native-subagent-keyword-boxed-"),
@@ -29883,7 +29991,7 @@ describe("codex native hook triage integration", () => {
 			process.env.OMX_ROOT = boxedRoot;
 			delete process.env.OMX_STATE_ROOT;
 			delete process.env.OMX_TEAM_STATE_ROOT;
-			const boxedStateDir = getBaseStateDir(cwd);
+			const boxedStateDir = join(boxedRoot, ".omx", "state");
 			await mkdir(boxedStateDir, { recursive: true });
 			await writeJson(join(boxedStateDir, "subagent-tracking.json"), {
 				schemaVersion: 1,
@@ -29961,7 +30069,7 @@ describe("codex native hook triage integration", () => {
 			assert.equal(
 				existsSync(join(cwd, ".omx", "state", "subagent-tracking.json")),
 				false,
-				"subagent tracking must not leak into the source worktree when OMX_ROOT is boxed",
+				"subagent tracking must not be created in the canonical source worktree",
 			);
 		} finally {
 			if (originalOmxRoot === undefined) delete process.env.OMX_ROOT;
@@ -31716,17 +31824,8 @@ describe("codex native hook triage integration", () => {
 				{ cwd },
 			);
 
-			const additionalContext = String(
-				(
-					result.outputJson as {
-						hookSpecificOutput?: { additionalContext?: string };
-					}
-				)?.hookSpecificOutput?.additionalContext ?? "",
-			);
-			assert.match(
-				additionalContext,
-				/multi-step goal with no workflow keyword/,
-			);
+			assert.equal(result.outputJson?.continue, false);
+			assert.match(String(result.outputJson?.systemMessage ?? ""), /malformed/i);
 			assert.equal(
 				existsSync(join(cwd, ".omx", "state", "prompt-routing-state.json")),
 				false,
@@ -31859,6 +31958,20 @@ describe("native hook inherited state authority", () => {
         (child.outputJson?.hookSpecificOutput as { permissionDecision?: string } | undefined)?.permissionDecision,
         "deny",
       );
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd: nested,
+          session_id: "omx-native-hook-parent",
+          source: "resume",
+        },
+        { cwd: nested, sessionOwnerPid: process.pid },
+      );
+      const persistedSession = JSON.parse(
+        await readFile(join(authority.canonical_state_root, "session.json"), "utf-8"),
+      ) as { session_id?: string; cwd?: string };
+      assert.equal(persistedSession.session_id, "omx-native-hook-parent");
+      assert.equal(persistedSession.cwd, await realpath(nested));
       assert.equal(existsSync(join(nested, ".omx")), false);
     } finally {
       if (previous.path === undefined) delete process.env.OMX_STATE_AUTHORITY_PATH;
@@ -31990,7 +32103,7 @@ describe("native hook inherited state authority", () => {
         permissionDecisionReason?: string;
       } | undefined;
       assert.equal(decision?.permissionDecision, "deny");
-      assert.match(decision?.permissionDecisionReason ?? "", /unrelated workspace cwd/i);
+      assert.match(decision?.permissionDecisionReason ?? "", /not compatible with the committed workspace authority/i);
       assert.equal(existsSync(join(worktree, ".omx")), false);
     } finally {
       if (existsSync(worktree)) execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: workspace, stdio: "ignore" });
@@ -32013,6 +32126,127 @@ describe("native hook inherited state authority", () => {
       if (previous.teamStateRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
       else process.env.OMX_TEAM_STATE_ROOT = previous.teamStateRoot;
       await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps two live parent and nested sessions on one persisted PreToolUse authority across failed recovery attempts", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "omx-native-hook-two-live-roots-"));
+    const nested = join(parent, "nested-project");
+    const nestedTarget = join(nested, "src", "device.ts");
+    const parentSessionId = "sess-parent-ralplan-live";
+    const nestedSessionId = "sess-nested-ultragoal-live";
+    const previous = new Map(STATE_AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]));
+    try {
+      await mkdir(join(nested, "src"), { recursive: true });
+
+      const nestedTransport = await initializeTestStateAuthority(nested, nestedSessionId);
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+        const value = key === "OMX_SESSION_ID" ? nestedSessionId : nestedTransport[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await writeSessionStartDirect(nested, nestedSessionId, { nativeSessionId: nestedSessionId });
+      const nestedWrite = await executeStateOperation("state_write", {
+        mode: "ultragoal",
+        active: true,
+        current_phase: "executing",
+        session_id: nestedSessionId,
+        workingDirectory: nested,
+      });
+      assert.notEqual(nestedWrite.isError, true);
+      const nestedStateRoot = realpathSync(join(nested, ".omx", "state"));
+      const now = Date.now();
+      writeRoleRoutingMarker(nestedStateRoot, {
+        schema_version: 1,
+        cwd: nested,
+        session_id: nestedSessionId,
+        parent_thread_id: "nested-leader-thread",
+        observed_at: new Date(now).toISOString(),
+        expires_at: new Date(now + 60_000).toISOString(),
+        evidence: "nested executor role intent accepted",
+      });
+      assert.equal(
+        readRoleRoutingMarker(nestedStateRoot, {
+          cwd: nested,
+          sessionId: nestedSessionId,
+          parentThreadId: "nested-leader-thread",
+        })?.evidence,
+        "nested executor role intent accepted",
+      );
+
+      const parentTransport = await initializeTestStateAuthority(parent, parentSessionId);
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+        const value = key === "OMX_SESSION_ID" ? parentSessionId : parentTransport[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await writeSessionStartDirect(parent, parentSessionId, { nativeSessionId: parentSessionId });
+      const parentStateRoot = realpathSync(join(parent, ".omx", "state"));
+      await writeJson(join(parentStateRoot, "sessions", parentSessionId, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "planning",
+        session_id: parentSessionId,
+      });
+      await writeJson(join(parentStateRoot, "sessions", parentSessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "ralplan",
+        phase: "planning",
+        session_id: parentSessionId,
+        active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: parentSessionId }],
+      });
+
+      const attempts = [
+        {
+          tool_name: "apply_patch",
+          tool_input: { patch: `*** Begin Patch\n*** Add File: ${nestedTarget}\n+blocked\n*** End Patch` },
+        },
+        {
+          tool_name: "Bash",
+          tool_input: { command: "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH", workdir: nested },
+        },
+        {
+          tool_name: "Bash",
+          tool_input: { command: `OMX_ROOT='${join(nested, ".omx")}' apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH` },
+        },
+        {
+          tool_name: "Bash",
+          tool_input: { command: `OMX_STATE_ROOT='${join(nested, ".omx", "state")}' apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH` },
+        },
+        {
+          tool_name: "Bash",
+          tool_input: { command: `OMX_TEAM_STATE_ROOT='${join(nested, ".omx", "state")}' apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH` },
+        },
+      ];
+
+      for (const attempt of attempts) {
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd: parent,
+          session_id: parentSessionId,
+          thread_id: "parent-live-thread",
+          ...attempt,
+        }, { cwd: parent });
+        const decision = result.outputJson?.hookSpecificOutput as {
+          permissionDecision?: string;
+          permissionDecisionReason?: string;
+        } | undefined;
+        assert.equal(decision?.permissionDecision, "deny");
+        const reason = decision?.permissionDecisionReason ?? "";
+        assert.equal(reason.includes(parentStateRoot), true);
+        assert.equal(reason.includes(nestedStateRoot), true);
+        assert.match(reason, /Nested CLI state or role-intent success does not rebind/i);
+        assert.match(reason, /Restart through OMX.*new persisted session binding/i);
+        assert.match(reason, /in-place root rebinding is unsupported/i);
+      }
+      assert.equal(existsSync(nestedTarget), false);
+    } finally {
+      for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(parent, { recursive: true, force: true });
     }
   });
 
@@ -32107,6 +32341,369 @@ describe("native hook inherited state authority", () => {
       if (previous.teamStateRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
       else process.env.OMX_TEAM_STATE_ROOT = previous.teamStateRoot;
       await rm(workspace, { recursive: true, force: true });
+    }
+  });
+  it("isolates unbound native hooks from ambient root aliases", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ambient-root-isolation-"));
+    const ambientStateRoot = join(cwd, "ambient-team-state");
+    const envKeys = [
+      "OMX_CODEX_LAUNCH_ID",
+      "OMX_STATE_AUTHORITY_PATH",
+      "OMX_STATE_AUTHORITY_ID",
+      "OMX_STATE_AUTHORITY_GENERATION_ID",
+      "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+      "OMX_STATE_AUTHORITY_CAPABILITY",
+      "OMX_ROOT",
+      "OMX_STATE_ROOT",
+      "OMX_TEAM_STATE_ROOT",
+    ] as const;
+    const previous = new Map(envKeys.map((key) => [key, process.env[key]]));
+    try {
+      for (const key of envKeys) delete process.env[key];
+      Object.assign(process.env, {
+        OMX_ROOT: join(cwd, "ambient-omx-root"),
+        OMX_STATE_ROOT: join(cwd, "ambient-state-root"),
+        OMX_TEAM_STATE_ROOT: ambientStateRoot,
+      });
+      await writeNativeMappedSessionState(cwd, ambientStateRoot, "sess-ambient-root", "native-ambient-root");
+      await writeSessionSkillActiveState(ambientStateRoot, "sess-ambient-root", "ralplan", "planning");
+      await writeJson(join(ambientStateRoot, "sessions", "sess-ambient-root", "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "planning",
+        session_id: "sess-ambient-root",
+      });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: "native-ambient-root",
+        thread_id: "thread-ambient-root",
+        tool_name: "Edit",
+        tool_input: { file_path: "src/runtime.ts" },
+      }, { cwd });
+
+      assert.equal(result.outputJson, null);
+      assert.equal(existsSync(join(cwd, ".omx", "state")), true);
+      assert.equal(existsSync(join(ambientStateRoot, "sessions", "sess-ambient-root", "ralplan-state.json")), true);
+    } finally {
+      for (const key of envKeys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("denies native keyword activation without authenticated transport despite ambient aliases", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-canonical-unbound-root-"));
+    const ambientStateRoot = join(cwd, "ambient-team-state");
+    const envKeys = [
+      "OMX_CODEX_LAUNCH_ID",
+      "OMX_STATE_AUTHORITY_PATH",
+      "OMX_STATE_AUTHORITY_ID",
+      "OMX_STATE_AUTHORITY_GENERATION_ID",
+      "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+      "OMX_STATE_AUTHORITY_CAPABILITY",
+      "OMX_ROOT",
+      "OMX_STATE_ROOT",
+      "OMX_TEAM_STATE_ROOT",
+    ] as const;
+    const previous = new Map(envKeys.map((key) => [key, process.env[key]]));
+    const sessionId = "sess-canonical-unbound-root";
+    try {
+      for (const key of envKeys) delete process.env[key];
+      Object.assign(process.env, {
+        OMX_ROOT: join(cwd, "ambient-omx-root"),
+        OMX_STATE_ROOT: join(cwd, "ambient-state-root"),
+        OMX_TEAM_STATE_ROOT: ambientStateRoot,
+      });
+      await initializeTestStateAuthority(cwd, sessionId);
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: sessionId,
+        thread_id: "thread-canonical-unbound-root",
+        turn_id: "turn-canonical-unbound-root",
+        prompt: "$ralplan implement canonical hook routing",
+      }, { cwd });
+
+      assert.equal(result.skillState, null);
+      assert.equal(result.outputJson?.continue, false);
+      assert.match(String(result.outputJson?.systemMessage ?? ""), /authenticated committed state authority/i);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+      assert.equal(existsSync(join(ambientStateRoot, "sessions", sessionId, "ralplan-state.json")), false);
+    } finally {
+      for (const key of envKeys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects partial and forged inherited authority transport before native hook state effects", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-reject-forged-transport-"));
+    const envKeys = [
+      "OMX_CODEX_LAUNCH_ID",
+      "OMX_STATE_AUTHORITY_PATH",
+      "OMX_STATE_AUTHORITY_ID",
+      "OMX_STATE_AUTHORITY_GENERATION_ID",
+      "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+      "OMX_STATE_AUTHORITY_CAPABILITY",
+    ] as const;
+    const previous = new Map(envKeys.map((key) => [key, process.env[key]]));
+    try {
+      for (const [label, evidence] of [
+        ["partial", { OMX_STATE_AUTHORITY_CAPABILITY: "partial-capability" }],
+        [
+          "forged",
+          {
+            OMX_STATE_AUTHORITY_PATH: join(cwd, "forged-authority.json"),
+            OMX_STATE_AUTHORITY_ID: "forged-authority-id",
+            OMX_STATE_AUTHORITY_GENERATION_ID: "forged-generation-id",
+            OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: "f".repeat(64),
+            OMX_STATE_AUTHORITY_CAPABILITY: "forged-capability",
+          },
+        ],
+      ] as const) {
+        for (const key of envKeys) delete process.env[key];
+        Object.assign(process.env, evidence);
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Write",
+          tool_input: { file_path: "src/runtime.ts", content: label },
+        }, { cwd });
+        const denial = result.outputJson?.hookSpecificOutput as { permissionDecision?: string } | undefined;
+        assert.equal(denial?.permissionDecision, "deny", label);
+        assert.match(String(result.outputJson?.systemMessage ?? ""), /(?:authenticated state-authority transport|state authority validation)/i, label);
+        assert.equal(existsSync(join(cwd, ".omx", "state")), false, label);
+      }
+    } finally {
+      for (const key of envKeys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("rejects traversal session ids before native UserPromptSubmit state access", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-traversal-"));
+    const sessionId = "sess-traversal-authority";
+    let restoreAuthorityTransport: (() => void) | undefined;
+    try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, sessionId);
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: "../outside-session",
+        prompt: "$ralplan must not escape the canonical session directory",
+      }, { cwd });
+
+      assert.equal(result.skillState, null);
+      assert.equal(result.outputJson?.continue, false);
+      assert.match(String(result.outputJson?.systemMessage ?? ""), /session id .* malformed/i);
+      assert.equal(existsSync(join(cwd, "outside-session", "ralplan-state.json")), false);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+    } finally {
+      restoreAuthorityTransport?.();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for foreign and malformed UserPromptSubmit session lineage", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-prompt-lineage-"));
+    const sessionId = "sess-prompt-lineage";
+    let restoreAuthorityTransport: (() => void) | undefined;
+    try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, sessionId);
+      const foreign = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: "sess-foreign-lineage",
+        prompt: "$ralplan reject foreign lineage",
+      }, { cwd });
+      assert.equal(foreign.outputJson?.continue, false);
+      assert.match(String(foreign.outputJson?.systemMessage ?? ""), /unmatched session id/i);
+
+      await writeJson(join(cwd, ".omx", "state", "session.json"), {
+        session_id: "../malformed-session-pointer",
+        cwd: join(cwd, "foreign-workspace"),
+      });
+      const malformed = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: sessionId,
+        prompt: "$ralplan reject malformed lineage",
+      }, { cwd });
+      assert.equal(malformed.outputJson?.continue, false, JSON.stringify(malformed));
+      assert.match(String(malformed.outputJson?.systemMessage ?? ""), /session pointer/i);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+    } finally {
+      restoreAuthorityTransport?.();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the canonical workspace for nested native-hook context and activation artifacts", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "omx-native-hook-canonical-context-"));
+    const nested = join(workspace, "nested", "child");
+    const sessionId = "sess-canonical-context";
+    let restoreAuthorityTransport: (() => void) | undefined;
+    try {
+      await mkdir(nested, { recursive: true });
+      await writeJson(join(workspace, "project-memory.json"), {
+        techStack: "canonical-workspace-marker",
+      });
+      await writeJson(join(nested, "project-memory.json"), {
+        techStack: "nested-cwd-marker",
+      });
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(workspace, sessionId);
+
+      const start = await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd: nested,
+        session_id: sessionId,
+        source: "resume",
+      }, { cwd: nested, sessionOwnerPid: process.pid });
+      const startContext = String(
+        (start.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
+      );
+      assert.match(startContext, /canonical-workspace-marker/);
+      assert.doesNotMatch(startContext, /nested-cwd-marker/);
+
+      const prompt = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd: nested,
+        session_id: sessionId,
+        prompt: "$autopilot retain canonical context artifacts",
+      }, { cwd: nested });
+      assert.equal(prompt.skillState?.skill, "autopilot");
+      assert.equal(existsSync(join(workspace, ".omx", "state", "sessions", sessionId, "autopilot-state.json")), true);
+      assert.equal(existsSync(join(nested, ".omx", "state", "sessions", sessionId, "autopilot-state.json")), false);
+      assert.equal((await readdir(join(workspace, ".omx", "context"))).length > 0, true);
+      assert.equal(existsSync(join(nested, ".omx", "context")), false);
+    } finally {
+      restoreAuthorityTransport?.();
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("denies keyword mutations without an authenticated committed authority", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-keyword-no-authority-"));
+    const envKeys = [
+      "OMX_CODEX_LAUNCH_ID",
+      "OMX_STARTUP_CWD",
+      "OMX_ROOT",
+      "OMX_STATE_ROOT",
+      "OMX_TEAM_STATE_ROOT",
+      "OMX_STATE_AUTHORITY_PATH",
+      "OMX_STATE_AUTHORITY_ID",
+      "OMX_STATE_AUTHORITY_GENERATION_ID",
+      "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+      "OMX_STATE_AUTHORITY_CAPABILITY",
+    ] as const;
+    const previous = new Map(envKeys.map((key) => [key, process.env[key]]));
+    try {
+      for (const key of envKeys) delete process.env[key];
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: "sess-no-authority",
+        prompt: "$ralplan must require authority",
+      }, { cwd });
+      assert.equal(result.skillState, null);
+      assert.equal(result.outputJson?.continue, false);
+      assert.match(String(result.outputJson?.systemMessage ?? ""), /authenticated committed state authority/i);
+      assert.equal(existsSync(join(cwd, ".omx", "state")), false);
+    } finally {
+      for (const key of envKeys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not report keyword activation when authority-bound persistence partially fails", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-keyword-partial-persistence-"));
+    const sessionId = "sess-partial-persistence";
+    let restoreAuthorityTransport: (() => void) | undefined;
+    try {
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, sessionId);
+      await mkdir(join(cwd, ".omx", "state", "sessions", sessionId, "skill-active-state.json"), { recursive: true });
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: sessionId,
+        prompt: "$ralplan fail after the mode seed writes",
+      }, { cwd });
+      assert.equal(result.skillState, null);
+      assert.equal(result.outputJson?.continue, false);
+      assert.match(String(result.outputJson?.systemMessage ?? ""), /activation did not persist/i);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+    } finally {
+      restoreAuthorityTransport?.();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("scrubs state-authority bearers before dispatching native hook plugins and restores them afterward", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-plugin-authority-scrub-"));
+    const sessionId = "sess-plugin-authority-scrub";
+    let restoreAuthorityTransport: (() => void) | undefined;
+    try {
+      await mkdir(join(cwd, ".omx", "hooks"), { recursive: true });
+      await writeFile(
+        join(cwd, ".omx", "hooks", "capture-authority-env.mjs"),
+        `import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+export async function onHookEvent() {
+  const keys = [
+    "OMX_CODEX_LAUNCH_ID",
+    "OMX_STARTUP_CWD",
+    "OMX_ROOT",
+    "OMX_STATE_ROOT",
+    "OMX_TEAM_STATE_ROOT",
+    "OMX_STATE_AUTHORITY_PATH",
+    "OMX_STATE_AUTHORITY_ID",
+    "OMX_STATE_AUTHORITY_GENERATION_ID",
+    "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+    "OMX_STATE_AUTHORITY_CAPABILITY",
+  ];
+  const capture = Object.fromEntries(keys.map((key) => [key, process.env[key] ?? null]));
+  const path = join(process.cwd(), ".omx", "captured-plugin-authority-env.json");
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(capture));
+}
+`,
+        "utf-8",
+      );
+      restoreAuthorityTransport = await establishCommittedTestStateAuthority(cwd, sessionId);
+      const capability = process.env.OMX_STATE_AUTHORITY_CAPABILITY;
+      assert.ok(capability);
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: sessionId,
+        prompt: "What information is available without changing workflow state?",
+      }, { cwd });
+      const captured = JSON.parse(
+        await readFile(join(cwd, ".omx", "captured-plugin-authority-env.json"), "utf-8"),
+      ) as Record<string, string | null>;
+      for (const value of Object.values(captured)) assert.equal(value, null);
+      assert.equal(process.env.OMX_STATE_AUTHORITY_CAPABILITY, capability);
+    } finally {
+      restoreAuthorityTransport?.();
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 });

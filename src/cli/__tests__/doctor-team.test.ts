@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
-import { delimiter, join, dirname } from 'path';
+import { delimiter, join, dirname, relative } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync, spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -9,14 +9,14 @@ import {
   initializeStateAuthority,
   rolloverStateAuthorityToAlternateRoot,
   mintStateAuthorityTransportCapability,
-  stateAuthorityTransportCapabilityForChild,
   type ResolvedStateAuthorityContext,
 } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 function runOmx(
   cwd: string,
   argv: string[],
-  envOverrides: Record<string, string> = {},
+  envOverrides: NodeJS.ProcessEnv = {},
 ): { status: number | null; stdout: string; stderr: string; error?: string } {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
@@ -54,20 +54,8 @@ function addDisposableWorktree(workspace: string, target: string): void {
   execFileSync('git', ['worktree', 'add', '--detach', target], { cwd: workspace, stdio: 'ignore' });
 }
 
-function authorityTransport(authority: ResolvedStateAuthorityContext): Record<string, string> {
-  const root = dirname(authority.generation.canonical_omx_root);
-  return {
-    OMX_STARTUP_CWD: authority.workspace_identity.canonical_path,
-    OMX_ROOT: root,
-    OMX_STATE_ROOT: root,
-    OMX_TEAM_STATE_ROOT: authority.canonical_state_root,
-    OMX_STATE_AUTHORITY_PATH: authority.authority_path,
-    OMX_STATE_AUTHORITY_ID: authority.generation.authority_id,
-    OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
-    OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: authority.workspace_identity.digest,
-    OMX_STATE_AUTHORITY_CAPABILITY: stateAuthorityTransportCapabilityForChild(authority),
-    OMX_SESSION_ID: authority.session_binding?.canonical_session_id ?? '',
-  };
+function authorityTransport(authority: ResolvedStateAuthorityContext): NodeJS.ProcessEnv {
+  return buildStateAuthorityTransportEnv(authority, {});
 }
 
 async function createAlternateAuthority(
@@ -75,20 +63,18 @@ async function createAlternateAuthority(
   alternateStateRoot: string,
   launchId: string,
 ): Promise<{
-  initial: ResolvedStateAuthorityContext;
   active: ResolvedStateAuthorityContext;
-  initialTransport: Record<string, string>;
-  activeTransport: Record<string, string>;
+  initialTransport: NodeJS.ProcessEnv;
+  activeTransport: NodeJS.ProcessEnv;
 }> {
   const initial = await initializeStateAuthority({
     startup_cwd: workspace,
-    observed_cwd: workspace,
     launch_id: `${launchId}-source`,
     session_binding: { canonical_session_id: `${launchId}-session` },
   });
   await mintStateAuthorityTransportCapability(initial);
   const initialTransport = authorityTransport(initial);
-  await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true });
+  await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true, mode: 0o700 });
   const active = await rolloverStateAuthorityToAlternateRoot({
     context: initial,
     proposed_state_root: alternateStateRoot,
@@ -98,7 +84,7 @@ async function createAlternateAuthority(
     issuer: TEST_AUTHORITY_ISSUER,
   });
   await mintStateAuthorityTransportCapability(active);
-  return { initial, active, initialTransport, activeTransport: authorityTransport(active) };
+  return { active, initialTransport, activeTransport: authorityTransport(active) };
 }
 function testPath(fakeBin: string): string {
   const inheritedPath = process.platform === 'win32'
@@ -138,6 +124,22 @@ describe('omx doctor --team', () => {
       const res = runOmx(wd, ['doctor', '--team'], { PATH: testPath(fakeBin) });
       assert.equal(res.status, 1, res.stderr || res.stdout);
       assert.match(res.stdout, /resume_blocker/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('reports malformed team state instead of falling back to an interactive default', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-team-malformed-'));
+    try {
+      const teamRoot = join(wd, '.omx', 'state', 'team', 'malformed');
+      await mkdir(teamRoot, { recursive: true });
+      await writeFile(join(teamRoot, 'config.json'), '{not-json');
+      const fakeBin = await createFakeTmuxBin(wd, '#!/bin/sh\nexit 0\n');
+
+      const result = runOmx(wd, ['doctor', '--team'], { PATH: testPath(fakeBin) });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(result.stdout, /team_config_unreadable: malformed config cannot be read or parsed/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -368,6 +370,21 @@ describe('omx doctor --team', () => {
     }
   });
 
+  it('fails closed when only a state-authority capability is inherited', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-team-capability-'));
+    try {
+      const fakeBin = await createFakeTmuxBin(wd, '#!/bin/sh\nexit 0\n');
+      const result = runOmx(wd, ['doctor', '--team'], {
+        OMX_STATE_AUTHORITY_CAPABILITY: 'forged-capability',
+        PATH: testPath(fakeBin),
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(result.stdout, /authority_generation_missing: cannot resolve inherited authority: inherited state-authority transport is incomplete/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('rejects inherited authority from a sibling linked worktree but uses the canonical alternate authority root from a nested cwd', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-doctor-team-authority-'));
     const workspace = join(root, 'workspace');
@@ -406,13 +423,16 @@ describe('omx doctor --team', () => {
       assert.equal(sibling.status, 1, sibling.stderr || sibling.stdout);
       assert.match(
         sibling.stdout,
-        /\[XX\] authority_observed_cwd_outside_workspace: cannot resolve inherited authority: inherited state-authority transport cannot be used from an unrelated workspace cwd/,
+        /\[XX\] authority_observed_cwd_outside_workspace: cannot resolve inherited authority: observed cwd is not compatible with the committed workspace authority for mutation/,
       );
       assert.doesNotMatch(sibling.stdout, /alternate-authority references missing tmux session/);
       assert.doesNotMatch(sibling.stdout, /cwd-decoy references missing tmux session/);
 
       const res = runOmx(nestedCwd, ['doctor', '--team'], {
         ...authorityTransport(active),
+        OMX_ROOT: relative(workspace, dirname(active.generation.canonical_omx_root)),
+        OMX_STATE_ROOT: relative(workspace, dirname(active.generation.canonical_omx_root)),
+        OMX_TEAM_STATE_ROOT: relative(workspace, active.canonical_state_root),
         PATH: testPath(fakeBin),
       });
       assert.equal(res.status, 1, res.stderr || res.stdout);
@@ -426,7 +446,7 @@ describe('omx doctor --team', () => {
     }
   });
 
-  it('fails closed for stale transport and conflicting inherited aliases from a nested authority workspace', async () => {
+  it('gives stale generation transport precedence over conflicting inherited aliases', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-doctor-team-authority-denial-'));
     const workspace = join(root, 'workspace');
     const nestedCwd = join(workspace, 'nested');
@@ -442,6 +462,7 @@ describe('omx doctor --team', () => {
       const fakeBin = await createFakeTmuxBin(root, '#!/bin/sh\nexit 0\n');
       const stale = runOmx(nestedCwd, ['doctor', '--team'], {
         ...initialTransport,
+        OMX_TEAM_STATE_ROOT: join(root, 'foreign-state'),
         PATH: testPath(fakeBin),
       });
       assert.equal(stale.status, 1, stale.stderr || stale.stdout);
@@ -449,6 +470,7 @@ describe('omx doctor --team', () => {
         stale.stdout,
         /\[XX\] authority_anchor_revision_conflict: cannot resolve inherited authority: inherited state-authority transport does not match the active anchor, generation, binding, fence, and filesystem-validated authority context/,
       );
+      assert.doesNotMatch(stale.stdout, /authority_workspace_mismatch/);
 
       const conflicting = runOmx(nestedCwd, ['doctor', '--team'], {
         ...activeTransport,
@@ -458,7 +480,7 @@ describe('omx doctor --team', () => {
       assert.equal(conflicting.status, 1, conflicting.stderr || conflicting.stdout);
       assert.match(
         conflicting.stdout,
-        /\[XX\] authority_workspace_mismatch: OMX_TEAM_STATE_ROOT conflicts with the persisted authority state root; remove the override and relaunch/,
+        /\[XX\] authority_workspace_mismatch: OMX_TEAM_STATE_ROOT candidate state root .* conflicts with persisted session authority root .*; restart through OMX from the candidate workspace to establish a new persisted session binding, or return to the persisted workspace\. In-place root rebinding is unsupported\./,
       );
     } finally {
       await rm(root, { recursive: true, force: true });

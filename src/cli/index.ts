@@ -7,8 +7,10 @@ import { execFileSync, spawn } from "child_process";
 import {
   basename,
   dirname,
+  isAbsolute,
   join,
   posix,
+  relative,
   resolve,
   win32,
 } from "path";
@@ -31,7 +33,7 @@ import {
   readFile,
   readdir,
   rm,
-  stat,
+
   symlink,
   utimes,
   writeFile,
@@ -96,11 +98,7 @@ import {
   CONFIG_FLAG,
   LONG_CONFIG_FLAG,
 } from "./constants.js";
-import {
-  getBaseStateDir,
-  getStateDir,
-  resolveCommittedAuthorityRuntimeStateScope,
-} from "../mcp/state-paths.js";
+import { resolveCommittedAuthorityRuntimeStateScope } from "../mcp/state-paths.js";
 import {
   evaluateRalphCompletionAuditEvidence,
   isRalphCompletePhase,
@@ -210,6 +208,7 @@ import {
   mintStateAuthorityTransportCapability,
   publishStateAuthorityLaunchTransport,
   resolveStateAuthority,
+  resolveStateAuthorityForGuard,
   rolloverStateAuthorityToAlternateRoot,
   validateCommittedStateAuthorityLaunchTransportJournal,
   validateCommittedStateAuthorityLaunchTransportPublication,
@@ -1354,14 +1353,7 @@ async function linkOrCopyCodexHomeEntry(
   }
 }
 
-async function copyFilePreservingTimestamps(
-  source: string,
-  destination: string,
-): Promise<void> {
-  await copyFile(source, destination);
-  const sourceStat = await stat(source);
-  await utimes(destination, sourceStat.atime, sourceStat.mtime);
-}
+
 
 function isCodexSqliteArtifact(entryName: string): boolean {
   return /^(?:state|logs)_\d+\.sqlite(?:-(?:shm|wal))?$/.test(entryName);
@@ -1410,19 +1402,200 @@ function uniqueJsonlLines(contents: string): string[] {
   return lines;
 }
 
+interface SafeHistoryEntry {
+  kind: "directory" | "file";
+  realpath: string;
+  atime: Date;
+  mtime: Date;
+}
+
+function isPathWithinRoot(candidatePath: string, rootPath: string): boolean {
+  const pathFromRoot = relative(rootPath, candidatePath);
+  return (
+    pathFromRoot === "" ||
+    (!pathFromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) &&
+      pathFromRoot !== ".." &&
+      !isAbsolute(pathFromRoot))
+  );
+}
+
+async function canonicalHistoryDirectory(
+  path: string,
+  label: string,
+): Promise<string> {
+  const before = await lstat(path);
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error(`${label} must be a regular directory: ${path}`);
+  }
+  const canonicalPath = realpathSync(path);
+  const after = await lstat(path);
+  if (
+    after.isSymbolicLink() ||
+    !after.isDirectory() ||
+    before.dev !== after.dev ||
+    before.ino !== after.ino
+  ) {
+    throw new Error(`${label} changed while it was being validated: ${path}`);
+  }
+  return canonicalPath;
+}
+
+async function assertHistoryDirectoryTreeSafe(
+  directory: string,
+  canonicalRoot: string,
+): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const entryPath = join(directory, entry.name);
+    const entryStat = await lstat(entryPath);
+    if (
+      entryStat.isSymbolicLink() ||
+      (!entryStat.isDirectory() && !entryStat.isFile())
+    ) {
+      throw new Error(`runtime history entry must not contain symlinks or special files: ${entryPath}`);
+    }
+    const canonicalEntry = realpathSync(entryPath);
+    if (!isPathWithinRoot(canonicalEntry, canonicalRoot)) {
+      throw new Error(`runtime history entry escapes its declared root: ${entryPath}`);
+    }
+    if (entryStat.isDirectory()) {
+      await assertHistoryDirectoryTreeSafe(entryPath, canonicalRoot);
+    }
+  }
+}
+
+async function assertHistorySourceSafe(
+  source: string,
+  sourceRoot: string,
+): Promise<SafeHistoryEntry> {
+  const canonicalSourceRoot = await canonicalHistoryDirectory(
+    sourceRoot,
+    "runtime history source root",
+  );
+  const before = await lstat(source);
+  if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) {
+    throw new Error(`runtime history source must be a regular file or directory: ${source}`);
+  }
+  const canonicalSource = realpathSync(source);
+  if (!isPathWithinRoot(canonicalSource, canonicalSourceRoot)) {
+    throw new Error(`runtime history source escapes its declared root: ${source}`);
+  }
+  if (before.isDirectory()) {
+    await assertHistoryDirectoryTreeSafe(canonicalSource, canonicalSourceRoot);
+  }
+  const after = await lstat(source);
+  if (
+    after.isSymbolicLink() ||
+    (!after.isDirectory() && !after.isFile()) ||
+    before.dev !== after.dev ||
+    before.ino !== after.ino
+  ) {
+    throw new Error(`runtime history source changed while it was being validated: ${source}`);
+  }
+  return {
+    kind: after.isDirectory() ? "directory" : "file",
+    realpath: canonicalSource,
+    atime: after.atime,
+    mtime: after.mtime,
+  };
+}
+
+async function assertHistoryDestinationSafe(
+  destination: string,
+  destinationRoot: string,
+): Promise<void> {
+  const canonicalDestinationRoot = await canonicalHistoryDirectory(
+    destinationRoot,
+    "runtime history destination root",
+  );
+  const canonicalDestinationParent = await canonicalHistoryDirectory(
+    dirname(destination),
+    "runtime history destination parent",
+  );
+  if (!isPathWithinRoot(canonicalDestinationParent, canonicalDestinationRoot)) {
+    throw new Error(`runtime history destination escapes its declared root: ${destination}`);
+  }
+  try {
+    const destinationStat = await lstat(destination);
+    if (
+      destinationStat.isSymbolicLink() ||
+      (!destinationStat.isDirectory() && !destinationStat.isFile())
+    ) {
+      throw new Error(`runtime history destination must not be a symlink or special file: ${destination}`);
+    }
+    const canonicalDestination = realpathSync(destination);
+    if (!isPathWithinRoot(canonicalDestination, canonicalDestinationRoot)) {
+      throw new Error(`runtime history destination escapes its declared root: ${destination}`);
+    }
+    if (destinationStat.isDirectory()) {
+      await assertHistoryDirectoryTreeSafe(
+        canonicalDestination,
+        canonicalDestinationRoot,
+      );
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+async function copyHistoryFilePreservingTimestamps(
+  source: string,
+  destination: string,
+  sourceRoot: string,
+  destinationRoot: string,
+): Promise<void> {
+  const sourceEntry = await assertHistorySourceSafe(source, sourceRoot);
+  if (sourceEntry.kind !== "file") {
+    throw new Error(`runtime history file source is not a regular file: ${source}`);
+  }
+  await assertHistoryDestinationSafe(destination, destinationRoot);
+  await copyFile(source, destination);
+  await utimes(destination, sourceEntry.atime, sourceEntry.mtime);
+}
+
+async function copyHistoryDirectory(
+  source: string,
+  destination: string,
+  sourceRoot: string,
+  destinationRoot: string,
+): Promise<void> {
+  const sourceEntry = await assertHistorySourceSafe(source, sourceRoot);
+  if (sourceEntry.kind !== "directory") {
+    throw new Error(`runtime history directory source is not a regular directory: ${source}`);
+  }
+  await assertHistoryDestinationSafe(destination, destinationRoot);
+  await cp(source, destination, {
+    recursive: true,
+    force: true,
+    dereference: false,
+    preserveTimestamps: true,
+  });
+}
+
 async function persistProjectLaunchRuntimeJsonlArtifact(
   source: string,
   destination: string,
+  sourceRoot: string,
+  destinationRoot: string,
 ): Promise<void> {
-  const existing = existsSync(destination)
-    ? await readFile(destination, "utf-8").catch(() => "")
-    : "";
+  const sourceEntry = await assertHistorySourceSafe(source, sourceRoot);
+  if (sourceEntry.kind !== "file") {
+    throw new Error(`runtime history JSONL source is not a regular file: ${source}`);
+  }
+  await assertHistoryDestinationSafe(destination, destinationRoot);
+  let existing = "";
+  try {
+    existing = await readFile(destination, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const sourceContents = await readFile(source, "utf-8");
   const separator =
     existing === "" || existing.endsWith("\n") || sourceContents === ""
       ? ""
       : "\n";
   const lines = uniqueJsonlLines(`${existing}${separator}${sourceContents}`);
+  await assertHistorySourceSafe(source, sourceRoot);
+  await assertHistoryDestinationSafe(destination, destinationRoot);
   await writeFile(
     destination,
     lines.length > 0 ? `${lines.join("\n")}\n` : "",
@@ -1441,25 +1614,38 @@ async function persistProjectLaunchRuntimeHistoryArtifacts(
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(runtimeCodexHome, entryName);
     if (!existsSync(source)) continue;
-    const sourceStat = await lstat(source);
-    if (sourceStat.isSymbolicLink()) continue;
     const destination = join(projectCodexHome, entryName);
-    if (sourceStat.isDirectory()) {
-      await cp(source, destination, {
-        recursive: true,
-        force: true,
-        preserveTimestamps: true,
-        verbatimSymlinks: true,
-      });
+    const sourceEntry = await assertHistorySourceSafe(source, runtimeCodexHome);
+    if (entryName === "sessions") {
+      if (sourceEntry.kind !== "directory") {
+        throw new Error(`runtime history sessions entry is not a regular directory: ${source}`);
+      }
+      await copyHistoryDirectory(
+        source,
+        destination,
+        runtimeCodexHome,
+        projectCodexHome,
+      );
       continue;
+    }
+    if (sourceEntry.kind !== "file") {
+      throw new Error(`runtime history artifact is not a regular file: ${source}`);
     }
     if (entryName === "history.jsonl" || entryName === "session_index.jsonl") {
-      await persistProjectLaunchRuntimeJsonlArtifact(source, destination);
+      await persistProjectLaunchRuntimeJsonlArtifact(
+        source,
+        destination,
+        runtimeCodexHome,
+        projectCodexHome,
+      );
       continue;
     }
-    if (sourceStat.isFile()) {
-      await copyFilePreservingTimestamps(source, destination);
-    }
+    await copyHistoryFilePreservingTimestamps(
+      source,
+      destination,
+      runtimeCodexHome,
+      projectCodexHome,
+    );
   }
 }
 
@@ -1477,7 +1663,33 @@ async function ensureProjectLaunchRuntimeHistoryLinks(
     } else if (!existsSync(projectEntry)) {
       await writeFile(projectEntry, "");
     }
-    await linkOrCopyCodexHomeEntry(projectEntry, runtimeEntry);
+    const sourceEntry = await assertHistorySourceSafe(
+      projectEntry,
+      projectCodexHome,
+    );
+    if (entryName === "sessions" && sourceEntry.kind !== "directory") {
+      throw new Error(`runtime history sessions entry is not a regular directory: ${projectEntry}`);
+    }
+    if (entryName !== "sessions" && sourceEntry.kind !== "file") {
+      throw new Error(`runtime history artifact is not a regular file: ${projectEntry}`);
+    }
+    await assertHistoryDestinationSafe(runtimeEntry, runtimeCodexHome);
+    if (sourceEntry.kind === "directory") {
+      await copyHistoryDirectory(
+        projectEntry,
+        runtimeEntry,
+        projectCodexHome,
+        runtimeCodexHome,
+      );
+    } else {
+      await copyHistoryFilePreservingTimestamps(
+        projectEntry,
+        runtimeEntry,
+        projectCodexHome,
+        runtimeCodexHome,
+      );
+    }
+
   }
 }
 
@@ -1488,19 +1700,30 @@ async function materializeProjectLaunchRuntimeHistoryEntries(
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
     if (!existsSync(source)) continue;
+    const sourceEntry = await assertHistorySourceSafe(source, sourceCodexHome);
     const destination = join(runtimeCodexHome, entryName);
     await rm(destination, { recursive: true, force: true });
-    const sourceStat = await lstat(source);
-    if (sourceStat.isDirectory()) {
-      await cp(source, destination, {
-        recursive: true,
-        force: true,
-        dereference: true,
-        preserveTimestamps: true,
-      });
+    if (entryName === "sessions") {
+      if (sourceEntry.kind !== "directory") {
+        throw new Error(`runtime history sessions entry is not a regular directory: ${source}`);
+      }
+      await copyHistoryDirectory(
+        source,
+        destination,
+        sourceCodexHome,
+        runtimeCodexHome,
+      );
       continue;
     }
-    await copyFilePreservingTimestamps(source, destination);
+    if (sourceEntry.kind !== "file") {
+      throw new Error(`runtime history artifact is not a regular file: ${source}`);
+    }
+    await copyHistoryFilePreservingTimestamps(
+      source,
+      destination,
+      sourceCodexHome,
+      runtimeCodexHome,
+    );
   }
 }
 
@@ -1512,47 +1735,59 @@ async function mergeProjectLaunchRuntimeHistoryEntries(
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
     if (!existsSync(source)) continue;
-    const sourceRealpath = realpathSync(source);
-    if (mergedHistorySourceRealpaths.has(sourceRealpath)) continue;
+    const sourceEntry = await assertHistorySourceSafe(source, sourceCodexHome);
+    if (mergedHistorySourceRealpaths.has(sourceEntry.realpath)) continue;
     const destination = join(runtimeCodexHome, entryName);
-    const sourceStat = await stat(source);
-    if (sourceStat.isDirectory()) {
+    if (entryName === "sessions") {
+      if (sourceEntry.kind !== "directory") {
+        throw new Error(`runtime history sessions entry is not a regular directory: ${source}`);
+      }
       await mkdir(destination, { recursive: true });
-      await cp(source, destination, {
-        recursive: true,
-        force: true,
-        dereference: true,
-        preserveTimestamps: true,
-      });
-      mergedHistorySourceRealpaths.add(sourceRealpath);
+      await copyHistoryDirectory(
+        source,
+        destination,
+        sourceCodexHome,
+        runtimeCodexHome,
+      );
+      mergedHistorySourceRealpaths.add(sourceEntry.realpath);
       continue;
     }
-    if (entryName === "sessions") continue;
-    if (!sourceStat.isFile()) continue;
+    if (sourceEntry.kind !== "file") {
+      throw new Error(`runtime history artifact is not a regular file: ${source}`);
+    }
     if (existsSync(destination)) {
-      const destinationStat = await stat(destination);
+      await assertHistoryDestinationSafe(destination, runtimeCodexHome);
+      const destinationStat = await lstat(destination);
       if (!destinationStat.isFile()) {
         await rm(destination, { recursive: true, force: true });
-        await copyFilePreservingTimestamps(source, destination);
-        mergedHistorySourceRealpaths.add(sourceRealpath);
+        await copyHistoryFilePreservingTimestamps(
+          source,
+          destination,
+          sourceCodexHome,
+          runtimeCodexHome,
+        );
+        mergedHistorySourceRealpaths.add(sourceEntry.realpath);
         continue;
       }
-      const existing = await readFile(destination, "utf-8").catch(() => "");
+      const existing = await readFile(destination, "utf-8");
       const addition = await readFile(source, "utf-8");
       const separator =
         existing === "" || existing.endsWith("\n") || addition === ""
           ? ""
           : "\n";
-      await writeFile(
-        destination,
-        `${existing}${separator}${addition}`,
-        "utf-8",
-      );
-      mergedHistorySourceRealpaths.add(sourceRealpath);
+      await assertHistorySourceSafe(source, sourceCodexHome);
+      await assertHistoryDestinationSafe(destination, runtimeCodexHome);
+      await writeFile(destination, `${existing}${separator}${addition}`, "utf-8");
+      mergedHistorySourceRealpaths.add(sourceEntry.realpath);
       continue;
     }
-    await copyFilePreservingTimestamps(source, destination);
-    mergedHistorySourceRealpaths.add(sourceRealpath);
+    await copyHistoryFilePreservingTimestamps(
+      source,
+      destination,
+      sourceCodexHome,
+      runtimeCodexHome,
+    );
+    mergedHistorySourceRealpaths.add(sourceEntry.realpath);
   }
 }
 
@@ -1618,6 +1853,18 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
     if (PROJECT_LAUNCH_RUNTIME_SKIPPED_ENTRY_NAMES.has(entry.name)) continue;
     const source = join(projectCodexHome, entry.name);
     const destination = join(runtimeCodexHome, entry.name);
+    if (PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES.has(entry.name)) {
+      const sourceEntry = await assertHistorySourceSafe(source, projectCodexHome);
+      if (entry.name === "sessions" && sourceEntry.kind !== "directory") {
+        throw new Error(`runtime history sessions entry is not a regular directory: ${source}`);
+      }
+      if (entry.name !== "sessions" && sourceEntry.kind !== "file") {
+        throw new Error(`runtime history artifact is not a regular file: ${source}`);
+      }
+      await assertHistoryDestinationSafe(destination, runtimeCodexHome);
+      continue;
+    }
+
     if (entry.name === "config.toml") {
       const projectHooksPath = join(projectCodexHome, "hooks.json");
       const projectConfig = await readFile(source, "utf-8");
@@ -1644,8 +1891,13 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
     const mergedHistorySourceRealpaths = new Set<string>();
     for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
       const source = join(projectCodexHome, entryName);
-      if (existsSync(source))
-        mergedHistorySourceRealpaths.add(realpathSync(source));
+      if (existsSync(source)) {
+        const sourceEntry = await assertHistorySourceSafe(
+          source,
+          projectCodexHome,
+        );
+        mergedHistorySourceRealpaths.add(sourceEntry.realpath);
+      }
     }
     await materializeProjectLaunchRuntimeHistoryEntries(
       runtimeCodexHome,
@@ -2682,15 +2934,6 @@ function resolveLaunchPath(cwd: string, raw: string): string {
   return isCrossPlatformAbsolutePath(raw) ? raw : join(cwd, raw);
 }
 
-function resolveHudRuntimeRootSource(
-  omxRootOverride: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): HudRuntimeRootSource {
-  if (env.OMX_TEAM_STATE_ROOT?.trim()) return "team-env";
-  if (env.OMX_ROOT?.trim() || omxRootOverride) return "omx-root-env";
-  if (env.OMX_STATE_ROOT?.trim()) return "omx-state-root-env";
-  return "cwd-default";
-}
 
 export function resolveHudRuntimeRootForLaunch(
   cwd: string,
@@ -2852,7 +3095,6 @@ export function shouldAutoIsolateMadmaxLaunch(
   if (command !== "launch" && command !== "exec") return false;
   if (env.OMX_NO_BOX === "1") return false;
   if (!launchArgsRequestMadmaxIsolation(launchArgs)) return false;
-  if (madmaxInheritedContextMatchesLaunch(cwd, launchArgs, env)) return false;
   if (madmaxInheritedContextMatchesLaunch(cwd, launchArgs, env)) return false;
   return true;
 }
@@ -3308,6 +3550,13 @@ class MadmaxDetachedGuardError extends Error {
 class DetachedLaunchPublicationError extends Error {
   readonly failClosed = true;
 }
+
+class DetachedLaunchRollbackError extends Error {
+  readonly failClosed = true;
+}
+
+class VerifiedDetachedLaunchRollbackError extends Error {}
+
 
 function allocateMadmaxIsolatedRoot(env: NodeJS.ProcessEnv): string {
   const runsRoot = resolveMadmaxRunsRoot(env);
@@ -4075,7 +4324,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
     authority,
     lifecycle: {
       prepareCodexHomeForLaunch,
-      preLaunch: (
+      preLaunch: async (
         launchPath,
         hotswapSessionId,
         notifyTempContract,
@@ -4083,8 +4332,8 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
         enableAuthority,
         _worktreeDirty,
         hotswapAuthority,
-      ) =>
-        preLaunch(
+      ) => {
+        await preLaunch(
           launchPath,
           hotswapSessionId,
           notifyTempContract as NotifyTempContract,
@@ -4092,7 +4341,8 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
           enableAuthority,
           worktreeDirty,
           hotswapAuthority,
-        ),
+        );
+      },
       postLaunch,
       cleanupRuntimeCodexHome,
       normalizeCodexLaunchArgs,
@@ -4107,8 +4357,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
 export async function launchWithHud(args: string[]): Promise<void> {
   const launchCwd = process.cwd();
   let sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const inheritedLaunchAuthority = await resolveInheritedStateAuthorityForLaunch(launchCwd);
-  removeProcessLocalStateAuthorityBearer();
+
 
   if (isNativeWindows()) {
     const { result } = spawnPlatformCommandSync("tmux", ["-V"], {
@@ -4194,6 +4443,13 @@ export async function launchWithHud(args: string[]): Promise<void> {
   clearInheritedMadmaxRootForDisposableWorktreeLaunch(
     parsedWorktree.remainingArgs,
   );
+  const inheritedLaunchAuthority = ensuredLaunchWorktree?.enabled
+    ? undefined
+    : await resolveInheritedStateAuthorityForLaunch(cwd);
+  removeProcessLocalStateAuthorityBearer();
+  if (ensuredLaunchWorktree?.enabled) {
+    process.env.OMX_STARTUP_CWD = cwd;
+  }
   let authority = await establishOrReuseLaunchAuthority(cwd, sessionId, inheritedLaunchAuthority);
   sessionId = authority.session_binding?.canonical_session_id ?? sessionId;
   authority = await activateMadmaxIsolationIfNeeded(
@@ -4271,15 +4527,15 @@ export async function launchWithHud(args: string[]): Promise<void> {
     preparedCodexHome.projectLocalCodexHomeForCleanup;
 
   // ── Phase 1: preLaunch ──────────────────────────────────────────────────
-  await preLaunch(
-    cwd,
-    sessionId,
-    notifyTempResult.contract,
-    codexHomeOverride,
-    enableNotifyFallbackAuthority,
-    worktreeDirty,
-    authority,
-  );
+authority = await preLaunch(
+  cwd,
+  sessionId,
+  notifyTempResult.contract,
+  codexHomeOverride,
+  enableNotifyFallbackAuthority,
+  worktreeDirty,
+  authority,
+);
 
   // ── Phase 2: run ────────────────────────────────────────────────────────
   let postLaunchHandledExternally = false;
@@ -4305,17 +4561,15 @@ export async function launchWithHud(args: string[]): Promise<void> {
   } finally {
     // ── Phase 3: postLaunch ─────────────────────────────────────────────
     if (!postLaunchHandledExternally) {
-      await postLaunch(
+      await runPostLaunchCleanup(
         cwd,
         sessionId,
         codexHomeOverride,
         enableNotifyFallbackAuthority,
         projectLocalCodexHomeForCleanup,
-      );
-      await cleanupRuntimeCodexHome(
         preparedCodexHome.runtimeCodexHomeForCleanup,
-        projectLocalCodexHomeForCleanup,
-      ).catch(logCliOperationFailure);
+      );
+
     }
   }
 }
@@ -4416,15 +4670,15 @@ export async function execWithOverlay(args: string[]): Promise<void> {
   const projectLocalCodexHomeForCleanup =
     preparedCodexHome.projectLocalCodexHomeForCleanup;
 
-  await preLaunch(
-    cwd,
-    sessionId,
-    notifyTempResult.contract,
-    codexHomeOverride,
-    true,
-    worktreeDirty,
-    authority,
-  );
+authority = await preLaunch(
+  cwd,
+  sessionId,
+  notifyTempResult.contract,
+  codexHomeOverride,
+  true,
+  worktreeDirty,
+  authority,
+);
 
   try {
     const notifyTempContractRaw = notifyTempResult.contract.active
@@ -4453,17 +4707,15 @@ export async function execWithOverlay(args: string[]): Promise<void> {
       : codexEnvBase;
     runCodexBlocking(cwd, codexArgs, codexEnv);
   } finally {
-    await postLaunch(
+    await runPostLaunchCleanup(
       cwd,
       sessionId,
       codexHomeOverride,
       true,
       projectLocalCodexHomeForCleanup,
-    );
-    await cleanupRuntimeCodexHome(
       preparedCodexHome.runtimeCodexHomeForCleanup,
-      projectLocalCodexHomeForCleanup,
-    ).catch(logCliOperationFailure);
+    );
+
   }
 }
 
@@ -5222,8 +5474,19 @@ function buildDetachedSessionLeaderCommand(
   environmentImports: readonly DetachedTmuxEnvironmentImport[] = [],
 ): string {
   const detachedPostLaunchHelper = sessionId
-    ? `${buildDetachedSessionPostLaunchHelperCommand(cwd, sessionId, codexHomeOverride, projectLocalCodexHomeForCleanup, runtimeCodexHomeForCleanup)} >/dev/null 2>&1 || true;`
+    ? [
+        buildDetachedSessionPostLaunchHelperCommand(
+          cwd,
+          sessionId,
+          codexHomeOverride,
+          projectLocalCodexHomeForCleanup,
+          runtimeCodexHomeForCleanup,
+        ),
+        'omx_post_launch_status=$?;',
+        'if [ "$status" -eq 0 ] && [ "$omx_post_launch_status" -ne 0 ]; then status="$omx_post_launch_status"; fi;',
+      ].join(" ")
     : "";
+
   const environmentManifest = detachedTmuxEnvironmentImportManifest(
     environmentImports,
   );
@@ -5285,8 +5548,11 @@ function buildDetachedSessionLeaderCommand(
     buildTmuxExtendedKeysReleaseShellSnippet(cwd),
     detachedPostLaunchHelper,
     'if [ "$status" -eq 0 ]; then',
-    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
+    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}";`,
+    'omx_tmux_cleanup_status=$?;',
+    'if [ "$omx_tmux_cleanup_status" -ne 0 ]; then status="$omx_tmux_cleanup_status"; fi;',
     "fi;",
+
     "exit $status;",
     "};",
     "trap omx_detached_session_cleanup 0 INT TERM HUP;",
@@ -5630,6 +5896,138 @@ function restoreDetachedTmuxSessionEnvironment(
 
 const DETACHED_TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS = 5_000;
 
+type DetachedTmuxSessionPresence = "present" | "absent" | "unknown";
+type DetachedTmuxWatchdogTermination =
+  | "terminated"
+  | "quarantined"
+  | "unverified";
+
+interface DetachedTmuxOneShotImportWatchdogDiagnostic {
+  version: 1;
+  event: "detached_tmux_one_shot_import_restore_failed";
+  occurred_at: string;
+  session_name_digest: string;
+  ready_channel_digest: string;
+  restore_error_digest: string;
+  termination: DetachedTmuxWatchdogTermination;
+}
+
+interface DetachedTmuxOneShotImportWatchdogDependencies {
+  capture?: (
+    sessionName: string,
+    environmentNames: string[],
+  ) => DetachedTmuxEnvironmentSnapshot;
+  signalReady?: (readyChannel: string) => void;
+  restore?: (
+    sessionName: string,
+    snapshot: DetachedTmuxEnvironmentSnapshot,
+  ) => void;
+  terminate?: (
+    sessionName: string,
+    snapshot: DetachedTmuxEnvironmentSnapshot,
+  ) => DetachedTmuxWatchdogTermination;
+  report?: (
+    diagnosticsPath: string | undefined,
+    diagnostic: DetachedTmuxOneShotImportWatchdogDiagnostic,
+  ) => void;
+  schedule?: (callback: () => void, timeoutMs: number) => void;
+}
+
+function detachedTmuxErrorDigest(error: unknown): string {
+  return createHash("sha256")
+    .update(error instanceof Error ? error.message : String(error))
+    .digest("hex");
+}
+
+function inspectDetachedTmuxSessionPresence(
+  sessionName: string,
+): DetachedTmuxSessionPresence {
+  try {
+    execTmuxFileSync(["has-session", "-t", sessionName], {
+      encoding: "utf-8",
+      stdio: "pipe",
+    });
+    return "present";
+  } catch (error) {
+    const detail = tmuxFailureMessage(error);
+    return /can't find session|session not found|no server running|no such file or directory/i.test(
+      detail,
+    )
+      ? "absent"
+      : "unknown";
+  }
+}
+
+function terminateOrQuarantineDetachedTmuxSession(
+  sessionName: string,
+  snapshot: DetachedTmuxEnvironmentSnapshot,
+): DetachedTmuxWatchdogTermination {
+  try {
+    execTmuxFileSync(["kill-session", "-t", sessionName], { stdio: "pipe" });
+  } catch {
+    // The presence check below distinguishes a session that is already gone
+    // from a session that could not be terminated.
+  }
+  if (inspectDetachedTmuxSessionPresence(sessionName) === "absent") {
+    return "terminated";
+  }
+
+  try {
+    restoreDetachedTmuxSessionEnvironment(sessionName, snapshot);
+  } catch {
+    return "unverified";
+  }
+  try {
+    execTmuxFileSync(
+      [
+        "set-option",
+        "-t",
+        sessionName,
+        "@omx_detached_watchdog_quarantine",
+        "environment-restore-failed",
+      ],
+      { stdio: "pipe" },
+    );
+    return "quarantined";
+  } catch {
+    return "unverified";
+  }
+}
+
+function reportDetachedTmuxOneShotImportWatchdogFailure(
+  diagnosticsPath: string | undefined,
+  diagnostic: DetachedTmuxOneShotImportWatchdogDiagnostic,
+): void {
+  if (diagnosticsPath) {
+    try {
+      mkdirSync(dirname(diagnosticsPath), { recursive: true, mode: 0o700 });
+      writeFileSync(diagnosticsPath, `${JSON.stringify(diagnostic)}\n`, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+    } catch (error) {
+      process.stderr.write(
+        `[omx] detached tmux watchdog could not persist restoration diagnostics (error digest=${detachedTmuxErrorDigest(error)}).\n`,
+      );
+    }
+  }
+  process.stderr.write(
+    `[omx] detached tmux watchdog ${diagnostic.termination} the affected session after environment restoration failed${diagnosticsPath ? `; diagnostics: ${diagnosticsPath}` : ""}.\n`,
+  );
+}
+
+function detachedTmuxWatchdogDiagnosticsPath(
+  authority: ImmutableResolvedStateAuthorityContext,
+  sessionId: string,
+): string {
+  const sessionDigest = createHash("sha256").update(sessionId).digest("hex");
+  return join(
+    authority.canonical_state_root,
+    "diagnostics",
+    `detached-tmux-watchdog-${sessionDigest}.json`,
+  );
+}
+
 /**
  * First-party crash guardian for a detached leader's one-shot tmux import.
  * The pre-import snapshot exists only in this process and is replayed after a
@@ -5640,15 +6038,42 @@ export function restoreDetachedTmuxOneShotImportEnvironmentAfterDelay(
   environmentNames: string[],
   readyChannel: string,
   timeoutMs: number = DETACHED_TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS,
+  diagnosticsPath?: string,
+  dependencies: DetachedTmuxOneShotImportWatchdogDependencies = {},
 ): void {
-  const snapshot = captureDetachedTmuxSessionEnvironment(sessionName, environmentNames);
-  execTmuxFileSync(["wait-for", "-S", readyChannel], { stdio: "pipe" });
-  setTimeout(() => {
+  const capture = dependencies.capture ?? captureDetachedTmuxSessionEnvironment;
+  const signalReady =
+    dependencies.signalReady ??
+    ((channel: string) => {
+      execTmuxFileSync(["wait-for", "-S", channel], { stdio: "pipe" });
+    });
+  const restore = dependencies.restore ?? restoreDetachedTmuxSessionEnvironment;
+  const terminate =
+    dependencies.terminate ?? terminateOrQuarantineDetachedTmuxSession;
+  const report =
+    dependencies.report ?? reportDetachedTmuxOneShotImportWatchdogFailure;
+  const schedule = dependencies.schedule ?? setTimeout;
+  const snapshot = capture(sessionName, environmentNames);
+  signalReady(readyChannel);
+  schedule(() => {
     try {
-      restoreDetachedTmuxSessionEnvironment(sessionName, snapshot);
-    } catch {
-      // The initiating process reports immediate failures. This bounded guard
-      // must not retry indefinitely after a crashed launcher.
+      restore(sessionName, snapshot);
+    } catch (error) {
+      let termination: DetachedTmuxWatchdogTermination = "unverified";
+      try {
+        termination = terminate(sessionName, snapshot);
+      } catch {
+        // Report the restoration failure even when termination itself fails.
+      }
+      report(diagnosticsPath, {
+        version: 1,
+        event: "detached_tmux_one_shot_import_restore_failed",
+        occurred_at: new Date().toISOString(),
+        session_name_digest: createHash("sha256").update(sessionName).digest("hex"),
+        ready_channel_digest: createHash("sha256").update(readyChannel).digest("hex"),
+        restore_error_digest: detachedTmuxErrorDigest(error),
+        termination,
+      });
     }
   }, timeoutMs);
 }
@@ -5679,12 +6104,16 @@ export function restoreDetachedTmuxOneShotImportManifestEnvironmentAfterDelay(
   sourceCount: number,
   readyChannel: string,
   timeoutMs: number = DETACHED_TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS,
+  diagnosticsPath?: string,
+  dependencies: DetachedTmuxOneShotImportWatchdogDependencies = {},
 ): void {
   restoreDetachedTmuxOneShotImportEnvironmentAfterDelay(
     sessionName,
     detachedTmuxOneShotImportEnvironmentNames(manifestName, sourceCount),
     readyChannel,
     timeoutMs,
+    diagnosticsPath,
+    dependencies,
   );
 }
 
@@ -5692,10 +6121,11 @@ function buildDetachedTmuxOneShotImportWatchdogCommand(
   sessionName: string,
   manifest: DetachedTmuxEnvironmentImportManifest,
   readyChannel: string,
+  diagnosticsPath: string,
 ): string {
   const script = [
     `const mod = await import(${JSON.stringify(import.meta.url)});`,
-    `mod.restoreDetachedTmuxOneShotImportManifestEnvironmentAfterDelay(${JSON.stringify(sessionName)}, ${JSON.stringify(manifest.manifestName)}, ${manifest.sourceCount}, ${JSON.stringify(readyChannel)});`,
+    `mod.restoreDetachedTmuxOneShotImportManifestEnvironmentAfterDelay(${JSON.stringify(sessionName)}, ${JSON.stringify(manifest.manifestName)}, ${manifest.sourceCount}, ${JSON.stringify(readyChannel)}, undefined, ${JSON.stringify(diagnosticsPath)});`,
   ].join(" ");
   return `${quoteShellArg(process.execPath)} --input-type=module -e ${quoteShellArg(script)}`;
 }
@@ -5705,6 +6135,7 @@ function configureDetachedTmuxSessionEnvironment(
   sessionId: string,
   environmentImports: readonly DetachedTmuxEnvironmentImport[],
   env: NodeJS.ProcessEnv,
+  diagnosticsPath: string,
 ): () => void {
   const manifest = detachedTmuxEnvironmentImportManifest(environmentImports);
   const environmentNames = manifest
@@ -5756,6 +6187,7 @@ function configureDetachedTmuxSessionEnvironment(
           sessionName,
           manifest,
           readyChannel,
+          diagnosticsPath,
         ),
       ], { stdio: "pipe" });
       execTmuxFileSync(["wait-for", readyChannel], {
@@ -5768,16 +6200,17 @@ function configureDetachedTmuxSessionEnvironment(
     try {
       restoreDetachedTmuxSessionEnvironment(sessionName, snapshot);
     } catch (restoreError) {
-      throw new Error(
+      throw new DetachedLaunchPublicationError(
         "failed to configure and restore detached tmux one-shot environment",
         {
           cause: restoreError,
         },
       );
     }
-    throw new Error("failed to configure detached tmux one-shot environment", {
-      cause: error,
-    });
+    throw new DetachedLaunchPublicationError(
+      "failed to configure detached tmux one-shot environment",
+      { cause: error },
+    );
   }
   return () => restoreDetachedTmuxSessionEnvironment(sessionName, snapshot);
 }
@@ -5906,7 +6339,7 @@ export function buildDetachedSessionBootstrapSteps(
   sessionId?: string,
   projectLocalCodexHomeForCleanup?: string,
   runtimeCodexHomeForCleanup?: string,
-  omxRootOverride?: string,
+  _omxRootOverride?: string,
   env: NodeJS.ProcessEnv = process.env,
   sqliteHomeOverride?: string,
   inheritedWorkerModel?: string | null,
@@ -5915,31 +6348,18 @@ export function buildDetachedSessionBootstrapSteps(
   tmuxEnvironmentImports?: readonly DetachedTmuxEnvironmentImport[],
   waitForChannel?: string,
 ): DetachedSessionTmuxStep[] {
+  if (!authority) {
+    throw new DetachedLaunchPublicationError(
+      "mutation-capable detached bootstrap requires authenticated state-authority transport.",
+    );
+  }
   const leaderWaitChannel = nativeWindows
     ? undefined
     : (waitForChannel ??
       buildDetachedLeaderWaitChannel(sessionName, sessionId));
-  const resolvedEnvStateRoot = env.OMX_STATE_ROOT?.trim()
-    ? resolveLaunchPath(cwd, env.OMX_STATE_ROOT.trim())
-    : undefined;
-  const hasExplicitRootOverride = Boolean(
-    env.OMX_ROOT?.trim() ||
-      (omxRootOverride && omxRootOverride !== resolvedEnvStateRoot),
-  );
-  const hudRuntimeRoot = env.OMX_TEAM_STATE_ROOT?.trim()
-    ? resolveHudRuntimeRootForLaunch(cwd, env)
-    : hasExplicitRootOverride
-      ? {
-          omxRoot: omxRootOverride,
-          rootSource: resolveHudRuntimeRootSource(omxRootOverride, env),
-        }
-      : resolveHudRuntimeRootForLaunch(cwd, env);
   const hudRuntimeEnv = {
-    ...buildHudRuntimeEnv({
-      sessionId,
-      ...hudRuntimeRoot,
-    }).env,
-    ...(authority ? buildStateAuthorityTransportEnv(authority, {}) : {}),
+    ...buildHudRuntimeEnv({ sessionId }).env,
+    ...buildStateAuthorityTransportEnv(authority, {}),
   };
   const tmuxEnvironmentNames = [
     ...new Set(
@@ -6179,6 +6599,33 @@ export function buildDetachedSessionRollbackSteps(
   return steps;
 }
 
+function rollbackDetachedTmuxSessionAndVerify(
+  sessionName: string,
+  hookTarget: string | null,
+  hookName: string | null,
+  clientAttachedHookName: string | null,
+): void {
+  const failedSteps: string[] = [];
+  for (const rollbackStep of buildDetachedSessionRollbackSteps(
+    sessionName,
+    hookTarget,
+    hookName,
+    clientAttachedHookName,
+  )) {
+    try {
+      execTmuxFileSync(rollbackStep.args, { stdio: "pipe" });
+    } catch {
+      failedSteps.push(rollbackStep.name);
+    }
+  }
+  const presence = inspectDetachedTmuxSessionPresence(sessionName);
+  if (failedSteps.length > 0 || presence !== "absent") {
+    throw new DetachedLaunchRollbackError(
+      `detached tmux rollback was not verified (failed steps: ${failedSteps.join(",") || "none"}; session presence: ${presence}).`,
+    );
+  }
+}
+
 export function buildNotifyTempStartupMessages(
   contract: NotifyTempContract,
   hasValidProviders: boolean,
@@ -6209,8 +6656,10 @@ export function buildNotifyFallbackWatcherEnv(
   } = {},
 ): NodeJS.ProcessEnv {
   const nextEnv = { ...env };
+  removeProcessLocalStateAuthorityBearer(nextEnv);
   delete nextEnv.TMUX;
   delete nextEnv.TMUX_PANE;
+
   return {
     ...nextEnv,
     ...(options.codexHomeOverride
@@ -6254,10 +6703,11 @@ interface PostLaunchCleanupDependencies {
 interface PostLaunchModeCleanupDependencies {
   readdir?: typeof import("fs/promises").readdir;
   readFile?: typeof import("fs/promises").readFile;
-  writeFile?: typeof import("fs/promises").writeFile;
+  writeFile?: (path: string, data: string) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
   writeWarn?: (line: string) => void;
   now?: () => Date;
+  authority?: ResolvedStateAuthorityContext;
 }
 
 type PostLaunchModeStateReadResult =
@@ -6393,7 +6843,7 @@ async function scrubPostLaunchRootSkillActiveForSession(
   stateDir: string,
   sessionId: string,
   nowIso: string,
-  writeFileFn: typeof import("fs/promises").writeFile,
+  writeFileFn: (path: string, data: string) => Promise<void>,
   rootStateBeforeCleanup?: SkillActiveStateLike | null,
 ): Promise<void> {
   const normalizedSessionId = cleanPostLaunchString(sessionId);
@@ -6496,14 +6946,24 @@ export async function cleanupPostLaunchModeStateFiles(
   dependencies: PostLaunchModeCleanupDependencies = {},
 ): Promise<void> {
   const readdir = dependencies.readdir ?? (await import("fs/promises")).readdir;
-  const writeFile =
-    dependencies.writeFile ?? (await import("fs/promises")).writeFile;
   const writeWarn = dependencies.writeWarn ?? console.warn;
   const now = dependencies.now ?? (() => new Date());
+  const failures: unknown[] = [];
+  const authority = dependencies.authority ?? await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId || undefined,
+  });
+  const writeFile = dependencies.writeFile ?? (async (path: string, data: string) => {
+    await atomicWriteAuthorityFile(path, data, {
+      authority_root: authority.canonical_state_root,
+      expected_root_identity: authority.generation.root_identity,
+    });
+  });
+  const rootStateDir = authority.canonical_state_root;
   const scopedDirs = sessionId
-    ? [getStateDir(cwd, sessionId)]
-    : [getBaseStateDir(cwd)];
-  const rootStateDir = getBaseStateDir(cwd);
+    ? [join(rootStateDir, "sessions", sessionId)]
+    : [rootStateDir];
   const rootSkillActiveStateBeforeCleanup = sessionId
     ? await readSkillActiveState(
         getSkillActiveStatePathsForStateDir(rootStateDir).rootPath,
@@ -6512,7 +6972,10 @@ export async function cleanupPostLaunchModeStateFiles(
   let preserveSkillActiveForReviewPendingAutopilot = false;
 
   for (const stateDir of scopedDirs) {
-    const files = await readdir(stateDir).catch(() => [] as string[]);
+    const files = await readdir(stateDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
     const autopilotPath = join(stateDir, "autopilot-state.json");
     const autopilotPrecheck = files.includes("autopilot-state.json")
       ? await readPostLaunchModeStateFile(autopilotPath, dependencies)
@@ -6550,22 +7013,25 @@ export async function cleanupPostLaunchModeStateFiles(
                 active: false,
                 currentPhase: "cancelled",
                 sessionId:
-                  stateDir === getStateDir(cwd, sessionId)
+                  stateDir === join(rootStateDir, "sessions", sessionId)
                     ? sessionId
                     : undefined,
                 nowIso: completedAt,
                 source: "postLaunchCleanup",
+                expectedRootIdentity: authority.generation.root_identity,
               });
             }
           } catch (err) {
             writeWarn(
               `[omx] postLaunch: failed to recover mode state ${path}: ${err instanceof Error ? err.message : err}`,
             );
+            failures.push(err);
           }
         } else if (result.kind === "malformed") {
           writeWarn(
             `[omx] postLaunch: skipped malformed mode state ${path}: ${result.message}`,
           );
+          failures.push(new Error(`malformed mode state ${path}: ${result.message}`));
         }
         continue;
       }
@@ -6603,11 +7069,12 @@ export async function cleanupPostLaunchModeStateFiles(
               active: false,
               currentPhase: "cancelled",
               sessionId:
-                stateDir === getStateDir(cwd, sessionId)
+                stateDir === join(rootStateDir, "sessions", sessionId)
                   ? sessionId
                   : undefined,
               nowIso: completedAt,
               source: "postLaunchCleanup",
+              expectedRootIdentity: authority.generation.root_identity,
             });
           }
         }
@@ -6651,15 +7118,17 @@ export async function cleanupPostLaunchModeStateFiles(
             active: false,
             currentPhase: "cancelled",
             sessionId:
-              stateDir === getStateDir(cwd, sessionId) ? sessionId : undefined,
+              stateDir === join(rootStateDir, "sessions", sessionId) ? sessionId : undefined,
             nowIso: completedAt,
             source: "postLaunchCleanup",
+            expectedRootIdentity: authority.generation.root_identity,
           });
         }
       } catch (err) {
         writeWarn(
           `[omx] postLaunch: failed to update mode state ${path}: ${err instanceof Error ? err.message : err}`,
         );
+        failures.push(err);
       }
     }
   }
@@ -6679,7 +7148,11 @@ export async function cleanupPostLaunchModeStateFiles(
       writeWarn(
         `[omx] postLaunch: failed to reconcile root skill-active state: ${err instanceof Error ? err.message : err}`,
       );
+      failures.push(err);
     }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "postLaunch mode cleanup failed");
   }
 }
 
@@ -6836,14 +7309,13 @@ export async function preLaunch(
   enableNotifyFallbackAuthority: boolean = false,
   worktreeDirty: boolean = false,
   authority?: ImmutableResolvedStateAuthorityContext,
-): Promise<void> {
+): Promise<ImmutableResolvedStateAuthorityContext> {
   const committedAuthority = await resolveCommittedPreLaunchAuthority(
     authority,
     sessionId,
     cwd,
   );
   await publishPreLaunchAuthorityBarrier(committedAuthority, sessionId);
-  publishStateAuthorityTransport(committedAuthority);
 
   // 1. Best-effort launch-safe orphan cleanup
   try {
@@ -6865,6 +7337,13 @@ export async function preLaunch(
 
   // 2. Establish the canonical pointer before any session-scoped launch artifact.
   await writeSessionStart(cwd, sessionId, await resolvePreLaunchSessionPointerOptions());
+  const refreshedAuthority = await refreshStateAuthorityTransportForLaunch(
+    committedAuthority,
+    sessionId,
+    cwd,
+  );
+  await publishPreLaunchAuthorityBarrier(refreshedAuthority, sessionId);
+  publishStateAuthorityTransport(refreshedAuthority);
 
   // 3. Generate runtime overlay + write session-scoped model instructions file
   const orchestrationMode = await resolveSessionOrchestrationMode(
@@ -6955,6 +7434,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
     logCliOperationFailure(err);
     // Non-fatal
   }
+  return refreshedAuthority;
 }
 
 /**
@@ -7265,13 +7745,14 @@ async function runCodex(
         : null;
 
       let createdDetachedSession = false;
+      let detachedSessionCreationAttempted = false;
       let detachedSessionEnvironmentConfigured = false;
       let restoreDetachedSessionEnvironment: (() => void) | null = null;
       let registeredHookTarget: string | null = null;
       let registeredHookName: string | null = null;
       let registeredClientAttachedHookName: string | null = null;
       let detachedLeaderPaneId: string | null = null;
-      let leaderPublicationSignaled = false;
+      let detachedLeaderReleaseSignaled = false;
       const environmentForDetachedSession = detachedTmuxEnvironment;
       if (!environmentForDetachedSession) {
         throw new DetachedLaunchPublicationError(
@@ -7307,6 +7788,9 @@ async function runCodex(
           leaderWaitChannel,
         );
         for (const step of bootstrapSteps) {
+          if (step.name === "new-session") {
+            detachedSessionCreationAttempted = true;
+          }
           const output = execTmuxFileSync(step.args, {
             stdio: "pipe",
             encoding: "utf-8",
@@ -7430,11 +7914,13 @@ async function runCodex(
                   sessionId,
                   environmentImportsForDetachedSession,
                   environmentForDetachedSession,
+                  detachedTmuxWatchdogDiagnosticsPath(launchAuthority, sessionId),
                 );
               detachedSessionEnvironmentConfigured = true;
               execTmuxFileSync(["wait-for", "-S", leaderWaitChannel], {
                 stdio: "pipe",
               });
+              detachedLeaderReleaseSignaled = true;
               execTmuxFileSync(
                 [
                   "wait-for",
@@ -7446,12 +7932,18 @@ async function runCodex(
                 { stdio: "pipe", timeout: 30_000 },
               );
             }
-            leaderPublicationSignaled = true;
           }
 
           if (step.name === "split-and-capture-hud-pane") {
             if (detachedSessionEnvironmentConfigured) {
-              restoreDetachedSessionEnvironment?.();
+              try {
+                restoreDetachedSessionEnvironment?.();
+              } catch (error) {
+                throw new DetachedLaunchPublicationError(
+                  "detached tmux environment restoration failed after leader release.",
+                  { cause: error },
+                );
+              }
               restoreDetachedSessionEnvironment = null;
               detachedSessionEnvironmentConfigured = false;
             }
@@ -7553,46 +8045,49 @@ async function runCodex(
         }
         return { postLaunchHandledExternally: !nativeWindows };
       } catch (err) {
+        let restorationFailure: unknown;
         if (detachedSessionEnvironmentConfigured) {
           try {
             restoreDetachedSessionEnvironment?.();
-          } catch (rollbackErr) {
-            logCliOperationFailure(rollbackErr);
+          } catch (error) {
+            restorationFailure = error;
           }
           restoreDetachedSessionEnvironment = null;
           detachedSessionEnvironmentConfigured = false;
         }
-        const publicationFailedBeforeSignal =
-          createdDetachedSession && !leaderPublicationSignaled;
-        if (publicationFailedBeforeSignal && detachedLeaderPaneId) {
-          try {
-            execTmuxFileSync(["kill-pane", "-t", detachedLeaderPaneId], {
-              stdio: "ignore",
-            });
-          } catch (rollbackErr) {
-            logCliOperationFailure(rollbackErr);
-          }
-        }
         if (createdDetachedSession) {
-          const rollbackSteps = buildDetachedSessionRollbackSteps(
-            sessionName,
-            registeredHookTarget,
-            registeredHookName,
-            registeredClientAttachedHookName,
-          );
-          for (const rollbackStep of rollbackSteps) {
-            try {
-              execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
-            } catch (rollbackErr) {
-              logCliOperationFailure(rollbackErr);
-              // best-effort rollback only
-            }
+          try {
+            rollbackDetachedTmuxSessionAndVerify(
+              sessionName,
+              registeredHookTarget,
+              registeredHookName,
+              registeredClientAttachedHookName,
+            );
+          } catch (rollbackError) {
+            throw new DetachedLaunchRollbackError(
+              `detached launch failed after ${detachedLeaderReleaseSignaled ? "leader release" : "session creation"}; rollback was not verified and direct fallback is refused.`,
+              { cause: rollbackError },
+            );
           }
+          if (restorationFailure) {
+            throw new DetachedLaunchPublicationError(
+              "detached tmux environment restoration failed during error recovery; rollback was verified and direct fallback is refused.",
+              { cause: restorationFailure },
+            );
+          }
+          if (err instanceof DetachedLaunchPublicationError) throw err;
+          throw new VerifiedDetachedLaunchRollbackError(
+            `detached launch failed after ${detachedLeaderReleaseSignaled ? "leader release" : "session creation"}; rollback was verified before direct fallback.`,
+            { cause: err },
+          );
         }
-        if (publicationFailedBeforeSignal) {
-          const detail = err instanceof Error ? err.message : String(err);
-          throw new DetachedLaunchPublicationError(
-            `detached launch publication failed before leader release: ${detail}`,
+        if (
+          detachedSessionCreationAttempted &&
+          inspectDetachedTmuxSessionPresence(sessionName) !== "absent"
+        ) {
+          throw new DetachedLaunchRollbackError(
+            "detached session creation failed without proving that no session was created; direct fallback is refused.",
+            { cause: err },
           );
         }
         throw err;
@@ -7613,7 +8108,8 @@ async function runCodex(
     } catch (err) {
       if (
         err instanceof MadmaxDetachedGuardError ||
-        err instanceof DetachedLaunchPublicationError
+        err instanceof DetachedLaunchPublicationError ||
+        err instanceof DetachedLaunchRollbackError
       ) {
         throw err;
       }
@@ -7801,6 +8297,7 @@ export async function postLaunch(
   enableNotifyFallbackAuthority: boolean = false,
   projectLocalCodexHomeForCleanup?: string,
 ): Promise<void> {
+  const authorityCleanupFailures: unknown[] = [];
   // Capture session start time before cleanup (writeSessionEnd deletes session.json)
   let sessionStartedAt: string | undefined;
   try {
@@ -7876,6 +8373,7 @@ export async function postLaunch(
   try {
     await writeSessionEnd(cwd, sessionId);
   } catch (err) {
+    authorityCleanupFailures.push(err);
     console.error(
       `[omx] postLaunch: session archive failed: ${err instanceof Error ? err.message : err}`,
     );
@@ -7894,6 +8392,7 @@ export async function postLaunch(
   try {
     await cleanupPostLaunchModeStateFiles(cwd, sessionId);
   } catch (err) {
+    authorityCleanupFailures.push(err);
     console.error(
       `[omx] postLaunch: mode cleanup failed: ${err instanceof Error ? err.message : err}`,
     );
@@ -7957,6 +8456,42 @@ export async function postLaunch(
     logCliOperationFailure(err);
     // Non-fatal
   }
+  if (authorityCleanupFailures.length > 0) {
+    throw new AggregateError(authorityCleanupFailures, "postLaunch authority cleanup failed");
+  }
+}
+
+async function runPostLaunchCleanup(
+  cwd: string,
+  sessionId: string,
+  codexHomeOverride: string | undefined,
+  enableNotifyFallbackAuthority: boolean,
+  projectLocalCodexHomeForCleanup: string | undefined,
+  runtimeCodexHomeForCleanup: string | undefined,
+): Promise<void> {
+  const failures: unknown[] = [];
+  try {
+    await postLaunch(
+      cwd,
+      sessionId,
+      codexHomeOverride,
+      enableNotifyFallbackAuthority,
+      projectLocalCodexHomeForCleanup,
+    );
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await cleanupRuntimeCodexHome(
+      runtimeCodexHomeForCleanup,
+      projectLocalCodexHomeForCleanup,
+    );
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "postLaunch runtime cleanup failed");
+  }
 }
 
 export async function runDetachedSessionPostLaunch(
@@ -7966,17 +8501,14 @@ export async function runDetachedSessionPostLaunch(
   projectLocalCodexHomeForCleanup?: string,
   runtimeCodexHomeForCleanup?: string,
 ): Promise<void> {
-  await postLaunch(
+  await runPostLaunchCleanup(
     cwd,
     sessionId,
     codexHomeOverride,
     false,
     projectLocalCodexHomeForCleanup,
-  );
-  await cleanupRuntimeCodexHome(
     runtimeCodexHomeForCleanup,
-    projectLocalCodexHomeForCleanup,
-  ).catch(logCliOperationFailure);
+  );
 }
 
 async function emitNativeHookEvent(
@@ -8401,12 +8933,15 @@ async function startHookDerivedWatcher(cwd: string): Promise<void> {
       );
     },
   );
+  const watcherEnv = { ...process.env };
+  removeProcessLocalStateAuthorityBearer(watcherEnv);
   let watcherPid: number | undefined;
   try {
     watcherPid = await launchBackgroundHelper([watcherScript, "--cwd", cwd], {
       cwd,
-      env: process.env,
+      env: watcherEnv,
     });
+
   } catch (error: unknown) {
     console.warn("[omx] warning: failed to launch hook-derived watcher", {
       cwd,
@@ -8535,15 +9070,17 @@ async function flushHookDerivedWatcherOnce(cwd: string): Promise<void> {
   const pkgRoot = getPackageRoot();
   const watcherScript = resolveHookDerivedWatcherScript(pkgRoot);
   if (!existsSync(watcherScript)) return;
+  const watcherEnv = {
+    ...process.env,
+    OMX_HOOK_DERIVED_SIGNALS: "1",
+  };
+  removeProcessLocalStateAuthorityBearer(watcherEnv);
   spawnSync(process.execPath, [watcherScript, "--once", "--cwd", cwd], {
     cwd,
     stdio: "ignore",
     timeout: 3000,
     windowsHide: true,
-    env: {
-      ...process.env,
-      OMX_HOOK_DERIVED_SIGNALS: "1",
-    },
+    env: watcherEnv,
   });
 }
 

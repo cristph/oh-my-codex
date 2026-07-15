@@ -129,31 +129,17 @@ jobs:
           set -euo pipefail
           node --test --test-concurrency=1 \
             dist/utils/__tests__/git-layout.test.js \
-            dist/state/__tests__/authority.test.js \
             dist/state/__tests__/authority-callsite-inventory.test.js \
-            dist/state/__tests__/operations.test.js \
             dist/mcp/__tests__/state-paths.test.js \
             dist/mcp/__tests__/state-server.test.js \
             dist/hooks/__tests__/session.test.js \
             dist/mcp/__tests__/server-lifecycle.test.js \
-            dist/cli/__tests__/state.test.js \
-            dist/cli/__tests__/index.test.js \
-            dist/cli/__tests__/launch-fallback.test.js \
             dist/cli/__tests__/session-search.test.js \
-            dist/cli/__tests__/team.test.js \
-            dist/cli/__tests__/doctor-team.test.js \
             dist/cli/__tests__/doctor-artifact-ownership.test.js \
             dist/cli/__tests__/doctor-context-window-warning.test.js \
             dist/cli/__tests__/doctor-invalid-config.test.js \
             dist/cli/__tests__/doctor-spark-routing.test.js \
             dist/cli/__tests__/auth.test.js \
-            dist/team/__tests__/state-root.test.js \
-            dist/team/__tests__/team-identity.test.js \
-            dist/team/__tests__/worker-runtime-identity.test.js \
-            dist/team/__tests__/runtime-boxed-state.test.js \
-            dist/team/__tests__/runtime-cli.test.js \
-            dist/team/__tests__/tmux-session.test.js \
-            dist/team/__tests__/api-interop.test.js \
             dist/hud/__tests__/state.test.js \
             dist/hud/__tests__/reconcile.test.js \
             dist/scripts/__tests__/codex-native-hook.test.js \

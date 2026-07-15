@@ -19,8 +19,10 @@ import {
   validateStateAuthority,
   type ResolvedStateAuthorityContext,
 } from '../state/authority.js';
+import { normalizeSessionId } from '../mcp/state-paths.js';
 import { resolveAuthenticatedTransportAuthority } from '../hooks/session.js';
 import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
+import { TEAM_NAME_SAFE_PATTERN } from '../team/contracts.js';
 
 
 import {
@@ -67,16 +69,21 @@ export interface HudAuthorityReadScope {
 
 function inheritedAuthorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
   return [
+    env.OMX_CODEX_LAUNCH_ID,
+    env.OMX_STARTUP_CWD,
+    env.OMX_ROOT,
+    env.OMX_STATE_ROOT,
+    env.OMX_TEAM_STATE_ROOT,
     env.OMX_STATE_AUTHORITY_PATH,
     env.OMX_STATE_AUTHORITY_ID,
     env.OMX_STATE_AUTHORITY_GENERATION_ID,
     env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+    env.OMX_STATE_AUTHORITY_CAPABILITY,
   ].some((value) => typeof value === 'string' && value.trim() !== '');
 }
 
 function sessionCandidate(env: NodeJS.ProcessEnv): string | undefined {
-  const sessionId = env.OMX_SESSION_ID?.trim();
-  return sessionId || undefined;
+  return normalizeSessionId(env.OMX_SESSION_ID);
 }
 
 async function canonicalPath(path: string): Promise<string> {
@@ -188,9 +195,7 @@ async function readLegacySessionId(stateRoot: string, cwd: string, env: NodeJS.P
     const [recordedCwd, observedCwd] = await Promise.all([canonicalPath(session.cwd), canonicalPath(cwd)]);
     if (recordedCwd !== observedCwd) return undefined;
   }
-  return typeof session?.session_id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(session.session_id)
-    ? session.session_id
-    : undefined;
+  return normalizeSessionId(session?.session_id);
 }
 
 /**
@@ -259,42 +264,53 @@ export async function resolveHudAuthorityReadScope(
         return {
           workspaceRoot: resolvePath(cwd),
           stateRoot: null,
-          diagnostics: resolution.diagnostics,
+          diagnostics: resolution.diagnostics.length > 0
+            ? resolution.diagnostics
+            : [authorityDiagnostic(
+              AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+              'state authority resolution returned no active authority or diagnostics',
+            )],
         };
       }
     } catch (error) {
-      if (!locatorPresent) {
-        const legacy = legacyHudScope(cwd, env);
-        return {
-          workspaceRoot: legacy.workspaceRoot,
-          stateRoot: legacy.stateRoot,
-          sessionId: await readLegacySessionId(legacy.stateRoot, cwd, env),
-          diagnostics: [],
-        };
-      }
       return {
         workspaceRoot: resolvePath(cwd),
         stateRoot: null,
         diagnostics: [authorityDiagnostic(
-          AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+          error instanceof StateAuthorityError
+            ? error.code
+            : AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
           `unable to resolve persisted state authority: ${error instanceof Error ? error.message : String(error)}`,
         )],
       };
     }
   }
 
-  const validation = await validateStateAuthority(resolvedContext.generation, {
-    workspace_identity: resolvedContext.workspace_identity,
-    session_id: sessionCandidate(env),
-  });
-  diagnostics = [...diagnostics, ...validation.diagnostics];
-  if (resolvedContext.canonical_state_root !== resolvedContext.generation.canonical_state_root) {
-    diagnostics.push(authorityDiagnostic(
-      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
-      'validated authority context state root differs from its generation record',
-    ));
+  try {
+    const validation = await validateStateAuthority(resolvedContext.generation, {
+      workspace_identity: resolvedContext.workspace_identity,
+      session_id: sessionCandidate(env),
+    });
+    diagnostics = [...diagnostics, ...validation.diagnostics];
+    if (resolvedContext.canonical_state_root !== resolvedContext.generation.canonical_state_root) {
+      diagnostics.push(authorityDiagnostic(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+        'validated authority context state root differs from its generation record',
+      ));
+    }
+    diagnostics.push(...await authorityLocatorDiagnostics(resolvedContext, env));
+  } catch (error) {
+    return {
+      workspaceRoot: resolvedContext.workspace_identity.canonical_path,
+      stateRoot: null,
+      diagnostics: [...diagnostics, authorityDiagnostic(
+        error instanceof StateAuthorityError
+          ? error.code
+          : AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+        `unable to validate persisted state authority: ${error instanceof Error ? error.message : String(error)}`,
+      )],
+    };
   }
-  diagnostics.push(...await authorityLocatorDiagnostics(resolvedContext, env));
   if (diagnostics.some((diagnostic) => diagnostic.fatal) || !resolvedContext.session_binding) {
     if (!resolvedContext.session_binding) {
       diagnostics.push(authorityDiagnostic(
@@ -313,30 +329,33 @@ export async function resolveHudAuthorityReadScope(
     stateRoot: resolvedContext.canonical_state_root,
     sessionId: resolvedContext.session_binding.canonical_session_id,
     context: resolvedContext,
-    diagnostics: [],
+    diagnostics,
   };
 }
 
-async function readJsonFile<T>(path: string): Promise<T | null> {
+async function readJsonFile<T>(path: string, strict = false): Promise<T | null> {
   try {
     const content = await readFile(path, 'utf-8');
     return JSON.parse(content) as T;
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    if (strict) throw error;
     return null;
   }
 }
 
 function statePath(scope: HudAuthorityReadScope, fileName: string, sessionScoped = false): string | null {
   if (!scope.stateRoot) return null;
-  return sessionScoped && scope.sessionId
-    ? join(scope.stateRoot, 'sessions', scope.sessionId, fileName)
+  const sessionId = normalizeSessionId(scope.sessionId);
+  return sessionScoped && sessionId
+    ? join(scope.stateRoot, 'sessions', sessionId, fileName)
     : join(scope.stateRoot, fileName);
 }
 
 async function readAuthoritativeModeState<T>(cwd: string, mode: string, scope?: HudAuthorityReadScope): Promise<T | null> {
   const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
   const path = statePath(resolvedScope, `${mode}-state.json`, Boolean(resolvedScope.sessionId));
-  return path ? readJsonFile<T>(path) : null;
+  return path ? readJsonFile<T>(path, Boolean(resolvedScope.context)) : null;
 }
 
 async function readCurrentAutopilotState(cwd: string, scope?: HudAuthorityReadScope): Promise<AutopilotStateForHud | null> {
@@ -468,7 +487,12 @@ export async function readUltragoalState(
 ): Promise<UltragoalStateForHud | null> {
   const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
   if (!resolvedScope.stateRoot) return null;
-  const plan = await readJsonFile<RawUltragoalPlan>(join(resolvedScope.workspaceRoot, '.omx', 'ultragoal', 'goals.json'));
+  const canonicalOmxRoot = resolvedScope.context?.generation.canonical_omx_root
+    ?? join(resolvedScope.workspaceRoot, '.omx');
+  const plan = await readJsonFile<RawUltragoalPlan>(
+    join(canonicalOmxRoot, 'ultragoal', 'goals.json'),
+    Boolean(resolvedScope.context),
+  );
   if (!plan || typeof plan !== 'object' || !Array.isArray(plan.goals)) return null;
 
   const goals = plan.goals.map(normalizeUltragoalGoal).filter((goal): goal is NormalizedUltragoalGoal => goal !== null);
@@ -600,7 +624,7 @@ export async function readSessionState(cwd: string, scope?: HudAuthorityReadScop
   const resolvedScope = scope ?? await resolveHudAuthorityReadScope(cwd);
   const path = statePath(resolvedScope, 'session.json');
   const session = path ? await readJsonFile<{ session_id?: unknown; started_at?: unknown }>(path) : null;
-  if (typeof session?.session_id !== 'string' || session.session_id !== resolvedScope.sessionId) return null;
+  if (typeof session?.session_id !== 'string' || session.session_id !== normalizeSessionId(resolvedScope.sessionId)) return null;
   return {
     session_id: session.session_id,
     started_at: typeof session.started_at === 'string' ? session.started_at : '',
@@ -815,7 +839,7 @@ async function readCanonicalTeamPhase(
   teamDetail: TeamStateForHud | null,
 ): Promise<string | undefined> {
   const teamName = sanitizeOptionalString(teamDetail?.team_name);
-  if (!teamName || !scope.stateRoot) return undefined;
+  if (!teamName || !TEAM_NAME_SAFE_PATTERN.test(teamName) || !scope.stateRoot) return undefined;
   const phaseState = await readJsonFile<{ current_phase?: unknown }>(join(scope.stateRoot, 'team', teamName, 'phase.json'));
   return sanitizeOptionalString(phaseState?.current_phase);
 }
@@ -922,9 +946,8 @@ export async function readAllState(
 ): Promise<HudRenderContext & { authority?: HudAuthorityStatus }> {
   const authorityScope = await resolveHudAuthorityReadScope(cwd, authorityContext);
   const version = readVersion();
-  const gitBranch = authorityScope.diagnostics[0]
-    ? `authority:${authorityScope.diagnostics[0].code}`
-    : buildGitBranchLabel(authorityScope.workspaceRoot, config);
+  const gitBranch = buildGitBranchLabel(authorityScope.workspaceRoot, config);
+  const sessionId = normalizeSessionId(authorityScope.sessionId);
   const [metrics, hudNotify, session, subagentTracking] = await Promise.all([
     readMetrics(cwd, authorityScope),
     readHudNotifyState(cwd, authorityScope),
@@ -934,7 +957,7 @@ export async function readAllState(
       : Promise.resolve(createSubagentTrackingState()),
   ]);
   const canonicalSkillState = authorityScope.stateRoot
-    ? await readVisibleSkillActiveStateForStateDir(authorityScope.stateRoot, authorityScope.sessionId)
+    ? await readVisibleSkillActiveStateForStateDir(authorityScope.stateRoot, sessionId)
     : {};
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
@@ -968,12 +991,12 @@ export async function readAllState(
   const canonicalSkillStateExists = authorityScope.stateRoot
     ? [
       join(authorityScope.stateRoot, 'skill-active-state.json'),
-      ...(authorityScope.sessionId
-        ? [join(authorityScope.stateRoot, 'sessions', authorityScope.sessionId, 'skill-active-state.json')]
+      ...(sessionId
+        ? [join(authorityScope.stateRoot, 'sessions', sessionId, 'skill-active-state.json')]
         : []),
     ].some((path) => existsSync(path))
     : false;
-  if (!canonicalSkillStateExists && canonicalSkills.size === 0) {
+  if (!authorityScope.context && !canonicalSkillStateExists && canonicalSkills.size === 0) {
     for (const [skill, detail] of [
       ['ralph', ralphDetail],
       ['ultrawork', ultraworkDetail],
@@ -1028,7 +1051,7 @@ export async function readAllState(
       'canonical-skill',
     )
     : supervisedAutopilotStage<CodeReviewStateForHud>(autopilot, 'code-review')
-      ?? codeReviewFromSubagentEvidence(canonicalSkills, subagentTracking, authorityScope.sessionId, autopilot);
+      ?? codeReviewFromSubagentEvidence(canonicalSkills, subagentTracking, sessionId, autopilot);
   const ultraqa = shouldSurfaceCanonicalSkill(canonicalSkills, 'ultraqa', ultraqaDetail)
     ? (() => {
       const detail = ultraqaDetail?.active === true ? ultraqaDetail : null;

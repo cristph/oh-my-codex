@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,6 +8,7 @@ import {
   buildHudResizeHookName,
   buildHudResizeHookSlot,
   buildHudWatchCommand,
+  createHudWatchPane,
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
   hudPaneMatchesOwner,
@@ -574,6 +575,122 @@ describe('HUD pane ownership helpers', () => {
     assert.deepEqual(calls, [['display-message', '-p', '#{pane_id}']]);
   });
 
+  it('passes allowed split-window environment values as literal assignments without forwarding the authority bearer', () => {
+    const calls: string[][] = [];
+    const hostileRoot = "/tmp/it's ; $(literal) = value";
+    const hostileSession = "session $(literal); 'quoted'";
+    const paneId = createHudWatchPane(
+      '/repo/$(literal)',
+      'node /repo/dist/cli/omx.js hud --watch',
+      {
+        heightLines: 3,
+        targetPaneId: '%leader',
+        envKeys: [
+          'OMX_ROOT',
+          'OMX_SESSION_ID',
+          'OMX_STATE_AUTHORITY_CAPABILITY',
+          'invalid-key',
+          'UNSET',
+        ],
+        env: {
+          OMX_ROOT: hostileRoot,
+          OMX_SESSION_ID: hostileSession,
+          OMX_STATE_AUTHORITY_CAPABILITY: 'authority-bearer-must-not-leak',
+        },
+      },
+      (args) => {
+        calls.push(args);
+        return '%hud\n';
+      },
+    );
+
+    assert.equal(paneId, '%hud');
+    assert.deepEqual(calls, [[
+      'split-window',
+      '-v',
+      '-l',
+      '3',
+      '-d',
+      '-t',
+      '%leader',
+      '-c',
+      '/repo/$(literal)',
+      '-e',
+      `OMX_ROOT=${hostileRoot}`,
+      '-e',
+      `OMX_SESSION_ID=${hostileSession}`,
+      '-P',
+      '-F',
+      '#{pane_id}',
+      'node /repo/dist/cli/omx.js hud --watch',
+    ]]);
+  });
+
+  it('scrubs authority transport from the tmux client environment', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'omx-hud-tmux-client-env-'));
+    const fakeBin = join(cwd, 'bin');
+    const capturePath = join(cwd, 'tmux-client-env');
+    const authorityEnv = {
+      OMX_CODEX_LAUNCH_ID: 'raw-launch-id',
+      OMX_STARTUP_CWD: 'raw-startup-cwd',
+      OMX_ROOT: 'raw-omx-root',
+      OMX_STATE_ROOT: 'raw-state-root',
+      OMX_TEAM_STATE_ROOT: 'raw-team-state-root',
+      OMX_STATE_AUTHORITY_PATH: 'raw-authority-path',
+      OMX_STATE_AUTHORITY_ID: 'raw-authority-id',
+      OMX_STATE_AUTHORITY_GENERATION_ID: 'raw-generation-id',
+      OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: 'raw-workspace-digest',
+      OMX_STATE_AUTHORITY_CAPABILITY: 'raw-authority-capability',
+    };
+    const previousEnv = new Map(
+      Object.keys(authorityEnv).map((key) => [key, process.env[key]]),
+    );
+    const previousPath = process.env.PATH;
+
+    try {
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env bash
+set -eu
+{
+  printf 'OMX_CODEX_LAUNCH_ID=%s\\n' "\${OMX_CODEX_LAUNCH_ID-}"
+  printf 'OMX_STARTUP_CWD=%s\\n' "\${OMX_STARTUP_CWD-}"
+  printf 'OMX_ROOT=%s\\n' "\${OMX_ROOT-}"
+  printf 'OMX_STATE_ROOT=%s\\n' "\${OMX_STATE_ROOT-}"
+  printf 'OMX_TEAM_STATE_ROOT=%s\\n' "\${OMX_TEAM_STATE_ROOT-}"
+  printf 'OMX_STATE_AUTHORITY_PATH=%s\\n' "\${OMX_STATE_AUTHORITY_PATH-}"
+  printf 'OMX_STATE_AUTHORITY_ID=%s\\n' "\${OMX_STATE_AUTHORITY_ID-}"
+  printf 'OMX_STATE_AUTHORITY_GENERATION_ID=%s\\n' "\${OMX_STATE_AUTHORITY_GENERATION_ID-}"
+  printf 'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST=%s\\n' "\${OMX_STATE_AUTHORITY_WORKSPACE_DIGEST-}"
+  printf 'OMX_STATE_AUTHORITY_CAPABILITY=%s\\n' "\${OMX_STATE_AUTHORITY_CAPABILITY-}"
+} > ${JSON.stringify(capturePath)}
+printf '%%hud\\n'
+`, { mode: 0o755 });
+      process.env.PATH = [fakeBin, previousPath].filter(Boolean).join(':');
+      Object.assign(process.env, authorityEnv);
+
+      assert.equal(createHudWatchPane('/repo', 'node omx.js hud --watch'), '%hud');
+      assert.equal(readFileSync(capturePath, 'utf-8'), [
+        'OMX_CODEX_LAUNCH_ID=',
+        'OMX_STARTUP_CWD=',
+        'OMX_ROOT=',
+        'OMX_STATE_ROOT=',
+        'OMX_TEAM_STATE_ROOT=',
+        'OMX_STATE_AUTHORITY_PATH=',
+        'OMX_STATE_AUTHORITY_ID=',
+        'OMX_STATE_AUTHORITY_GENERATION_ID=',
+        'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST=',
+        'OMX_STATE_AUTHORITY_CAPABILITY=',
+        '',
+      ].join('\n'));
+    } finally {
+      process.env.PATH = previousPath;
+      for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
   it('tags reconciled HUD watch commands with the leader pane owner', () => {
     const cmd = buildHudWatchCommand('/usr/bin/omx.js', undefined, 'sess-a', undefined, '%1');
 

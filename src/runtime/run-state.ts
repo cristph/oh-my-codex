@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
-import { getStateFilePath, resolveStateScope } from '../mcp/state-paths.js';
+import { getStateFilePath, resolveStateScope, resolveWritableStateScope } from '../mcp/state-paths.js';
 import {
   classifyRunOutcome,
   compatibilityRunOutcomeFromTerminalLifecycleOutcome,
@@ -174,11 +175,18 @@ export async function syncRunStateFromModeState(
   workingDirectory?: string,
   explicitSessionId?: string,
 ): Promise<RunState> {
-  const scope = await resolveStateScope(workingDirectory, explicitSessionId);
-  const path = getRunStatePath(workingDirectory, scope.sessionId);
+  const scope = await resolveWritableStateScope(workingDirectory, explicitSessionId);
+  const path = join(scope.stateDir, RUN_STATE_FILENAME);
   await mkdir(scope.stateDir, { recursive: true });
 
-  const existing = await readRunState(workingDirectory, scope.sessionId);
+  let existing: RunState | null = null;
+  if (existsSync(path)) {
+    try {
+      existing = JSON.parse(await readFile(path, 'utf-8')) as RunState;
+    } catch {
+      existing = null;
+    }
+  }
   const next = buildRunState(state, existing);
   await writeAtomicFile(path, JSON.stringify(next, null, 2));
   return next;

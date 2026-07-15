@@ -42,6 +42,12 @@ async function withCommittedAuthority<T>(
   run: () => Promise<T>,
   ownerSessionId?: string,
 ): Promise<T> {
+  await mkdir(join(cwd, ".omx", "state", "authority"), { recursive: true });
+  await Promise.all([
+    chmod(join(cwd, ".omx"), 0o700),
+    chmod(join(cwd, ".omx", "state"), 0o700),
+    chmod(join(cwd, ".omx", "state", "authority"), 0o700),
+  ]);
   const authority = await initializeStateAuthority({
     startup_cwd: cwd,
     observed_cwd: cwd,
@@ -61,9 +67,12 @@ async function withCommittedAuthority<T>(
   });
   const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
   Object.assign(process.env, transport);
+  const previousCwd = process.cwd();
+  process.chdir(cwd);
   try {
     return await run();
   } finally {
+    process.chdir(previousCwd);
     for (const key of STATE_AUTHORITY_ENV_KEYS) {
       const value = previous.get(key);
       if (typeof value === "string") process.env[key] = value;
@@ -226,6 +235,8 @@ describe("mcpParityCommand", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-mcp-parity-owner-session-"));
     const logs = captureLogs();
     const previousPath = process.env.PATH;
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
 
     try {
       const canonicalSessionId = "native-id";
@@ -264,6 +275,12 @@ describe("mcpParityCommand", () => {
       }, "omx-owner-id");
 
     } finally {
+      if (previousTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = previousTmux;
+      if (previousTmuxPane === undefined) delete process.env.TMUX_PANE;
+      else process.env.TMUX_PANE = previousTmuxPane;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
       await rm(cwd, { recursive: true, force: true });
     }
   });

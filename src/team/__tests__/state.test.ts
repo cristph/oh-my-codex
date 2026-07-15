@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, it } from 'node:test';
+import { after, afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
 import {
   ABSOLUTE_MAX_WORKERS,
   DEFAULT_MAX_WORKERS,
@@ -12,7 +14,7 @@ import {
   claimTask,
   computeTaskReadiness,
   getTeamSummary,
-  initTeamState,
+  initTeamState as initTeamStateRaw,
   listTasks,
   migrateV1ToV2,
   readTask,
@@ -47,17 +49,59 @@ import {
   writeTeamManifestV2,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
-const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+async function initTeamState(
+  ...args: Parameters<typeof initTeamStateRaw>
+): ReturnType<typeof initTeamStateRaw> {
+  const cwd = args[4];
+  const requestedEnv = args[6] ?? process.env;
+  const sessionId = requestedEnv.OMX_SESSION_ID?.trim() || `team-state-${crypto.randomUUID()}`;
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const transport = buildStateAuthorityTransportEnv(authority, {
+    ...requestedEnv,
+    OMX_SESSION_ID: sessionId,
+  });
+  Object.assign(process.env, transport);
+
+  const authenticatedArgs = [...args] as Parameters<typeof initTeamStateRaw>;
+  authenticatedArgs[6] = transport;
+  return initTeamStateRaw(...authenticatedArgs);
+}
+
+let testEnvironment: NodeJS.ProcessEnv;
 
 beforeEach(() => {
-  delete process.env.OMX_TEAM_STATE_ROOT;
+  testEnvironment = { ...process.env };
+  for (const key of [
+    'OMX_TEAM_STATE_ROOT',
+    'OMX_STARTUP_CWD',
+    'OMX_ROOT',
+    'OMX_STATE_ROOT',
+    'OMX_STATE_AUTHORITY_PATH',
+    'OMX_STATE_AUTHORITY_ID',
+    'OMX_STATE_AUTHORITY_GENERATION_ID',
+    'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+    'OMX_STATE_AUTHORITY_CAPABILITY',
+  ]) delete process.env[key];
 });
 
 afterEach(() => {
   resetWriteAtomicRenameForTests();
-  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
-  else delete process.env.OMX_TEAM_STATE_ROOT;
+  for (const key of Object.keys(process.env)) {
+    if (!(key in testEnvironment)) delete process.env[key];
+  }
+  Object.assign(process.env, testEnvironment);
 });
 
 async function writeCompatRuntimeFixture(runtimePath: string, runtimeLogPath: string): Promise<void> {
@@ -589,20 +633,20 @@ exit 1
         process.env,
         {
           leader_cwd: '/tmp/leader',
-          team_state_root: '/tmp/leader/.omx/state',
+          team_state_root: join(cwd, '.omx', 'state'),
           workspace_mode: 'worktree',
           worktree_mode: { enabled: true, detached: false, name: 'feature/team-meta' },
         },
       );
       assert.equal(cfg.leader_cwd, '/tmp/leader');
-      assert.equal(cfg.team_state_root, '/tmp/leader/.omx/state');
+      assert.equal(cfg.team_state_root, join(cwd, '.omx', 'state'));
       assert.equal(cfg.workspace_mode, 'worktree');
       assert.deepEqual(cfg.worktree_mode, { enabled: true, detached: false, name: 'feature/team-meta' });
 
       const manifest = await readTeamManifestV2('team-meta', cwd);
       assert.ok(manifest);
       assert.equal(manifest?.leader_cwd, '/tmp/leader');
-      assert.equal(manifest?.team_state_root, '/tmp/leader/.omx/state');
+      assert.equal(manifest?.team_state_root, join(cwd, '.omx', 'state'));
       assert.equal(manifest?.workspace_mode, 'worktree');
       assert.deepEqual(manifest?.worktree_mode, { enabled: true, detached: false, name: 'feature/team-meta' });
       assert.equal(manifest?.lifecycle_profile, 'default');
@@ -615,52 +659,43 @@ exit 1
     }
   });
 
-  it('resolves task/mailbox/approval paths under explicit OMX_TEAM_STATE_ROOT from a worker cwd (worker-env contamination regression)', async () => {
+  it('rejects copied authority transport from an unrelated worker cwd', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-team-explicit-root-'));
     const leaderCwd = join(root, 'leader');
     const workerCwd = join(root, 'worker-worktree');
     const explicitStateRoot = join(leaderCwd, '.omx', 'state');
-    const prevRoot = process.env.OMX_TEAM_STATE_ROOT;
+    const previousEnv = { ...process.env };
     try {
       await mkdir(leaderCwd, { recursive: true });
       await mkdir(workerCwd, { recursive: true });
-      await initTeamState('team-explicit-root', 't', 'executor', 1, leaderCwd);
-      process.env.OMX_TEAM_STATE_ROOT = explicitStateRoot;
+      const sessionId = 'team-explicit-root-session';
+      const authority = await initializeStateAuthority({
+        startup_cwd: leaderCwd,
+        launch_id: 'team-explicit-root-launch',
+        session_binding: { canonical_session_id: sessionId },
+      });
+      await mintStateAuthorityTransportCapability(authority);
+      const transport = buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+      Object.assign(process.env, transport);
+      await initTeamStateRaw('team-explicit-root', 't', 'executor', 1, leaderCwd);
 
-      const task = await createTask(
-        'team-explicit-root',
-        { subject: 'explicit root task', description: 'regression guard', status: 'pending' },
-        workerCwd,
+      await assert.rejects(
+        createTask(
+          'team-explicit-root',
+          { subject: 'copied authority task', description: 'must be rejected', status: 'pending' },
+          workerCwd,
+        ),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === 'authority_observed_cwd_outside_workspace',
       );
-      const claim = await claimTask('team-explicit-root', task.id, 'worker-1', task.version ?? 1, workerCwd);
-      assert.equal(claim.ok, true);
-
-      await sendDirectMessage('team-explicit-root', 'worker-1', 'leader-fixed', 'hello from worker cwd', workerCwd);
-      const messages = await listMailboxMessages('team-explicit-root', 'leader-fixed', workerCwd);
-      assert.equal(messages.length, 1);
-      assert.equal(messages[0]?.body, 'hello from worker cwd');
-
-      const approvalRecord = {
-        task_id: task.id,
-        required: true,
-        status: 'approved' as const,
-        reviewer: 'leader-fixed',
-        decision_reason: 'path guard uses resolved team state root',
-        decided_at: new Date().toISOString(),
-      };
-      await writeTaskApproval('team-explicit-root', approvalRecord, workerCwd);
-      const approval = await readTaskApproval('team-explicit-root', task.id, workerCwd);
-      assert.equal(approval?.status, 'approved');
-      assert.equal(approval?.reviewer, 'leader-fixed');
-
-      const explicitTeamRoot = join(explicitStateRoot, 'team', 'team-explicit-root');
-      assert.equal(existsSync(join(explicitTeamRoot, 'tasks', `task-${task.id}.json`)), true);
-      assert.equal(existsSync(join(explicitTeamRoot, 'mailbox', 'leader-fixed.json')), true);
-      assert.equal(existsSync(join(explicitTeamRoot, 'approvals', `task-${task.id}.json`)), true);
-      assert.equal(existsSync(join(workerCwd, '.omx', 'state', 'team', 'team-explicit-root')), false);
+      assert.equal(existsSync(join(explicitStateRoot, 'team', 'team-explicit-root', 'config.json')), true);
+      assert.equal(existsSync(join(workerCwd, '.omx', 'state')), false);
     } finally {
-      if (typeof prevRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previousEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, previousEnv);
       await rm(root, { recursive: true, force: true });
     }
   });

@@ -1,13 +1,16 @@
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
 
 import {
   executeStateOperation as executeStateOperationRaw,
+  setStateOperationTestHooksForTests,
   type StateOperationName,
   type StateOperationResponse,
 } from '../operations.js';
@@ -99,6 +102,20 @@ async function executeStateOperation(
   }
   return executeStateOperationRaw(name, rawArgs);
 }
+
+async function committedSessionStatePath(
+  workingDirectory: string,
+  filename: string,
+  sessionId?: string,
+): Promise<string> {
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: workingDirectory,
+    observed_cwd: workingDirectory,
+  });
+  const scopedSessionId = sessionId?.trim() || authority.session_binding?.canonical_session_id;
+  assert.ok(scopedSessionId, 'state operation authority must have a committed session binding');
+  return join(authority.canonical_state_root, 'sessions', scopedSessionId, filename);
+}
 async function withAmbientTmuxEnv<T>(env: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> {
   const previousTmux = process.env.TMUX;
   const previousTmuxPane = process.env.TMUX_PANE;
@@ -167,13 +184,11 @@ async function withStateOperationFault<T>(
   point: 'after_effects_before_committed_evidence' | 'after_first_state_clear_effect',
   run: () => Promise<T>,
 ): Promise<T> {
-  const previous = process.env.OMX_STATE_OPERATION_FAULT_INJECTION;
-  process.env.OMX_STATE_OPERATION_FAULT_INJECTION = point;
+  setStateOperationTestHooksForTests({ faultInjectionPoint: point });
   try {
     return await run();
   } finally {
-    if (typeof previous === 'string') process.env.OMX_STATE_OPERATION_FAULT_INJECTION = previous;
-    else delete process.env.OMX_STATE_OPERATION_FAULT_INJECTION;
+    setStateOperationTestHooksForTests();
   }
 }
 
@@ -192,7 +207,29 @@ async function executeStateOperationInChild(
   env: NodeJS.ProcessEnv = {},
 ): Promise<{ payload: unknown; isError?: boolean }> {
   const childProgram = `
-    const { executeStateOperation } = await import(process.env.OMX_STATE_OPERATION_MODULE_URL);
+    const { writeFile, access } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { executeStateOperation, setStateOperationTestHooksForTests } = await import(process.env.OMX_STATE_OPERATION_MODULE_URL);
+    const faultInjectionPoint = process.env.OMX_STATE_OPERATION_FAULT_INJECTION;
+    const barrierDirectory = process.env.OMX_STATE_OPERATION_TEST_BARRIER_DIR;
+    const barrierPoint = process.env.OMX_STATE_OPERATION_TEST_BARRIER_POINT || 'before_mutation_transaction';
+    setStateOperationTestHooksForTests({
+      ...(faultInjectionPoint ? { faultInjectionPoint } : {}),
+      ...(barrierDirectory ? {
+        barrier: async (point) => {
+          if (point !== barrierPoint) return;
+          const reachedPath = join(barrierDirectory, point + '.reached');
+          const releasePath = join(barrierDirectory, point + '.release');
+          await writeFile(reachedPath, '');
+          const deadline = Date.now() + 5000;
+          for (;;) {
+            try { await access(releasePath); break; } catch {}
+            if (Date.now() >= deadline) throw new Error('timed out waiting at state operation test barrier: ' + point);
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        },
+      } : {}),
+    });
     const response = await executeStateOperation(
       process.env.OMX_STATE_OPERATION_NAME,
       JSON.parse(process.env.OMX_STATE_OPERATION_ARGS),
@@ -671,6 +708,43 @@ describe('state operations directory initialization', () => {
     }
   });
 
+  it('does not let workspace Ultragoal artifacts override a committed authority state decision', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-authoritative-ultragoal-'));
+    try {
+      const established = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'ultragoal',
+        active: false,
+        current_phase: 'cleared',
+      });
+      assert.equal(established.isError, undefined);
+      await mkdir(join(wd, '.omx', 'ultragoal'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'ultragoal', 'goals.json'),
+        JSON.stringify({
+          activeGoalId: 'G001',
+          goals: [{ id: 'G001', title: 'Forged compatibility artifact', status: 'in_progress' }],
+        }),
+      );
+
+      const active = await executeStateOperation('state_list_active', { workingDirectory: wd });
+      const status = await executeStateOperation('state_get_status', {
+        workingDirectory: wd,
+        mode: 'ultragoal',
+      });
+      const statuses = (status.payload as {
+        statuses?: Record<string, { active?: boolean; phase?: string; source?: string }>;
+      }).statuses || {};
+
+      assert.deepEqual(active.payload, { active_modes: [] });
+      assert.equal(statuses.ultragoal?.active, false);
+      assert.equal(statuses.ultragoal?.phase, 'cleared');
+      assert.equal(statuses.ultragoal?.source, undefined);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('does not treat root fallback as active for explicit session list-active decisions', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-active-scope-'));
     try {
@@ -791,7 +865,7 @@ describe('state operations directory initialization', () => {
       assert.deepEqual(writeResponse.payload, {
         success: true,
         mode: 'deep-interview',
-        path: canonicalizeAuthorityPathForCreation(join(wd, '.omx', 'state', 'deep-interview-state.json')),
+        path: canonicalizeAuthorityPathForCreation(await committedSessionStatePath(wd, 'deep-interview-state.json')),
       });
 
       const readResponse = await executeStateOperation('state_read', {
@@ -879,7 +953,7 @@ describe('state operations directory initialization', () => {
       assert.deepEqual(writeResponse.payload, {
         success: true,
         mode: 'autoresearch',
-        path: canonicalizeAuthorityPathForCreation(join(wd, '.omx', 'state', 'autoresearch-state.json')),
+        path: canonicalizeAuthorityPathForCreation(await committedSessionStatePath(wd, 'autoresearch-state.json')),
       });
 
       const readResponse = await executeStateOperation('state_read', {
@@ -995,7 +1069,7 @@ describe('state operations directory initialization', () => {
         assert.equal(response.isError, undefined);
       }
 
-      const filePath = join(wd, '.omx', 'state', 'team-state.json');
+      const filePath = await committedSessionStatePath(wd, 'team-state.json');
       const state = JSON.parse(await readFile(filePath, 'utf-8')) as Record<string, unknown>;
       for (let i = 0; i < 16; i++) {
         assert.equal(state[`k${i}`], i);
@@ -1071,10 +1145,131 @@ describe('state operations directory initialization', () => {
     }
   });
 
+  it('fails a committed read closed when the state root is replaced after scope resolution', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-read-root-swap-'));
+    const stateRoot = join(wd, '.omx', 'state');
+    const displacedStateRoot = join(wd, '.omx', 'state-before-read');
+    try {
+      const established = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'baseline',
+      });
+      assert.equal(established.isError, undefined);
+      setStateOperationTestHooksForTests({
+        async barrier(point) {
+          if (point !== 'before_state_read') return;
+          await rename(stateRoot, displacedStateRoot);
+          await mkdir(stateRoot, { recursive: true });
+          await writeFile(
+            join(stateRoot, 'team-state.json'),
+            JSON.stringify({ active: true, current_phase: 'replacement-root' }),
+          );
+        },
+      });
+
+      const response = await executeStateOperation('state_get_status', { workingDirectory: wd });
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: unknown }).error), /persisted active state-root identity|fingerprint/);
+    } finally {
+      setStateOperationTestHooksForTests();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves malformed canonical workflow and skill state instead of overwriting either during a mutation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-malformed-canonical-preflight-'));
+    const stateRoot = join(wd, '.omx', 'state');
+    let workflowPath: string;
+    let skillStatePath: string;
+    try {
+      const established = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'baseline',
+      });
+      assert.equal(established.isError, undefined);
+      workflowPath = await committedSessionStatePath(wd, 'team-state.json');
+      skillStatePath = await committedSessionStatePath(wd, 'skill-active-state.json');
+
+      await writeFile(workflowPath, '{ malformed workflow state');
+      const workflowDenied = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'must-not-overwrite',
+      });
+      assert.equal(workflowDenied.isError, true);
+      assert.match(String((workflowDenied.payload as { error?: unknown }).error), /malformed JSON/);
+      assert.equal(await readFile(workflowPath, 'utf-8'), '{ malformed workflow state');
+
+      await writeFile(workflowPath, JSON.stringify({ active: true, current_phase: 'baseline' }));
+      await writeFile(skillStatePath, '{ malformed canonical skill state');
+      const skillDenied = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: false,
+        current_phase: 'cleared',
+      });
+      assert.equal(skillDenied.isError, true);
+      assert.match(String((skillDenied.payload as { error?: unknown }).error), /canonical skill state contains malformed JSON/);
+      assert.equal(await readFile(skillStatePath, 'utf-8'), '{ malformed canonical skill state');
+      assert.equal((JSON.parse(await readFile(workflowPath, 'utf-8')) as { current_phase?: string }).current_phase, 'baseline');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not commit a prepared write into a root replaced at the atomic-write boundary', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-write-root-swap-'));
+    try {
+      const stateRoot = join(wd, '.omx', 'state');
+      const parkedStateRoot = join(wd, '.omx', 'state-before-write-boundary');
+      const statePath = join(stateRoot, 'team-state.json');
+      const barrierDir = join(wd, 'barrier');
+      const point = 'before_state_write';
+      await mkdir(barrierDir, { recursive: true });
+      const established = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'baseline',
+      });
+      assert.equal(established.isError, undefined);
+
+      const pending = executeStateOperationInChild(
+        new URL('../operations.js', import.meta.url).href,
+        'state_write',
+        { workingDirectory: wd, mode: 'team', active: true, current_phase: 'must-not-reach-replacement' },
+        {
+          OMX_STATE_OPERATION_TEST_BARRIER_DIR: barrierDir,
+          OMX_STATE_OPERATION_TEST_BARRIER_POINT: point,
+        },
+      );
+      await waitForFile(join(barrierDir, `${point}.reached`));
+      await rename(stateRoot, parkedStateRoot);
+      await mkdir(stateRoot, { recursive: true });
+      await writeFile(statePath, JSON.stringify({ active: true, current_phase: 'replacement-root' }));
+      await writeFile(join(barrierDir, `${point}.release`), 'release');
+
+      const response = await pending;
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: unknown }).error), /persisted active state-root identity|fingerprint/);
+      assert.equal(
+        (JSON.parse(await readFile(statePath, 'utf-8')) as { current_phase?: string }).current_phase,
+        'replacement-root',
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('tombstones a clear intent before durable deletion and commits it only after every effect', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-tombstone-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const written = await executeStateOperation('state_write', {
         workingDirectory: wd,
         mode: 'team',
@@ -1082,6 +1277,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'running',
       });
       assert.equal(written.isError, undefined);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
       assert.equal(existsSync(statePath), true);
 
       const cleared = await executeStateOperation('state_clear', {
@@ -1121,21 +1317,25 @@ describe('state operations directory initialization', () => {
     try {
       const established = await executeStateOperation('state_write', {
         workingDirectory: wd,
-        mode: 'deep-interview',
+        mode: 'team',
         active: true,
         current_phase: 'authoritative',
       });
       assert.equal(established.isError, undefined);
 
-      const target = join(wd, '.omx', 'state', 'team-state.json');
-      await mkdir(target, { recursive: true });
-      const response = await executeStateOperation('state_clear', {
-        workingDirectory: wd,
-        mode: 'team',
-      });
-      assert.equal(response.isError, true);
-      assert.match((response.payload as { error: string }).error, /regular file/);
+      const target = await committedSessionStatePath(wd, 'team-state.json');
       assert.equal(existsSync(target), true);
+      const response = await withStateOperationFault(
+        'after_first_state_clear_effect',
+        () => executeStateOperation('state_clear', {
+          workingDirectory: wd,
+          mode: 'team',
+          all_sessions: true,
+        }),
+      );
+      assert.equal(response.isError, true);
+      assert.match((response.payload as { error: string }).error, /injected state operation crash/);
+      assert.equal(existsSync(target), false);
 
       const evidence = (await readFile(
         join(wd, '.omx', 'state', 'authority', 'state-authority-tombstones.jsonl'),
@@ -1162,8 +1362,10 @@ describe('state operations directory initialization', () => {
   it('aborts a durable write when target validation fails before the atomic file effect', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-write-fault-'));
     try {
+      await ensureTestOperationAuthority(wd, undefined);
       const stateRoot = join(wd, '.omx', 'state');
-      await mkdir(join(stateRoot, 'team-state.json'), { recursive: true });
+      const statePath = await committedSessionStatePath(wd, 'team-state.json');
+      await mkdir(statePath, { recursive: true });
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -1173,7 +1375,7 @@ describe('state operations directory initialization', () => {
       });
       assert.equal(response.isError, true);
       assert.match((response.payload as { error: string }).error, /regular file|Cannot read team workflow state/);
-      assert.equal(existsSync(join(stateRoot, 'team-state.json')), true);
+      assert.equal(existsSync(statePath), true);
 
       assert.equal(
         existsSync(join(stateRoot, 'authority', 'state-authority-tombstones.jsonl')),
@@ -1248,7 +1450,7 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('ignores locally proven same-root historical prepared evidence without replaying it', async () => {
+  it('does not replay a predecessor prepared write into a changed committed session scope', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-historical-evidence-'));
     try {
       const faulted = await withStateOperationFault('after_effects_before_committed_evidence', () => (
@@ -1279,22 +1481,109 @@ describe('state operations directory initialization', () => {
       const successor = await initializeStateAuthority({
         startup_cwd: wd,
         launch_id: 'state-operation-same-root-successor',
-        session_binding: { canonical_session_id: 'state-operation-same-root-session' },
+        session_binding: { canonical_session_id: 'state-operation-same-root-successor' },
       });
       assert.notEqual(successor.generation.generation_id, predecessor.generation.generation_id);
       assert.equal(successor.canonical_state_root, predecessor.canonical_state_root);
 
-      const statePath = join(successor.canonical_state_root, 'team-state.json');
-      await writeFile(statePath, JSON.stringify({ active: true, current_phase: 'current-generation' }));
+      const statePath = await committedSessionStatePath(
+        wd,
+        'team-state.json',
+        predecessor.session_binding?.canonical_session_id,
+      );
       const recovered = await executeStateOperation('state_get_status', {
         workingDirectory: wd,
-        session_id: 'state-operation-same-root-session',
+        session_id: 'state-operation-same-root-successor',
       });
       assert.equal(recovered.isError, undefined);
       assert.equal(
-        (JSON.parse(await readFile(statePath, 'utf-8')) as { current_phase?: string }).current_phase,
-        'current-generation',
+        existsSync(await committedSessionStatePath(wd, 'team-state.json', 'state-operation-same-root-successor')),
+        false,
       );
+      assert.equal(
+        (JSON.parse(await readFile(statePath, 'utf-8')) as { current_phase?: string }).current_phase,
+        'historical-prepared',
+      );
+      const evidence = (await readFile(
+        join(successor.canonical_state_root, 'authority', 'state-authority-tombstones.jsonl'),
+        'utf-8',
+      )).trim().split('\n').map((line) => JSON.parse(line) as {
+        event?: { kind?: string; stage?: string; operation_id?: string; recovery_args?: { current_phase?: unknown } };
+      });
+      const prepared = evidence.find((record) => (
+        record.event?.kind === 'state_write_transaction'
+        && record.event.stage === 'prepared'
+        && record.event.recovery_args?.current_phase === 'historical-prepared'
+      ));
+      const preparedOperationId = prepared?.event?.operation_id;
+      assert.ok(preparedOperationId);
+      assert.equal(evidence.some((record) => (
+        record.event?.kind === 'state_write_transaction'
+        && record.event.stage === 'committed'
+        && record.event.operation_id === preparedOperationId
+      )), true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a locally proven same-root predecessor prepared clear through generation rollover', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-historical-clear-'));
+    try {
+      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      const established = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'team',
+        active: true,
+        current_phase: 'running',
+      });
+      assert.equal(established.isError, undefined);
+      const faulted = await withStateOperationFault('after_effects_before_committed_evidence', () => (
+        executeStateOperation('state_clear', { workingDirectory: wd, mode: 'team' })
+      ));
+      assert.equal(faulted.isError, true);
+      assert.equal(existsSync(statePath), false);
+
+      const predecessor = await resolveStateAuthorityForGuard({
+        startup_cwd: wd,
+        observed_cwd: wd,
+      });
+      const predecessorGeneration = JSON.parse(
+        await readFile(predecessor.authority_path, 'utf-8'),
+      ) as Record<string, unknown>;
+      await writeFile(predecessor.authority_path, `${JSON.stringify({
+        ...predecessorGeneration,
+        created_by_pid: 2147483001,
+        created_by_process_started_at: 'linux:1',
+        created_by_boot_id: 'retired-owner',
+        created_by_command_digest: 'a'.repeat(64),
+      })}\n`);
+      const successor = await initializeStateAuthority({
+        startup_cwd: wd,
+        launch_id: 'state-operation-same-root-clear-successor',
+        session_binding: { canonical_session_id: 'state-operation-same-root-clear-session' },
+      });
+
+      const recovered = await executeStateOperation('state_get_status', { workingDirectory: wd });
+      assert.equal(recovered.isError, undefined);
+      assert.equal(existsSync(statePath), false);
+      const evidence = (await readFile(
+        join(successor.canonical_state_root, 'authority', 'state-authority-tombstones.jsonl'),
+        'utf-8',
+      )).trim().split('\n').map((line) => JSON.parse(line) as {
+        event?: { kind?: string; stage?: string; operation_id?: string };
+      });
+      const prepared = evidence.find((record) => (
+        record.event?.kind === 'state_clear_tombstone'
+        && record.event.stage === 'prepared'
+      ));
+      const preparedOperationId = prepared?.event?.operation_id;
+      assert.ok(preparedOperationId);
+      assert.equal(evidence.some((record) => (
+        record.event?.kind === 'state_clear_tombstone'
+        && record.event.stage === 'committed'
+        && record.event.operation_id === preparedOperationId
+      )), true);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1303,7 +1592,7 @@ describe('state operations directory initialization', () => {
   it('repairs one torn evidence tail before replaying and accepting the next mutation', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-torn-evidence-tail-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const faulted = await withStateOperationFault('after_effects_before_committed_evidence', () => (
         executeStateOperation('state_write', {
           workingDirectory: wd,
@@ -1313,6 +1602,7 @@ describe('state operations directory initialization', () => {
         })
       ));
       assert.equal(faulted.isError, true);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
 
       const evidencePath = join(wd, '.omx', 'state', 'authority', 'state-authority-tombstones.jsonl');
       const evidenceBeforeRepair = (await readFile(evidencePath, 'utf-8'))
@@ -1402,7 +1692,7 @@ describe('state operations directory initialization', () => {
       });
       assert.equal(written.isError, undefined);
 
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      const statePath = await committedSessionStatePath(wd, 'team-state.json');
       const evidencePath = join(wd, '.omx', 'state', 'authority', 'state-authority-tombstones.jsonl');
       const firstEvidenceLine = (await readFile(evidencePath, 'utf-8')).split('\n').find(Boolean);
       assert.ok(firstEvidenceLine);
@@ -1425,7 +1715,7 @@ describe('state operations directory initialization', () => {
       assert.equal(denied.isError, true);
       assert.match(
         String((denied.payload as { error?: unknown }).error),
-        /fence outside the current authority generation/,
+        /fence outside (?:the current|its referenced) authority generation/,
       );
       assert.equal(
         (JSON.parse(await readFile(statePath, 'utf-8')) as { current_phase?: string }).current_phase,
@@ -1439,7 +1729,7 @@ describe('state operations directory initialization', () => {
   it('denies state-write recovery when persisted targets differ from the active authority scope', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-mismatched-write-targets-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const faulted = await withStateOperationFault('after_effects_before_committed_evidence', () => (
         executeStateOperation('state_write', {
           workingDirectory: wd,
@@ -1449,6 +1739,7 @@ describe('state operations directory initialization', () => {
         })
       ));
       assert.equal(faulted.isError, true);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
 
       const evidencePath = join(wd, '.omx', 'state', 'authority', 'state-authority-tombstones.jsonl');
       const preparedLine = (await readFile(evidencePath, 'utf-8'))
@@ -1564,7 +1855,7 @@ describe('state operations directory initialization', () => {
   it('commits prepared A before concurrent B writes so stale recovery cannot overwrite B', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-write-evidence-recovery-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const faulted = await withStateOperationFault('after_effects_before_committed_evidence', () => (
         executeStateOperation('state_write', {
           workingDirectory: wd,
@@ -1574,6 +1865,7 @@ describe('state operations directory initialization', () => {
         })
       ));
       assert.equal(faulted.isError, true);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
       assert.match((faulted.payload as { error: string }).error, /after_effects_before_committed_evidence/);
       assert.equal(existsSync(statePath), true);
 
@@ -1637,7 +1929,7 @@ describe('state operations directory initialization', () => {
   it('keeps a cross-process prepared crash inside the newer mutation transaction', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-cross-process-recovery-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const barrierDir = join(wd, 'barrier');
       const reachedPath = join(barrierDir, 'before_mutation_transaction.reached');
       const releasePath = join(barrierDir, 'before_mutation_transaction.release');
@@ -1651,6 +1943,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'baseline',
       });
       assert.equal(established.isError, undefined);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
 
       const newerMutation = executeStateOperationInChild(
         operationsModuleUrl,
@@ -1765,7 +2058,7 @@ describe('state operations directory initialization', () => {
     try {
       const sessionId = 'sess-clear-recovery';
       const lateSessionId = 'sess-created-after-prepare';
-      const rootPath = join(wd, '.omx', 'state', 'team-state.json');
+      let rootPath: string;
       const sessionPath = join(wd, '.omx', 'state', 'sessions', sessionId, 'team-state.json');
       const latePath = join(wd, '.omx', 'state', 'sessions', lateSessionId, 'team-state.json');
 
@@ -1776,6 +2069,7 @@ describe('state operations directory initialization', () => {
         const response = await executeStateOperation('state_write', args);
         assert.equal(response.isError, undefined);
       }
+      rootPath = await committedSessionStatePath(wd, 'team-state.json');
       assert.equal(existsSync(rootPath), true);
       assert.equal(existsSync(sessionPath), true);
 
@@ -1910,7 +2204,7 @@ describe('state operations directory initialization', () => {
   it('does not delete through a symlink-replaced state target after its descriptor-safe unlink seam', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-unlink-race-'));
     try {
-      const statePath = join(wd, '.omx', 'state', 'team-state.json');
+      let statePath: string;
       const outsideState = join(wd, 'outside-state.json');
       const barrierDir = join(wd, 'barrier');
       const point = 'before_state_unlink';
@@ -1923,6 +2217,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'baseline',
       });
       assert.equal(established.isError, undefined);
+      statePath = await committedSessionStatePath(wd, 'team-state.json');
       const pending = executeStateOperationInChild(
         new URL('../operations.js', import.meta.url).href,
         'state_clear',
@@ -1956,6 +2251,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'running',
       });
       assert.equal(established.isError, undefined);
+      await rm(join(stateRoot, 'sessions'), { recursive: true, force: true });
       await mkdir(outside, { recursive: true });
       await symlink(outside, join(stateRoot, 'sessions'), 'dir');
 
@@ -1982,7 +2278,7 @@ describe('state operations directory initialization', () => {
         assert.match((response.payload as { error: string }).error, /symbolic link/);
       }
       assert.equal(existsSync(join(outside, sessionId, 'team-state.json')), false);
-      assert.equal(existsSync(join(stateRoot, 'team-state.json')), true);
+      assert.equal(existsSync(await committedSessionStatePath(wd, 'team-state.json')), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1993,7 +2289,7 @@ describe('state operations directory initialization', () => {
     try {
       const stateRoot = join(wd, '.omx', 'state');
       const outside = join(wd, 'outside');
-      const teamPath = join(stateRoot, 'team-state.json');
+      let teamPath: string;
       const established = await executeStateOperation('state_write', {
         workingDirectory: wd,
         mode: 'team',
@@ -2001,6 +2297,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'running',
       });
       assert.equal(established.isError, undefined);
+      teamPath = await committedSessionStatePath(wd, 'team-state.json');
       await mkdir(outside, { recursive: true });
       const outsideTeamState = join(outside, 'team-state.json');
       await writeFile(outsideTeamState, JSON.stringify({ active: true, current_phase: 'outside-root' }));
@@ -2159,6 +2456,7 @@ describe('state operations directory initialization', () => {
         join(sessionDir, 'deep-interview-state.json'),
         JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'session-active' }, null, 2),
       );
+      await ensureTestOperationAuthority(wd, sessionId);
 
       await executeStateOperation('state_clear', {
         workingDirectory: wd,
@@ -2388,6 +2686,7 @@ describe('state operations directory initialization', () => {
       };
       await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify(staleSkillState, null, 2));
       await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify(staleSkillState, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -2540,6 +2839,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'planning',
         session_id: sessionId,
       }, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -2872,6 +3172,7 @@ describe('state operations directory initialization', () => {
         current_phase: 'planning',
         session_id: sessionId,
       }, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -2910,6 +3211,7 @@ describe('state operations directory initialization', () => {
         session_id: sessionId,
         ralplan_consensus_gate: consensusGate,
       }, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -2937,6 +3239,12 @@ describe('state operations directory initialization', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-ralplan-complete-update-mode-'));
     try {
       const sessionId = 'sess-ralplan-complete-update-mode';
+      await initializeStateAuthority({
+        startup_cwd: wd,
+        observed_cwd: wd,
+        launch_id: 'ralplan-update-mode-authority',
+        session_binding: { canonical_session_id: sessionId },
+      });
       const consensusGate = await writeNativeRalplanConsensusGate(wd, sessionId);
       const stateDir = join(wd, '.omx', 'state');
       const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -3019,6 +3327,7 @@ describe('state operations directory initialization', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-ralplan-update-mode-forged-complete-'));
     try {
       const sessionId = 'sess-ralplan-update-mode-forged-complete';
+      await ensureTestOperationAuthority(wd, sessionId);
       await writeNativeSubagentTracking(wd, sessionId);
       const stateDir = join(wd, '.omx', 'state');
       const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -3053,7 +3362,7 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('does not retarget committed authority and terminalizes the owning Ralplan session despite stale foreign observed cwd metadata', async () => {
+  it('fails closed when committed authority session metadata belongs to a foreign workspace', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-ralplan-stale-session-'));
     try {
       const staleSessionId = 'sess-ralplan-stale';
@@ -3106,20 +3415,15 @@ describe('state operations directory initialization', () => {
         },
       });
 
-      assert.equal(response.isError, undefined, JSON.stringify(response.payload));
-      const responsePath = String((response.payload as { path?: unknown }).path ?? '');
-      assert.equal(responsePath.startsWith(`${stateDir}/`), true);
+      assert.equal(response.isError, true);
+      assert.match(
+        String((response.payload as { error?: unknown }).error),
+        /session metadata belongs to a different workspace/,
+      );
       assert.equal(existsSync(`${wd}-different-project`), false);
       const rootRalplan = JSON.parse(await readFile(join(stateDir, 'ralplan-state.json'), 'utf-8')) as Record<string, unknown>;
-      assert.equal(rootRalplan.active, false);
-      assert.equal(rootRalplan.current_phase, 'complete');
-      const sessionRalplanPath = join(sessionDir, 'ralplan-state.json');
-      const sessionSkillPath = join(sessionDir, 'skill-active-state.json');
-      assert.equal(existsSync(sessionRalplanPath), true);
-      assert.equal(existsSync(sessionSkillPath), false);
-      const sessionRalplan = JSON.parse(await readFile(sessionRalplanPath, 'utf-8')) as Record<string, unknown>;
-      assert.equal(sessionRalplan.active, false);
-      assert.equal(sessionRalplan.current_phase, 'complete');
+      assert.equal(rootRalplan.active, true);
+      assert.equal(rootRalplan.current_phase, 'planning');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3137,6 +3441,7 @@ describe('state operations directory initialization', () => {
         active: true,
         current_phase: 'running',
       }, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -3155,7 +3460,7 @@ describe('state operations directory initialization', () => {
       const listed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(listed.payload, { active_modes: ['team'] });
+      assert.deepEqual(listed.payload, { active_modes: [] });
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3248,7 +3553,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['ralplan'] });
+      assert.deepEqual(rootListed.payload, { active_modes: [] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -3308,7 +3613,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['ralplan'] });
+      assert.deepEqual(rootListed.payload, { active_modes: [] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -3381,7 +3686,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['ralplan'] });
+      assert.deepEqual(rootListed.payload, { active_modes: [] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -3511,7 +3816,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['ralplan'] });
+      assert.deepEqual(rootListed.payload, { active_modes: [] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -3575,7 +3880,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['ralplan'] });
+      assert.deepEqual(rootListed.payload, { active_modes: [] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -3635,6 +3940,7 @@ describe('state operations directory initialization', () => {
       };
       await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify(mixedSkillState, null, 2));
       await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify(mixedSkillState, null, 2));
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const response = await executeStateOperation('state_write', {
         workingDirectory: wd,
@@ -3945,7 +4251,7 @@ describe('state operations directory initialization', () => {
       const rootListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
       });
-      assert.deepEqual(rootListed.payload, { active_modes: ['autoresearch'] });
+      assert.deepEqual(rootListed.payload, { active_modes: ['team'] });
 
       const sessionListed = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
@@ -6659,6 +6965,7 @@ describe('state operations directory initialization', () => {
           owner_omx_session_id: sessionId,
         }, null, 2),
       );
+      await ensureTestOperationAuthority(wd, sessionId);
 
       const writeResult = await executeStateOperation('state_write', {
         workingDirectory: wd,

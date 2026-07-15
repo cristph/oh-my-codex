@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { afterEach, beforeEach, describe, it, type TestContext } from 'node:test';
+import { afterEach, beforeEach, describe, it as nodeIt, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
@@ -9,9 +9,9 @@ import { delimiter, join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { buildLeaderMonitoringHints, parseTeamStartArgs, teamCommand } from '../team.js';
-import { buildStateAuthorityTransportEnv } from '../index.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
-import { readModeState } from '../../modes/base.js';
+
 import { readApprovedExecutionLaunchHint } from '../../planning/artifacts.js';
 import { buildRepoAwareTeamExecutionPlan } from '../../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../../team/state.js';
@@ -37,6 +37,10 @@ import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture }
 
 const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
 const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
+
+function it(name: string, fn: (t: TestContext) => void | Promise<void>): void {
+  nodeIt(name, { concurrency: false }, fn);
+}
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
 function pathEnvironmentKey(): 'PATH' | 'Path' {
@@ -186,6 +190,94 @@ function withMockPromptModeCodexAllowed<T>(fn: () => T): T {
     return result;
   } finally {
     if (restoreImmediately) restore();
+  }
+}
+
+const AUTHENTICATED_TEAM_COMMAND_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+  'OMX_TEAM_WORKER',
+] as const;
+
+async function buildAuthenticatedTeamCommandTransport(
+  cwd: string,
+  sessionId: string,
+): Promise<NodeJS.ProcessEnv> {
+  const stateRoot = join(cwd, '.omx', 'state');
+  await mkdir(stateRoot, { recursive: true });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(stateRoot, 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `cli-team-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
+
+
+async function readCanonicalSessionTeamModeState(
+  cwd: string,
+  sessionId: string,
+): Promise<{
+  active?: boolean;
+  current_phase?: string;
+  display_name?: string;
+  team_name?: string;
+} | null> {
+  try {
+    return JSON.parse(
+      await readFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'team-state.json'), 'utf-8'),
+    ) as {
+      active?: boolean;
+      current_phase?: string;
+      display_name?: string;
+      team_name?: string;
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function withAuthenticatedTeamCommandAuthority<T>(
+  cwd: string,
+  sessionId: string,
+  run: () => Promise<T>,
+  _bindSession = false,
+): Promise<T> {
+  const previousCwd = process.cwd();
+  const previous = new Map(
+    AUTHENTICATED_TEAM_COMMAND_ENV_KEYS.map((key) => [key, process.env[key]]),
+  );
+  try {
+    process.chdir(cwd);
+    await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+    await chmod(join(cwd, '.omx'), 0o700);
+    await chmod(join(cwd, '.omx', 'state'), 0o700);
+    await chmod(join(cwd, '.omx', 'state', 'sessions'), 0o700);
+    await chmod(join(cwd, '.omx', 'state', 'sessions', sessionId), 0o700);
+    const transport = await buildAuthenticatedTeamCommandTransport(cwd, sessionId);
+    Object.assign(process.env, transport);
+    delete process.env.OMX_TEAM_STATE_ROOT;
+    delete process.env.OMX_TEAM_WORKER;
+    return await run();
+  } finally {
+    for (const key of AUTHENTICATED_TEAM_COMMAND_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+    process.chdir(previousCwd);
   }
 }
 
@@ -1418,7 +1510,7 @@ describe('teamCommand shutdown --force parsing', () => {
     assert.equal(force, true);
   });
 
-  it('persists cancelled team mode state on shutdown even when no team mode state existed beforehand', async () => {
+  it('persists cancellation to the authenticated session mode state on shutdown', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-mode-state-'));
     const previousCwd = process.cwd();
     const originalLog = console.log;
@@ -1433,24 +1525,27 @@ describe('teamCommand shutdown --force parsing', () => {
         join(wd, '.omx', 'state', 'session.json'),
         JSON.stringify({ session_id: 'sess-team-shutdown-state' }),
       );
-      await initTeamState(
-        'team-shutdown-mode-state',
-        'persist cancelled team mode state after shutdown',
-        'executor',
-        1,
-        wd,
-      );
-
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       console.warn = (...args: unknown[]) => warns.push(args.map(String).join(' '));
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-shutdown-state',
+        async () => {
+          await initTeamState(
+            'team-shutdown-mode-state',
+            'persist cancelled team mode state after shutdown',
+            'executor',
+            1,
+            wd,
+          );
+          await teamCommand(['shutdown', 'team-shutdown-mode-state', '--force']);
+        },
+      );
 
-      await teamCommand(['shutdown', 'team-shutdown-mode-state', '--force']);
-
-      const state = await readModeState('team', wd);
-      assert.ok(state);
-      assert.equal(state?.active, false);
-      assert.equal(state?.current_phase, 'cancelled');
-      assert.equal(state?.team_name, 'team-shutdown-mode-state');
+      const shutdownState = await readCanonicalSessionTeamModeState(wd, 'sess-team-shutdown-state');
+      assert.equal(shutdownState?.active, false);
+      assert.equal(shutdownState?.current_phase, 'cancelled');
+      assert.equal(shutdownState?.team_name, 'team-shutdown-mode-state');
       assert.equal(warns.length, 0);
       assert.ok(
         logs.some((line) =>
@@ -1488,15 +1583,16 @@ describe('teamCommand shutdown --force parsing', () => {
           team_name: teamName,
         }, null, 2),
       );
-      await initTeamState(
-        teamName,
-        'persist cancelled session-scoped team mode state after shutdown',
-        'executor',
-        1,
-        wd,
-      );
-
-      await teamCommand(['shutdown', teamName, '--force']);
+      await withAuthenticatedTeamCommandAuthority(wd, sessionId, async () => {
+        await initTeamState(
+          teamName,
+          'persist cancelled session-scoped team mode state after shutdown',
+          'executor',
+          1,
+          wd,
+        );
+        await teamCommand(['shutdown', teamName, '--force']);
+      });
 
       const scopedState = JSON.parse(
         await readFile(join(scopedStateDir, 'team-state.json'), 'utf-8'),
@@ -1535,15 +1631,16 @@ describe('teamCommand shutdown --force parsing', () => {
           team_name: teamName,
         }, null, 2),
       );
-      await initTeamState(
-        teamName,
-        'shutdown should not create scoped team mode state from a root-only mode state',
-        'executor',
-        1,
-        wd,
-      );
-
-      await teamCommand(['shutdown', teamName, '--force']);
+      await withAuthenticatedTeamCommandAuthority(wd, sessionId, async () => {
+        await initTeamState(
+          teamName,
+          'shutdown should not create scoped team mode state from a root-only mode state',
+          'executor',
+          1,
+          wd,
+        );
+        await teamCommand(['shutdown', teamName, '--force']);
+      });
 
       assert.equal(existsSync(scopedStatePath), false);
       const rootState = JSON.parse(
@@ -1587,15 +1684,16 @@ describe('teamCommand shutdown --force parsing', () => {
           team_name: teamName,
         }, null, 2),
       );
-      await initTeamState(
-        teamName,
-        'shutdown should ignore stale session.json when only root team mode state exists',
-        'executor',
-        1,
-        wd,
-      );
-
-      await teamCommand(['shutdown', teamName, '--force']);
+      await withAuthenticatedTeamCommandAuthority(wd, staleSessionId, async () => {
+        await initTeamState(
+          teamName,
+          'shutdown should ignore stale session.json when only root team mode state exists',
+          'executor',
+          1,
+          wd,
+        );
+        await teamCommand(['shutdown', teamName, '--force']);
+      });
 
       assert.equal(existsSync(scopedStatePath), false);
       const rootState = JSON.parse(
@@ -1695,7 +1793,11 @@ esac
     }
 
     try {
-      await initTeamState('shared-shutdown-cli', 'shared shutdown cli test', 'executor', 2, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'shared-shutdown-cli', async () => initTeamState('shared-shutdown-cli', 'shared shutdown cli test', 'executor', 2, wd));
+      const authorityTransport = await buildAuthenticatedTeamCommandTransport(
+        wd,
+        'shared-shutdown-cli',
+      );
       const config = await readTeamConfig('shared-shutdown-cli', wd);
       assert.ok(config);
       if (!config) return;
@@ -1710,8 +1812,8 @@ esac
         cwd: wd,
         env: {
           ...process.env,
+          ...authorityTransport,
           [pathKey]: prependPath(binDir, previousPath),
-          OMX_TEAM_STATE_ROOT: join(wd, '.omx', 'state'),
         },
       });
 
@@ -1730,7 +1832,7 @@ esac
     }
   });
 
-  it('keeps the shutdown command alive when executed inside the leader pane PTY', { concurrency: false }, async (t) => {
+  it('keeps the shutdown command alive when executed inside the leader pane PTY', async (t) => {
     skipUnlessTmux(t);
 
     const wd = await realpath(await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-in-pane-')));
@@ -1742,7 +1844,11 @@ esac
         const workerPaneOne = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
         const workerPaneTwo = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
 
-        await initTeamState(teamName, 'shared shutdown in-pane test', 'executor', 2, wd);
+        await withAuthenticatedTeamCommandAuthority(wd, 'shared-shutdown-in-pane', async () => initTeamState(teamName, 'shared shutdown in-pane test', 'executor', 2, wd));
+        const authorityTransport = await buildAuthenticatedTeamCommandTransport(
+          wd,
+          'shared-shutdown-in-pane',
+        );
         const config = await readTeamConfig(teamName, wd);
         assert.ok(config);
         if (!config) return;
@@ -1757,8 +1863,8 @@ esac
           cwd: wd,
           env: {
             ...process.env,
+            ...authorityTransport,
             OMX_AUTO_UPDATE: '0',
-            OMX_TEAM_STATE_ROOT: teamStateRoot,
             TMUX: fixture.env.TMUX,
             TMUX_PANE: fixture.leaderPaneId,
           },
@@ -1913,7 +2019,7 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('api-read-events', 'api event test', 'executor', 1, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-events', async () => initTeamState('api-read-events', 'api event test', 'executor', 1, wd));
       await appendTeamEvent('api-read-events', {
         type: 'worker_idle',
         worker: 'worker-1',
@@ -1922,7 +2028,7 @@ describe('teamCommand api', () => {
       }, wd);
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-events', async () => teamCommand([
         'api',
         'read-events',
         '--input',
@@ -1933,7 +2039,7 @@ describe('teamCommand api', () => {
           task_id: '1',
         }),
         '--json',
-      ]);
+      ]));
 
       assert.equal(logs.length, 1);
       const envelope = JSON.parse(logs[0]) as {
@@ -1967,7 +2073,7 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('api-read-idle', 'api idle state test', 'executor', 2, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-idle', async () => initTeamState('api-read-idle', 'api idle state test', 'executor', 2, wd));
       await writeMonitorSnapshot('api-read-idle', {
         taskStatusById: {},
         workerAliveByName: { 'worker-1': true, 'worker-2': true },
@@ -1985,13 +2091,13 @@ describe('teamCommand api', () => {
       }, wd);
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-idle', async () => teamCommand([
         'api',
         'read-idle-state',
         '--input',
         JSON.stringify({ team_name: 'api-read-idle' }),
         '--json',
-      ]);
+      ]));
 
       assert.equal(logs.length, 1);
       const envelope = JSON.parse(logs[0]) as {
@@ -2030,7 +2136,7 @@ describe('teamCommand api', () => {
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
       process.chdir(wd);
-      await initTeamState('api-read-stall', 'api stall state test', 'executor', 2, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-stall', async () => initTeamState('api-read-stall', 'api stall state test', 'executor', 2, wd));
       const task = await createTask('api-read-stall', {
         subject: 'Pending work',
         description: 'Needs leader attention',
@@ -2058,13 +2164,13 @@ describe('teamCommand api', () => {
         last_turn_at: '2026-03-10T10:00:00.000Z',
       }, wd);
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-stall', async () => teamCommand([
         'api',
         'get-summary',
         '--input',
         JSON.stringify({ team_name: 'api-read-stall' }),
         '--json',
-      ]);
+      ]));
       logs.length = 0;
 
       await updateWorkerHeartbeat('api-read-stall', 'worker-1', {
@@ -2100,13 +2206,13 @@ describe('teamCommand api', () => {
         stalled_for_ms: null,
       }, null, 2));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-read-stall', async () => teamCommand([
         'api',
         'read-stall-state',
         '--input',
         JSON.stringify({ team_name: 'api-read-stall' }),
         '--json',
-      ]);
+      ]));
 
       assert.equal(logs.length, 1);
       const envelope = JSON.parse(logs[0]) as {
@@ -2143,10 +2249,10 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('api-team', 'api test', 'executor', 1, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-send-message', async () => initTeamState('api-team', 'api test', 'executor', 1, wd));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-send-message', async () => teamCommand([
         'api',
         'send-message',
         '--input',
@@ -2157,7 +2263,7 @@ describe('teamCommand api', () => {
           body: 'ACK',
         }),
         '--json',
-      ]);
+      ]));
 
       assert.equal(logs.length, 1);
       const envelope = JSON.parse(logs[0]) as {
@@ -2218,10 +2324,10 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('lifecycle-team', 'lifecycle test', 'executor', 1, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-lifecycle', async () => initTeamState('lifecycle-team', 'lifecycle test', 'executor', 1, wd));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-lifecycle', async () => teamCommand([
         'api',
         'create-task',
         '--input',
@@ -2231,7 +2337,7 @@ describe('teamCommand api', () => {
           description: 'Created through CLI interop',
         }),
         '--json',
-      ]);
+      ]));
       const created = JSON.parse(logs.at(-1) ?? '{}') as {
         ok?: boolean;
         data?: { task?: { id?: string } };
@@ -2240,7 +2346,7 @@ describe('teamCommand api', () => {
       const taskId = created.data?.task?.id;
       assert.equal(typeof taskId, 'string');
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-lifecycle', async () => teamCommand([
         'api',
         'claim-task',
         '--input',
@@ -2251,7 +2357,7 @@ describe('teamCommand api', () => {
           expected_version: 1,
         }),
         '--json',
-      ]);
+      ]));
       const claimed = JSON.parse(logs.at(-1) ?? '{}') as {
         ok?: boolean;
         data?: { claimToken?: string };
@@ -2260,7 +2366,7 @@ describe('teamCommand api', () => {
       const claimToken = claimed.data?.claimToken;
       assert.equal(typeof claimToken, 'string');
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-lifecycle', async () => teamCommand([
         'api',
         'transition-task-status',
         '--input',
@@ -2272,7 +2378,7 @@ describe('teamCommand api', () => {
           claim_token: claimToken,
         }),
         '--json',
-      ]);
+      ]));
       const transitioned = JSON.parse(logs.at(-1) ?? '{}') as {
         ok?: boolean;
         data?: { ok?: boolean; task?: { status?: string } };
@@ -2295,10 +2401,10 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('event-team', 'event test', 'executor', 1, wd);
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-append-event', async () => initTeamState('event-team', 'event test', 'executor', 1, wd));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await teamCommand([
+      await withAuthenticatedTeamCommandAuthority(wd, 'api-append-event', async () => teamCommand([
         'api',
         'append-event',
         '--input',
@@ -2311,7 +2417,7 @@ describe('teamCommand api', () => {
           reason: 'leader_pane_missing_no_injection',
         }),
         '--json',
-      ]);
+      ]));
 
       const envelope = JSON.parse(logs.at(-1) ?? '{}') as {
         ok?: boolean;
@@ -2339,7 +2445,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-team', 'inspect worker panes', 'executor', 2, wd));
+      const config = await withAuthenticatedTeamCommandAuthority(wd, 'pane-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('pane-team', 'inspect worker panes', 'executor', 2, wd)));
       config.worker_launch_mode = 'prompt';
       await withoutTeamTestWorkerEnv(() => createTask('pane-team', {
         subject: 'Recover worker-1 progress',
@@ -2463,7 +2569,7 @@ describe('teamCommand status', () => {
       );
 
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-team']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-team'])));
 
       const output = logs.join('\n');
       assert.match(output, /panes: leader=%10 hud=%11/);
@@ -2480,7 +2586,7 @@ describe('teamCommand status', () => {
         .join('\n'), /omx sparkshell/);
 
       logs.length = 0;
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-team', '--model-inspect']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-team', '--model-inspect'])));
       const modelInspectOutput = logs.join('\n');
       assert.match(modelInspectOutput, /inspect_summary: [\s\S]*command=omx sparkshell --tmux-pane %21 --tail-lines 400/);
     } finally {
@@ -2511,13 +2617,14 @@ describe('teamCommand status', () => {
     previousEnv.set('OMX_TEAM_WORKER', process.env.OMX_TEAM_WORKER);
     try {
       process.chdir(wd);
+      Object.assign(process.env, transport);
+      delete process.env.OMX_TEAM_STATE_ROOT;
+      delete process.env.OMX_TEAM_WORKER;
       const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-conflict-team', 'deny conflicting pane lookup', 'executor', 1, wd));
       config.leader_pane_id = '%10';
       config.workers[0]!.pane_id = '%21';
       await saveTeamConfig(config, wd);
-      Object.assign(process.env, transport);
       process.env.OMX_TEAM_STATE_ROOT = join(wd, 'foreign-state');
-      delete process.env.OMX_TEAM_WORKER;
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       console.error = (...args: unknown[]) => stderr.push(args.map(String).join(' '));
       process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -2527,7 +2634,7 @@ describe('teamCommand status', () => {
 
       await assert.rejects(
         teamCommand(['status', 'pane-conflict-team']),
-        /conflicts with the inherited state authority/,
+        /conflicts with .*persisted.*session authority/,
       );
       assert.doesNotMatch([...logs, ...stderr].join('\n'), /leader=%10|worker-1=%21/);
     } finally {
@@ -2552,7 +2659,7 @@ describe('teamCommand status', () => {
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
       process.chdir(wd);
-      const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-json-team', 'inspect worker panes', 'executor', 1, wd));
+      const config = await withAuthenticatedTeamCommandAuthority(wd, 'pane-json-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('pane-json-team', 'inspect worker panes', 'executor', 1, wd)));
       config.worker_launch_mode = 'prompt';
       await withoutTeamTestWorkerEnv(() => createTask('pane-json-team', {
         subject: 'Recover worker-1 progress',
@@ -2632,7 +2739,7 @@ describe('teamCommand status', () => {
       );
 
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-json-team', '--json']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-json-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-json-team', '--json'])));
 
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
         schema_version?: string;
@@ -2957,7 +3064,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      const config = await withoutTeamTestWorkerEnv(() => initTeamState('workspace-mode-team', 'inspect workspace mode', 'executor', 1, wd));
+      const config = await withAuthenticatedTeamCommandAuthority(wd, 'workspace-mode-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('workspace-mode-team', 'inspect workspace mode', 'executor', 1, wd)));
       config.workspace_mode = 'worktree';
       const teamDir = join(wd, '.omx', 'state', 'team', 'workspace-mode-team');
       const configPath = join(teamDir, 'config.json');
@@ -2969,7 +3076,7 @@ describe('teamCommand status', () => {
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'workspace-mode-team']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'workspace-mode-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'workspace-mode-team'])));
 
       assert.ok(logs.some((line) => /workspace_mode: worktree/.test(line)));
     } finally {
@@ -2986,7 +3093,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      const config = await withoutTeamTestWorkerEnv(() => initTeamState('workspace-mode-json-team', 'inspect workspace mode', 'executor', 1, wd));
+      const config = await withAuthenticatedTeamCommandAuthority(wd, 'workspace-mode-json-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('workspace-mode-json-team', 'inspect workspace mode', 'executor', 1, wd)));
       config.workspace_mode = 'worktree';
       const teamDir = join(wd, '.omx', 'state', 'team', 'workspace-mode-json-team');
       const configPath = join(teamDir, 'config.json');
@@ -2998,7 +3105,7 @@ describe('teamCommand status', () => {
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'workspace-mode-json-team', '--json']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'workspace-mode-json-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'workspace-mode-json-team', '--json'])));
 
       const payload = JSON.parse(logs[0] ?? '{}') as { workspace_mode?: string | null; status?: string };
       assert.equal(payload.status, 'ok');
@@ -3017,7 +3124,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-json-team', 'inspect ultragoal guidance', 'executor', 1, wd));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-json-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-json-team', 'inspect ultragoal guidance', 'executor', 1, wd)));
       const plansDir = join(wd, '.omx', 'plans');
       await mkdir(plansDir, { recursive: true });
       const prdPath = join(plansDir, 'prd-ultragoal-json.md');
@@ -3064,7 +3171,7 @@ describe('teamCommand status', () => {
       });
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-json-team', '--json']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-json-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-json-team', '--json'])));
 
       const payload = JSON.parse(logs[0] ?? '{}') as {
         ultragoal_checkpoint_guidance?: {
@@ -3097,7 +3204,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-idle-json-team', 'inspect idle ultragoal status', 'executor', 1, wd));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-idle-json-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-idle-json-team', 'inspect idle ultragoal status', 'executor', 1, wd)));
       await mkdir(join(wd, '.omx', 'ultragoal'), { recursive: true });
       await writeFile(
         join(wd, '.omx', 'ultragoal', 'goals.json'),
@@ -3113,7 +3220,7 @@ describe('teamCommand status', () => {
       );
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-idle-json-team', '--json']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-idle-json-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-idle-json-team', '--json'])));
 
       const payload = JSON.parse(logs[0] ?? '{}') as {
         status?: string;
@@ -3135,7 +3242,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-text-team', 'inspect ultragoal text guidance', 'executor', 1, wd));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-text-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('ultragoal-text-team', 'inspect ultragoal text guidance', 'executor', 1, wd)));
       const plansDir = join(wd, '.omx', 'plans');
       await mkdir(plansDir, { recursive: true });
       const prdPath = join(plansDir, 'prd-ultragoal-text.md');
@@ -3182,7 +3289,7 @@ describe('teamCommand status', () => {
       });
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-text-team']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'ultragoal-text-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'ultragoal-text-team'])));
 
       const output = logs.join('\n');
       assert.match(output, /ultragoal_checkpoint_guidance/);
@@ -3234,10 +3341,10 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await withoutTeamTestWorkerEnv(() => initTeamState('activity-team', 'inspect activity', 'executor', 1, wd));
+      await withAuthenticatedTeamCommandAuthority(wd, 'activity-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('activity-team', 'inspect activity', 'executor', 1, wd)));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'activity-team', '--json']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'activity-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'activity-team', '--json'])));
 
       const activity = JSON.parse(await readFile(join(wd, '.omx', 'state', 'leader-runtime-activity.json'), 'utf-8')) as {
         last_activity_at?: string;
@@ -3263,7 +3370,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-tail-team', 'inspect worker panes', 'executor', 1, wd));
+      const config = await withAuthenticatedTeamCommandAuthority(wd, 'pane-tail-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('pane-tail-team', 'inspect worker panes', 'executor', 1, wd)));
       config.workers[0]!.pane_id = '%51';
       const manifestPath = join(wd, '.omx', 'state', 'team', 'pane-tail-team', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as {
@@ -3283,15 +3390,15 @@ describe('teamCommand status', () => {
       );
 
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--tail-lines', '600']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-tail-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--tail-lines', '600'])));
       assert.match(logs.join('\n'), /inspect_worker-1: tmux capture-pane -p -t %51 -S -600/);
 
       logs.length = 0;
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--model-inspect', '--tail-lines', '600']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-tail-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--model-inspect', '--tail-lines', '600'])));
       assert.match(logs.join('\n'), /inspect_worker-1: omx sparkshell --tmux-pane %51 --tail-lines 600/);
 
       logs.length = 0;
-      await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--json', '--tail-lines=550']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'pane-tail-team', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--json', '--tail-lines=550'])));
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
         tail_lines?: number;
         panes?: { sparkshell_commands?: Record<string, string> };
@@ -3324,7 +3431,7 @@ describe('teamCommand await', () => {
     const logs: string[] = [];
     const originalLog = console.log;
     const teamTask = 'project scoped architect reasoning override';
-    let displayTeamName = '';
+
 
     await mkdir(binDir, { recursive: true });
     await mkdir(captureDir, { recursive: true });
@@ -3356,6 +3463,7 @@ process.on('SIGTERM', () => process.exit(0));
     );
 
     let runtimeTeamName: string | null = null;
+    const displayTeamName = parseTeamStartArgs(['1:architect', teamTask]).parsed.teamName;
     try {
       process.chdir(wd);
       process.env[pathKey] = prependPath(binDir, previousPath);
@@ -3367,13 +3475,18 @@ process.on('SIGTERM', () => process.exit(0));
       process.env.OMX_ARGV_CAPTURE_DIR = captureDir;
       process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-      displayTeamName = parseTeamStartArgs(['1:architect', teamTask]).parsed.teamName;
 
-      await withMockPromptModeCodexAllowed(() =>
-        withoutTeamTestWorkerEnv(() => teamCommand(['1:architect', teamTask])));
 
-      const startedState = await readModeState('team', wd);
-      runtimeTeamName = String(startedState?.team_name ?? parseTeamStartArgs(['1:architect', teamTask]).parsed.teamName);
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-project-reasoning',
+        () => withMockPromptModeCodexAllowed(() => teamCommand(['1:architect', teamTask])),
+        true,
+      );
+
+      const startedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-project-reasoning');
+      assert.ok(typeof startedState?.team_name === 'string');
+      runtimeTeamName = startedState.team_name;
 
       let captured: { argv: string[]; codexHome: string | null } | null = null;
       for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -3392,7 +3505,11 @@ process.on('SIGTERM', () => process.exit(0));
     } finally {
       console.log = originalLog;
       if (runtimeTeamName) {
-        await shutdownTeam(runtimeTeamName, wd, { force: true }).catch(() => {});
+        await withAuthenticatedTeamCommandAuthority(
+          wd,
+          'sess-team-project-reasoning',
+          () => shutdownTeam(runtimeTeamName!, wd, { force: true }),
+        ).catch(() => {});
       }
       process.chdir(previousCwd);
       if (typeof previousPath === 'string') process.env[pathKey] = previousPath;
@@ -3422,20 +3539,20 @@ process.on('SIGTERM', () => process.exit(0));
     const originalLog = console.log;
     try {
       process.chdir(wd);
-      await initTeamState('await-team', 'await test', 'executor', 1, wd);
-      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
-
-      const waitPromise = teamCommand(['await', 'await-team', '--json', '--timeout-ms', '500']);
-      setTimeout(() => {
-        void appendTeamEvent('await-team', {
+      await withAuthenticatedTeamCommandAuthority(wd, 'await-team', async () => {
+        await initTeamState('await-team', 'await test', 'executor', 1, wd);
+        console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+        const waitPromise = teamCommand(['await', 'await-team', '--json', '--timeout-ms', '500']);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await appendTeamEvent('await-team', {
           type: 'worker_state_changed',
           worker: 'worker-1',
           state: 'blocked',
           prev_state: 'working',
           reason: 'needs_follow_up',
         }, wd);
-      }, 50);
-      await waitPromise;
+        await waitPromise;
+      });
 
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
         team_name?: string;
@@ -3471,13 +3588,12 @@ process.on('SIGTERM', () => process.exit(0));
     const originalLog = console.log;
     const originalStderrWrite = process.stderr.write.bind(process.stderr);
     const teamTask = 'issue 662 prompt dead worker smoke';
-    const teamName = parseTeamStartArgs(['1:executor', teamTask]).parsed.teamName;
 
     await mkdir(binDir, { recursive: true });
     await writeNodeCommandStub(
       binDir,
       'codex',
-      `setTimeout(() => process.exit(0), 0);
+      `setTimeout(() => process.exit(0), 300);
 process.stdin.resume();
 process.on('SIGTERM', () => process.exit(0));
 `,
@@ -3495,16 +3611,21 @@ process.on('SIGTERM', () => process.exit(0));
         return true;
       }) as typeof process.stderr.write;
 
-      await withMockPromptModeCodexAllowed(() =>
-        withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
-      const startedState = await readModeState('team', wd);
-      const runtimeTeamName = String(startedState?.team_name ?? teamName);
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-await-prompt-dead',
+        () => withMockPromptModeCodexAllowed(() => teamCommand(['1:executor', teamTask])),
+        true,
+      );
+      const startedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-await-prompt-dead');
+      assert.ok(typeof startedState?.team_name === 'string');
+      const runtimeTeamName = startedState.team_name;
 
       let statusOutput = '';
       for (let attempt = 0; attempt < 50; attempt += 1) {
         logs.length = 0;
         stderr.length = 0;
-        await withoutTeamTestWorkerEnv(() => teamCommand(['status', runtimeTeamName]));
+        await withAuthenticatedTeamCommandAuthority(wd, 'sess-team-await-prompt-dead', async () => withoutTeamTestWorkerEnv(() => teamCommand(['status', runtimeTeamName])));
         statusOutput = logs.join('\n');
         if (/phase=failed/.test(statusOutput)) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -3513,7 +3634,7 @@ process.on('SIGTERM', () => process.exit(0));
       assert.doesNotMatch(stderr.join('\n'), /ESRCH/);
 
       logs.length = 0;
-      await withoutTeamTestWorkerEnv(() => teamCommand(['await', runtimeTeamName, '--json', '--timeout-ms', '250']));
+      await withAuthenticatedTeamCommandAuthority(wd, 'sess-team-await-prompt-dead', async () => withoutTeamTestWorkerEnv(() => teamCommand(['await', runtimeTeamName, '--json', '--timeout-ms', '250'])));
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
         team_name?: string;
         status?: string;
@@ -3568,22 +3689,31 @@ process.on('SIGTERM', () => process.exit(0));
       process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
       process.env.OMX_TEAM_WORKER_CLI = 'codex';
 
-      await withMockPromptModeCodexAllowed(() =>
-        withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-mode-state',
+        () => withMockPromptModeCodexAllowed(() => teamCommand(['1:executor', teamTask])),
+        true,
+      );
 
-      const startedState = await readModeState('team', wd);
-      const runtimeTeamName = String(startedState?.team_name ?? teamName);
+      const startedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-mode-state');
       assert.equal(startedState?.active, true);
-      assert.equal(startedState?.team_name, runtimeTeamName);
-      assert.equal(startedState?.display_name, teamName);
-      assert.equal(startedState?.current_phase, 'team-exec');
+      assert.ok(typeof startedState?.team_name === 'string');
+      const runtimeTeamName = startedState.team_name;
+      assert.equal(startedState.display_name, teamName);
+      assert.equal(startedState.current_phase, 'team-exec');
 
-      await rm(join(wd, '.omx', 'state', 'team-state.json'), { force: true });
-      assert.equal(await readModeState('team', wd), null);
+      await rm(join(wd, '.omx', 'state', 'sessions', 'sess-team-mode-state', 'team-state.json'), { force: true });
+      assert.equal(await readCanonicalSessionTeamModeState(wd, 'sess-team-mode-state'), null);
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', runtimeTeamName]));
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-mode-state',
+        () => teamCommand(['resume', runtimeTeamName]),
+        true,
+      );
 
-      const resumedState = await readModeState('team', wd);
+      const resumedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-mode-state');
       assert.equal(resumedState?.active, true);
       assert.equal(resumedState?.team_name, runtimeTeamName);
       assert.equal(resumedState?.current_phase, 'team-exec');
@@ -3611,7 +3741,6 @@ process.on('SIGTERM', () => process.exit(0));
     const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const teamTask = 'issue 772 terminal team mode state';
-    const teamName = parseTeamStartArgs(['1:executor', teamTask]).parsed.teamName;
 
     await mkdir(binDir, { recursive: true });
     await writeNodeCommandStub(
@@ -3630,10 +3759,16 @@ process.on('SIGTERM', () => process.exit(0));
       process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
       process.env.OMX_TEAM_WORKER_CLI = 'codex';
 
-      await withMockPromptModeCodexAllowed(() =>
-        withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
-      const startedState = await readModeState('team', wd);
-      const runtimeTeamName = String(startedState?.team_name ?? teamName);
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-mode-terminal',
+        () => withMockPromptModeCodexAllowed(() => teamCommand(['1:executor', teamTask])),
+        true,
+      );
+      const startedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-mode-terminal');
+      assert.ok(typeof startedState?.team_name === 'string');
+      const runtimeTeamName = startedState.team_name;
+      await mkdir(join(wd, '.omx', 'state', 'team', runtimeTeamName), { recursive: true });
       await writeFile(
         join(wd, '.omx', 'state', 'team', runtimeTeamName, 'phase.json'),
         JSON.stringify({
@@ -3646,9 +3781,14 @@ process.on('SIGTERM', () => process.exit(0));
       );
       await rm(join(wd, '.omx', 'state', 'team-state.json'), { force: true });
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', runtimeTeamName]));
+      await withAuthenticatedTeamCommandAuthority(
+        wd,
+        'sess-team-mode-terminal',
+        () => teamCommand(['resume', runtimeTeamName]),
+        true,
+      );
 
-      const resumedState = await readModeState('team', wd);
+      const resumedState = await readCanonicalSessionTeamModeState(wd, 'sess-team-mode-terminal');
       assert.equal(resumedState?.active, false);
       assert.equal(resumedState?.team_name, runtimeTeamName);
       assert.equal(resumedState?.current_phase, 'complete');

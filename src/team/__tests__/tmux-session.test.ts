@@ -30,6 +30,8 @@ import {
   isMsysOrGitBash,
   isNativeWindows,
   isTmuxAvailable,
+  readPaneTeamOwnerTagResult,
+  restoreTmuxOneShotImportEnvironmentAfterDelay,
   isWorkerPaneOpen,
   restoreStandaloneHudPane,
   translatePathForMsys,
@@ -56,13 +58,47 @@ import {
   classifyWorkerStartupInjectSafety,
   checkWorkerStartupInjectSafety,
   dismissTrustPromptIfPresent,
+  evaluateStartupDirectTriggerSafety,
   evaluateStartupDirectTriggerSafetyCapture,
   mitigateCopyModeUnderlineArtifacts,
   buildTmuxOneShotWorkerImportCommand,
+  assertTmuxOneShotImportSessionHealthy,
+
 } from '../tmux-session.js';
+
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+async function workerStartupTransport(cwd: string): Promise<Record<string, string>> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const sessionId = `tmux-startup-${Buffer.from(cwd).toString('hex').slice(0, 24)}`;
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }) as Record<string, string>;
+}
+
+function mockMsysPlatformPreservingLinuxAuthorityIdentity(): void {
+  Object.defineProperty(process, 'platform', {
+    configurable: true,
+    get: () => {
+      const stack = new Error().stack ?? '';
+      return /(?:state-root|authority)\.(?:[cm]?[jt]s)/.test(stack)
+        ? 'linux'
+        : 'win32';
+    },
+  });
+}
 
 const fsMutable = fs as typeof fs & {
   existsSync: typeof fs.existsSync;
@@ -1304,25 +1340,27 @@ describe('buildWorkerStartupCommand', () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
     const prevMsystem = process.env.MSYSTEM;
     const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
-    const stateRoot = 'C:\\omx-state';
+    const wd = await mkdtemp(join(tmpdir(), 'omx-worker-startup-msys-'));
+    const stateRoot = join(wd, '.omx', 'state');
+    const transport = await workerStartupTransport(wd);
     try {
-      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      mockMsysPlatformPreservingLinuxAuthorityIdentity();
       process.env.MSYSTEM = 'MINGW64';
       process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
       const cmd = writeWorkerStartupScriptCommand(
         'alpha',
         1,
         ['--model', 'gpt-5'],
-        'C:\\repo',
-        { OMX_TEAM_STATE_ROOT: stateRoot },
+        wd,
+        { ...transport, OMX_TEAM_STATE_ROOT: stateRoot },
         'gemini',
       );
-      assert.equal(cmd, `exec /bin/sh '/c/omx-state/team/alpha/runtime/worker-1-startup.sh'`);
+      assert.equal(cmd, `exec /bin/sh '${stateRoot}/team/alpha/runtime/worker-1-startup.sh'`);
       const script = await readFile(join(stateRoot, 'team', 'alpha', 'runtime', 'worker-1-startup.sh'), 'utf-8');
-      assert.match(script, /^cd '\/c\/repo'$/m);
+      assert.match(script, new RegExp(`^cd '${wd.replace(/'/g, `'\\''`)}'$`, 'm'));
       assert.match(script, /^exec '\/bin\/sh' -c /m);
     } finally {
-      await rm(stateRoot, { recursive: true, force: true });
+      await rm(wd, { recursive: true, force: true });
       if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
       if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
       else delete process.env.MSYSTEM;
@@ -1334,7 +1372,8 @@ describe('buildWorkerStartupCommand', () => {
   it('does not emit cmd.exe flag wrappers for MSYS startup scripts with cmd shims', async () => {
     const fakeRoot = await mkdtemp(join(tmpdir(), 'omx-worker-startup-msys-cmd-shim-'));
     const fakeBin = join(fakeRoot, 'bin dir');
-    const stateRoot = join(fakeRoot, 'state root');
+    const stateRoot = join(fakeRoot, '.omx', 'state');
+    const transport = await workerStartupTransport(fakeRoot);
     const startupScriptPath = join(stateRoot, 'team', 'alpha', 'runtime', 'worker-1-startup.sh');
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
     const prevPath = process.env.PATH;
@@ -1345,7 +1384,7 @@ describe('buildWorkerStartupCommand', () => {
       await mkdir(fakeBin, { recursive: true });
       const geminiCmdPath = join(fakeBin, 'gemini.cmd');
       await writeFile(geminiCmdPath, '@echo off\r\n');
-      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      mockMsysPlatformPreservingLinuxAuthorityIdentity();
       process.env.PATH = fakeBin;
       process.env.PATHEXT = '.CMD';
       process.env.MSYSTEM = 'MINGW64';
@@ -1355,8 +1394,8 @@ describe('buildWorkerStartupCommand', () => {
         'alpha',
         1,
         ['--model', 'gemini-2.5-pro'],
-        'C:\\repo with space',
-        { OMX_TEAM_STATE_ROOT: stateRoot },
+        fakeRoot,
+        { ...transport, OMX_TEAM_STATE_ROOT: stateRoot },
         'gemini',
       );
 
@@ -1364,7 +1403,7 @@ describe('buildWorkerStartupCommand', () => {
       const script = await readFile(startupScriptPath, 'utf-8');
       assert.doesNotMatch(script, /cmd\.exe/i);
       assert.doesNotMatch(script, /'\/d'|'\/s'|'\/c'|\s\/d\s|\s\/s\s|\s\/c\s/i);
-      assert.match(script, /^cd '\/c\/repo with space'$/m);
+      assert.match(script, new RegExp(`^cd '${fakeRoot.replace(/'/g, `'\\''`)}'$`, 'm'));
       assert.match(script, /^exec '\/bin\/sh' -c /m);
       assert.match(script, new RegExp(escapeRegExp(geminiCmdPath)));
       assert.match(script, /--approval-mode/);
@@ -1453,6 +1492,7 @@ describe('buildWorkerStartupCommand', () => {
         ['--model', 'gpt-5'],
         wd,
         {
+          ...(await workerStartupTransport(wd)),
           OMX_TEAM_STATE_ROOT: stateRoot,
           OMX_TEAM_LEADER_CWD: wd,
           OMX_TMUX_HUD_OWNER: '1',
@@ -1883,11 +1923,15 @@ describe('buildWorkerStartupCommand', () => {
       await writeFile(join(codexHome, 'config.toml'), '[mcp_servers.omx_state]\ncommand = "omx"\n');
       process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
       delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
-      const startupEnv = { OMX_TEAM_STATE_ROOT: stateRoot, CODEX_HOME: codexHome };
+      const startupEnv = {
+        ...(await workerStartupTransport(stateRoot)),
+        OMX_TEAM_STATE_ROOT: join(stateRoot, '.omx', 'state'),
+        CODEX_HOME: codexHome,
+      };
 
       for (const [index, launchArgs] of configForms.entries()) {
-        writeWorkerStartupScriptCommand('alpha', index + 1, launchArgs, '/tmp/project', startupEnv, 'codex', undefined, 'explore');
-        const script = await readFile(join(stateRoot, 'team', 'alpha', 'runtime', `worker-${index + 1}-startup.sh`), 'utf-8');
+        writeWorkerStartupScriptCommand('alpha', index + 1, launchArgs, stateRoot, startupEnv, 'codex', undefined, 'explore');
+        const script = await readFile(join(stateRoot, '.omx', 'state', 'team', 'alpha', 'runtime', `worker-${index + 1}-startup.sh`), 'utf-8');
         assert.equal((script.match(/mcp_servers\.omx_state\.enabled=/g) ?? []).length, 1);
         assert.match(script, /mcp_servers\.omx_state\.enabled=true/);
         assert.doesNotMatch(script, /mcp_servers\.omx_state\.enabled=false/);
@@ -1895,8 +1939,8 @@ describe('buildWorkerStartupCommand', () => {
 
       for (const [index, launchArgs] of configForms.entries()) {
         const workerIndex = index + 10;
-        writeWorkerStartupScriptCommand('alpha', workerIndex, ['--', ...launchArgs], '/tmp/project', startupEnv, 'codex', undefined, 'explore');
-        const script = await readFile(join(stateRoot, 'team', 'alpha', 'runtime', `worker-${workerIndex}-startup.sh`), 'utf-8');
+        writeWorkerStartupScriptCommand('alpha', workerIndex, ['--', ...launchArgs], stateRoot, startupEnv, 'codex', undefined, 'explore');
+        const script = await readFile(join(stateRoot, '.omx', 'state', 'team', 'alpha', 'runtime', `worker-${workerIndex}-startup.sh`), 'utf-8');
         const generatedIndex = script.indexOf('mcp_servers.omx_state.enabled=false');
         const positionalIndex = script.indexOf('mcp_servers.omx_state.enabled=true');
         assert.ok(generatedIndex >= 0 && generatedIndex < positionalIndex);
@@ -2706,7 +2750,8 @@ describe('team worker launch mode helpers', () => {
   });
 
   it('executes the generated POSIX startup script with canonical config policy and exact positional argv', async () => {
-    const stateRoot = await mkdtemp(join(tmpdir(), 'omx-worker-policy-script-'));
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-worker-policy-script-'));
+    const stateRoot = join(workspace, '.omx', 'state');
     const codexHome = await mkdtemp(join(tmpdir(), 'omx-worker-policy-codex-home-'));
     const fakeBin = join(stateRoot, 'bin');
     const capturePath = join(stateRoot, 'worker-argv.json');
@@ -2736,13 +2781,17 @@ require('fs').writeFileSync(process.env.OMX_POLICY_ARGV_CAPTURE, JSON.stringify(
       ];
       const launchArgs = ['--config', 'sandbox_mode="workspace-write"', '--', ...positionalSuffix];
       const expectedArgs = ['--sandbox', 'workspace-write', '--', ...positionalSuffix];
-      const workerEnv = { OMX_TEAM_STATE_ROOT: stateRoot, CODEX_HOME: codexHome };
-      const spec = buildWorkerProcessLaunchSpec('policy-team', 1, launchArgs, stateRoot, workerEnv, 'codex', undefined, 'executor');
+      const workerEnv = {
+        ...(await workerStartupTransport(workspace)),
+        OMX_TEAM_STATE_ROOT: stateRoot,
+        CODEX_HOME: codexHome,
+      };
+      const spec = buildWorkerProcessLaunchSpec('policy-team', 1, launchArgs, workspace, workerEnv, 'codex', undefined, 'executor');
       const scriptCommand = writeWorkerStartupScriptCommand(
         'policy-team',
         1,
         launchArgs,
-        stateRoot,
+        workspace,
         workerEnv,
         'codex',
         undefined,
@@ -2767,7 +2816,7 @@ require('fs').writeFileSync(process.env.OMX_POLICY_ARGV_CAPTURE, JSON.stringify(
       else delete process.env.PATH;
       if (typeof previousCapture === 'string') process.env.OMX_POLICY_ARGV_CAPTURE = previousCapture;
       else delete process.env.OMX_POLICY_ARGV_CAPTURE;
-      await rm(stateRoot, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
       await rm(codexHome, { recursive: true, force: true });
     }
   });
@@ -3859,8 +3908,7 @@ esac
 });
 
 describe('tmux one-shot worker environment import', () => {
-  it('keeps bearer values out of tmux argv and gives a first-party cleanup watchdog ownership', async () => {
-    const rawBearer = 'raw-bearer-must-not-reach-tmux-argv';
+  it('builds a value-free one-shot import command with explicit acknowledgement and cleanup', () => {
     const command = buildTmuxOneShotWorkerImportCommand(
       'team-session',
       [{
@@ -3870,7 +3918,6 @@ describe('tmux one-shot worker environment import', () => {
       'omx-tmux-import-ack-nonce',
       'exec worker-command',
     );
-    assert.doesNotMatch(command, new RegExp(rawBearer));
     assert.match(command, /unset[\s\S]*OMX_TMUX_IMPORT_nonce_0[\s\S]*OMX_STATE_AUTHORITY_CAPABILITY/);
     assert.match(command, /tmux show-environment[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
     assert.match(command, /tmux set-environment -u[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
@@ -3879,13 +3926,184 @@ describe('tmux one-shot worker environment import', () => {
     assert.match(command, /exec worker-command/);
     assert.doesNotMatch(command, /exec exec worker-command/);
 
-    const source = await readFile(new URL('../../../src/team/tmux-session.ts', import.meta.url), 'utf8');
-    assert.match(source, /"run-shell",\s*"-b"/);
-    assert.match(source, /restoreTmuxOneShotImportEnvironmentAfterDelay/);
-    assert.match(source, /setTimeout\([\s\S]*?restoreTmuxSessionEnvironment/);
-    assert.match(source, /TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS/);
-    assert.match(source, /waitForTmuxOneShotImportChannel[\s\S]*?TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS/);
-    assert.doesNotMatch(source, /injectTmuxWorkerAuthorityEnvironment/);
+  });
+
+  it('scrubs the authority tuple from synchronous, asynchronous, and direct tmux clients', async () => {
+    const authorityEnv = {
+      OMX_STARTUP_CWD: 'hostile-startup-cwd',
+      OMX_STATE_AUTHORITY_PATH: '/tmp/hostile/state-authority.json',
+      OMX_STATE_AUTHORITY_ID: 'hostile-authority-id',
+      OMX_STATE_AUTHORITY_GENERATION_ID: 'hostile-generation-id',
+      OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: 'hostile-workspace-digest',
+      OMX_STATE_AUTHORITY_CAPABILITY: 'hostile-bearer-$(touch should-not-run)',
+    };
+    const previous = Object.fromEntries(
+      Object.keys(authorityEnv).map((key) => [key, process.env[key]]),
+    );
+    Object.assign(process.env, authorityEnv);
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-authority-scrub-',
+        (logPath) => `#!/bin/sh
+set -eu
+for key in OMX_STARTUP_CWD OMX_STATE_AUTHORITY_PATH OMX_STATE_AUTHORITY_ID OMX_STATE_AUTHORITY_GENERATION_ID OMX_STATE_AUTHORITY_WORKSPACE_DIGEST OMX_STATE_AUTHORITY_CAPABILITY; do
+  if printenv "$key" >/dev/null; then
+    printf 'leaked:%s=%s\\n' "$key" "$(printenv "$key")" >> "${logPath}"
+  fi
+done
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  -V)
+    echo 'tmux 3.4'
+    ;;
+  show-option)
+    echo 'team-owner'
+    ;;
+  list-panes)
+    echo '0'
+    ;;
+  capture-pane)
+    echo 'How can I help you today?'
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(isTmuxAvailable(), true);
+          assert.equal(isWorkerPaneOpen('team-session', 1), true);
+          assert.deepEqual(readPaneTeamOwnerTagResult('%1'), {
+            status: 'value',
+            value: 'team-owner',
+          });
+          assert.deepEqual(
+            await evaluateStartupDirectTriggerSafety('team-session', 1),
+            { safe: true, reason: 'ready_prompt' },
+          );
+          assert.doesNotMatch(await readFile(logPath, 'utf-8'), /leaked:/);
+        },
+      );
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (typeof value === 'string') process.env[key] = value;
+        else delete process.env[key];
+      }
+    }
+  });
+
+  it('restores a watchdog snapshot without evaluating hostile tmux values', async () => {
+    const state = await mkdtemp(join(tmpdir(), 'omx-tmux-watchdog-success-'));
+    const markerPath = join(state, 'hostile-value-executed');
+    const sourceName = 'OMX_TMUX_IMPORT_watchdog_0';
+    const sessionName = `team;$(touch ${markerPath})`;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-watchdog-success-bin-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  show-environment)
+    printf '%s\\n' '-${sourceName}'
+    ;;
+  wait-for)
+    ;;
+  source-file)
+    cat >> "${logPath}"
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          restoreTmuxOneShotImportEnvironmentAfterDelay(
+            sessionName,
+            [sourceName],
+            'watchdog-ready',
+            1,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          const log = await readFile(logPath, 'utf-8');
+          assert.match(log, /source-file -/);
+          assert.match(log, new RegExp(`set-environment -t .* -r ${sourceName}`));
+          assert.equal(fs.existsSync(markerPath), false);
+        },
+      );
+    } finally {
+      await rm(state, { recursive: true, force: true });
+    }
+  });
+
+  it('quarantines the session after watchdog restore failure and blocks the next import preflight', async () => {
+
+    const state = await mkdtemp(join(tmpdir(), 'omx-tmux-watchdog-timeout-'));
+    const markerPath = join(state, 'hostile-timeout-executed');
+    const sourceName = 'OMX_TMUX_IMPORT_watchdog_timeout_0';
+    const providerSourceName = 'OMX_TMUX_IMPORT_watchdog_timeout_1';
+
+    const sessionName = `team;$(touch ${markerPath})`;
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-watchdog-timeout-bin-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  show-environment)
+    printf '%s\\n' '-${sourceName}'
+    printf '%s\\n' '-${providerSourceName}'
+
+
+    ;;
+  wait-for)
+    ;;
+  source-file)
+    cat >/dev/null
+    exit 1
+    ;;
+  set-environment)
+    ;;
+  set-option)
+    printf '1\n' > "${logPath}.quarantine"
+    ;;
+  show-option)
+    if [ -f "${logPath}.quarantine" ]; then cat "${logPath}.quarantine"; fi
+    ;;
+
+esac
+`,
+        async ({ logPath }) => {
+          restoreTmuxOneShotImportEnvironmentAfterDelay(
+            sessionName,
+            [sourceName, providerSourceName],
+            'watchdog-ready-timeout',
+            1,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          const log = await readFile(logPath, 'utf-8');
+          assert.equal((log.match(/^source-file -$/gm) ?? []).length, 3);
+          assert.match(
+            log,
+            new RegExp(`set-environment -u -t .* -- ${sourceName}`),
+          );
+          assert.match(
+            log,
+            new RegExp(`set-environment -u -t .* -- ${providerSourceName}`),
+          );
+          assert.match(log, /set-option -t .* @omx_one_shot_import_restore_failure 1/);
+          assert.equal(process.exitCode, 1);
+          assert.throws(
+            () => assertTmuxOneShotImportSessionHealthy(
+              sessionName,
+              [sourceName, providerSourceName],
+            ),
+            /quarantined session/,
+          );
+          assert.equal(fs.existsSync(markerPath), false);
+        },
+      );
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(state, { recursive: true, force: true });
+    }
   });
 });
 

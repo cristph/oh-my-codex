@@ -1,11 +1,12 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  initTeamState,
+  initTeamState as initTeamStateDirect,
   enqueueDispatchRequest,
   readDispatchRequest,
   listMailboxMessages,
@@ -14,6 +15,8 @@ import {
   saveTeamConfig,
 } from '../../team/state.js';
 import { pathToFileURL } from 'node:url';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
@@ -218,6 +221,32 @@ async function waitForMailboxNotifiedAt(teamName: string, workerName: string, me
     if (attempt < 4) await sleep(25);
   }
   return undefined;
+}
+
+async function initTeamState(
+  teamName: string,
+  task: string,
+  agentType: string,
+  workerCount: number,
+  cwd: string,
+) {
+  const sessionId = 'notify-hook-team-dispatch';
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-hook-team-dispatch-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return await initTeamStateDirect(
+    teamName,
+    task,
+    agentType,
+    workerCount,
+    cwd,
+    undefined,
+    buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }),
+  );
 }
 
 describe('notify-hook team dispatch consumer', () => {
@@ -924,19 +953,22 @@ exit 0
     }
   });
 
-  it('uses explicit canonical stateDir when marking mailbox notified_at', async () => {
+  it('uses a distinct explicit canonical stateDir when marking mailbox notified_at', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
-    const stateDir = join(cwd, '.omx', 'state');
+    const canonicalCwd = join(cwd, 'canonical-workspace');
+    const stateDir = join(canonicalCwd, '.omx', 'state');
     try {
-      await initTeamState('alpha', 'task', 'executor', 1, cwd);
-      const msg = await sendDirectMessage('alpha', 'worker-1', 'worker-1', 'hello', cwd);
+      await mkdir(canonicalCwd, { recursive: true });
+      await initTeamState('decoy', 'must remain untouched', 'executor', 1, cwd);
+      await initTeamState('alpha', 'task', 'executor', 1, canonicalCwd);
+      const msg = await sendDirectMessage('alpha', 'worker-1', 'worker-1', 'hello', canonicalCwd);
       const queued = await enqueueDispatchRequest('alpha', {
         kind: 'mailbox',
         to_worker: 'worker-1',
         worker_index: 1,
         message_id: msg.message_id,
         trigger_message: 'check mailbox',
-      }, cwd);
+      }, canonicalCwd);
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
@@ -948,14 +980,15 @@ exit 0
       });
 
       assert.equal(result.processed, 1);
-      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      const request = await readDispatchRequest('alpha', queued.request.request_id, canonicalCwd);
       assert.equal(request?.status, 'notified');
       assert.ok(request?.notified_at, 'expected dispatch state to record notified_at');
-      const mailbox = await listMailboxMessages('alpha', 'worker-1', cwd);
+      const mailbox = await listMailboxMessages('alpha', 'worker-1', canonicalCwd);
       const mailboxMessage = mailbox.find((entry) => entry.message_id === msg.message_id);
       assert.ok(mailboxMessage, 'expected the queued mailbox message to remain readable');
-      const notifiedAt = await waitForMailboxNotifiedAt('alpha', 'worker-1', msg.message_id, cwd);
+      const notifiedAt = await waitForMailboxNotifiedAt('alpha', 'worker-1', msg.message_id, canonicalCwd);
       assert.ok(notifiedAt || request.notified_at, 'expected dispatch state or mailbox shadow to record notified_at');
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'alpha')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

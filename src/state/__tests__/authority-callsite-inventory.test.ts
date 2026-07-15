@@ -92,6 +92,23 @@ type UnresolvedAuthorityCall = {
   targetText: string;
 };
 
+type CallableSymbolResolution = {
+  symbol?: ts.Symbol;
+  failure?: 'depth-exceeded' | 'fixed-point';
+};
+
+type AliasResolutionFailure = {
+  key: string;
+  location: string;
+  targetText: string;
+  failure: NonNullable<CallableSymbolResolution['failure']>;
+};
+
+type CallGraph = {
+  callersByTarget: Map<string, Set<string>>;
+  aliasResolutionFailures: AliasResolutionFailure[];
+};
+
 const ROOT_ENV_NAMES = new Set([
   'OMX_RUNS_DIR',
   'OMX_ROOT',
@@ -536,19 +553,26 @@ function resolveCallableSymbol(
   propertyAssignments: ReadonlyMap<ts.Symbol, ts.Expression | undefined>,
   depth = 0,
   seen = new Set<ts.Symbol>(),
-): ts.Symbol | undefined {
+): CallableSymbolResolution {
   const isStaticReference =
     ts.isIdentifier(expression) ||
     ts.isPropertyAccessExpression(expression) ||
     (ts.isElementAccessExpression(expression) &&
       staticStringValue(checker, expression.argumentExpression) !== undefined);
-  if (!isStaticReference) return undefined;
+  if (!isStaticReference) return {};
 
   const symbol = resolveAlias(checker, checker.getSymbolAtLocation(expression));
-  if (!symbol || depth >= MAX_LOCAL_ALIAS_DEPTH || seen.has(symbol)) {
-    return symbol;
+  if (!symbol) return {};
+  if (depth >= MAX_LOCAL_ALIAS_DEPTH) return { failure: 'depth-exceeded' };
+  if (seen.has(symbol)) {
+    const isLocalAlias = symbol.declarations?.some((declaration) =>
+      (ts.isVariableDeclaration(declaration) && isConstVariableDeclaration(declaration))
+      || ts.isShorthandPropertyAssignment(declaration)
+      || ts.isPropertyAssignment(declaration),
+    ) === true;
+    return isLocalAlias ? { failure: 'fixed-point' } : { symbol };
   }
-  if (resolvesToMethod(symbol)) return symbol;
+  if (resolvesToMethod(symbol)) return { symbol };
   seen.add(symbol);
   const shorthandDeclaration = symbol.declarations?.find(
     (declaration): declaration is ts.ShorthandPropertyAssignment =>
@@ -564,7 +588,7 @@ function resolveCallableSymbol(
       propertyAssignments,
     );
     if (!shorthandInitializer || isFunctionValue(shorthandInitializer)) {
-      return shorthandValueSymbol;
+      return { symbol: shorthandValueSymbol };
     }
     return resolveCallableSymbol(
       checker,
@@ -575,7 +599,7 @@ function resolveCallableSymbol(
     );
   }
   const initializer = callableInitializer(symbol, propertyAssignments);
-  if (!initializer || isFunctionValue(initializer)) return symbol;
+  if (!initializer || isFunctionValue(initializer)) return { symbol };
   return resolveCallableSymbol(
     checker,
     initializer,
@@ -589,7 +613,7 @@ function getCallTargetSymbol(
   checker: ts.TypeChecker,
   expression: ts.Expression,
   propertyAssignments: ReadonlyMap<ts.Symbol, ts.Expression | undefined>,
-): ts.Symbol | undefined {
+): CallableSymbolResolution {
   return resolveCallableSymbol(checker, expression, propertyAssignments);
 }
 
@@ -628,8 +652,9 @@ function buildCallerGraph(
   checker: ts.TypeChecker,
   definitionForNode: Map<ts.Node, Definition>,
   definitionForSymbol: Map<ts.Symbol, Definition>,
-): Map<string, Set<string>> {
+): CallGraph {
   const callersByTarget = new Map<string, Set<string>>();
+  const aliasResolutionFailures: AliasResolutionFailure[] = [];
   const propertyAssignments = collectStaticPropertyAssignments(
     root,
     program,
@@ -648,13 +673,22 @@ function buildCallerGraph(
       if (ts.isCallExpression(node)) {
         const caller = enclosingDefinition(node, definitionForNode);
         const addReference = (expression: ts.Expression): void => {
-          const targetSymbol = getCallTargetSymbol(
+          const resolution = getCallTargetSymbol(
             checker,
             expression,
             propertyAssignments,
           );
+          if (resolution.failure && caller) {
+            aliasResolutionFailures.push({
+              key: caller.key,
+              location: sourceLocation(sourceFile, expression),
+              targetText: expression.getText(sourceFile),
+              failure: resolution.failure,
+            });
+            return;
+          }
           const target = definitionForResolvedSymbol(
-            targetSymbol,
+            resolution.symbol,
             definitionForSymbol,
           );
           if (target && caller) addCaller(target, caller);
@@ -670,7 +704,7 @@ function buildCallerGraph(
     };
     visit(sourceFile);
   }
-  return callersByTarget;
+  return { callersByTarget, aliasResolutionFailures };
 }
 
 function trackedEnvName(value: string | undefined): string | undefined {
@@ -1040,14 +1074,19 @@ function stringLiteralValue(node: ts.Expression): string | undefined {
     : undefined;
 }
 
-function constructsDotOmxStatePath(node: ts.CallExpression): boolean {
+function constructsDotOmxStatePath(
+  checker: ts.TypeChecker,
+  node: ts.CallExpression,
+): boolean {
   const calleeName = ts.isIdentifier(node.expression)
     ? node.expression.text
     : ts.isPropertyAccessExpression(node.expression)
       ? node.expression.name.text
       : '';
   if (calleeName !== 'join' && calleeName !== 'resolve') return false;
-  const values = node.arguments.map(stringLiteralValue);
+  const values = node.arguments.map((argument) =>
+    staticStringValue(checker, argument),
+  );
   if (values.some((value) => value?.replace(/\\/g, '/').includes('.omx/state')))
     return true;
   const omxIndex = values.findIndex((value) => value === '.omx');
@@ -1125,6 +1164,7 @@ function isDefaultedDependencyCallable(
 function collectDirectStatePathConstructions(
   root: string,
   program: ts.Program,
+  checker: ts.TypeChecker,
   definitionForNode: Map<ts.Node, Definition>,
 ): DirectStatePathConstruction[] {
   const constructions: DirectStatePathConstruction[] = [];
@@ -1132,7 +1172,7 @@ function collectDirectStatePathConstructions(
     if (!isProductionSource(root, sourceFile)) continue;
     const path = normalizeRepoPath(root, sourceFile.fileName);
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && constructsDotOmxStatePath(node)) {
+      if (ts.isCallExpression(node) && constructsDotOmxStatePath(checker, node)) {
         const definition = enclosingDefinition(node, definitionForNode);
         assert.ok(
           definition,
@@ -1243,13 +1283,13 @@ function collectUnresolvedAuthorityCalls(
         return;
       }
       const targetText = node.expression.getText(sourceFile);
-      const targetSymbol = getCallTargetSymbol(
+      const targetResolution = getCallTargetSymbol(
         checker,
         node.expression,
         propertyAssignments,
       );
       const target = definitionForResolvedSymbol(
-        targetSymbol,
+        targetResolution.symbol,
         definitionForSymbol,
       );
       const calleeName = ts.isIdentifier(node.expression)
@@ -1397,19 +1437,22 @@ function validateAuthorityCallsiteInventory(
       );
     }
   }
-  if (input.requireTransportAccess && directEnvAccesses.length === 0) {
+  const authorityTransportReads = directEnvAccesses.filter(
+    (access) =>
+      access.access === 'read' &&
+      AUTHORITY_TRANSPORT_ENV_NAMES.has(access.envName),
+  );
+  if (input.requireTransportAccess && authorityTransportReads.length === 0) {
     violations.push(
-      '[missing-transport-access] production scan found no authority transport access',
+      '[missing-transport-reader] production scan found no authority transport reader',
     );
   }
-  if (
-    input.requireTransportAccess &&
-    !directEnvAccesses.some(
-      (access) =>
-        access.access === 'write' &&
-        AUTHORITY_TRANSPORT_ENV_NAMES.has(access.envName),
-    )
-  ) {
+  const authorityTransportWrites = directEnvAccesses.filter(
+    (access) =>
+      access.access === 'write' &&
+      AUTHORITY_TRANSPORT_ENV_NAMES.has(access.envName),
+  );
+  if (input.requireTransportAccess && authorityTransportWrites.length === 0) {
     violations.push(
       '[missing-transport-writer] production scan found no child-transport writer',
     );
@@ -1540,6 +1583,7 @@ function validateAuthorityCallsiteInventory(
   const directStatePaths = collectDirectStatePathConstructions(
     input.root,
     input.program,
+    checker,
     definitionForNode,
   );
   if (input.requireStatePathConstruction && directStatePaths.length === 0) {
@@ -1555,13 +1599,18 @@ function validateAuthorityCallsiteInventory(
     }
   }
 
-  const callersByTarget = buildCallerGraph(
+  const { callersByTarget, aliasResolutionFailures } = buildCallerGraph(
     input.root,
     input.program,
     checker,
     definitionForNode,
     definitionForSymbol,
   );
+  for (const failure of aliasResolutionFailures) {
+    violations.push(
+      `[callable-alias-${failure.failure}] ${failure.key}@${failure.location} (${failure.targetText})`,
+    );
+  }
   const boundaries = new Set(input.boundaryKeys);
   if (new Set(input.helperKeys).size !== input.helperKeys.length) {
     violations.push('[duplicate-authority-helper-seed]');
@@ -1883,6 +1932,12 @@ function assertMutationViolation(
   precommitKeys: readonly string[] = [],
   registryCandidateHelperKeys: readonly string[] = [],
   validationBoundaryKeys: readonly string[] = [],
+  requirements: Pick<
+    AuthorityInventoryValidationInput,
+    | 'requireAmbientRootReader'
+    | 'requireTransportAccess'
+    | 'requireStatePathConstruction'
+  > = {},
 ): void {
   const { root, program } = createMutationFixtureProgram(files);
   try {
@@ -1899,6 +1954,7 @@ function assertMutationViolation(
         precommitKeys,
           registryCandidateHelperKeys,
           validationBoundaryKeys,
+          ...requirements,
       }),
       expectedViolation,
     );
@@ -1916,6 +1972,106 @@ describe('authority callsite inventory', () => {
         productionValidationInput(root, program),
       ),
       [],
+    );
+  });
+
+  it('rejects a transport writer paired only with an ambient root reader', () => {
+    assertMutationViolation(
+      {
+        'src/globals.d.ts': [
+          'declare namespace NodeJS { interface ProcessEnv { OMX_ROOT?: string; OMX_STATE_AUTHORITY_ID?: string; } }',
+          'declare const process: { env: NodeJS.ProcessEnv };',
+        ].join('\n'),
+        'src/callers.ts': [
+          "export function readAmbientRoot(): string { return process.env.OMX_ROOT ?? ''; }",
+          "export function writeAuthorityTransport(): void { process.env.OMX_STATE_AUTHORITY_ID = 'authority'; }",
+        ].join('\n'),
+      },
+      [
+        fixtureEntry(
+          'src/callers.ts',
+          'readAmbientRoot',
+          'bootstrap-only',
+          'phase-0-inventory-and-denial',
+          'Reads an ambient bootstrap root before committed authority resolution.',
+        ),
+        fixtureEntry(
+          'src/callers.ts',
+          'writeAuthorityTransport',
+          'authority-context',
+          'phase-2-postcommit-transport',
+          'Publishes committed authority transport for a child process.',
+        ),
+      ],
+      [],
+      /\[missing-transport-reader\]/,
+      [],
+      [],
+      [],
+      { requireTransportAccess: true },
+    );
+  });
+
+  it('rejects a local callable alias chain that exceeds the resolution bound', () => {
+    assertMutationViolation(
+      {
+        'src/helpers.ts':
+          "export function neutralTarget(): string { return 'target'; }\n",
+        'src/callers.ts': [
+          "import { neutralTarget } from './helpers.js';",
+          'const alias1 = neutralTarget;',
+          'const alias2 = alias1;',
+          'const alias3 = alias2;',
+          'const alias4 = alias3;',
+          'const alias5 = alias4;',
+          'export function callThroughDeepNeutralAliases(): string { return alias5(); }',
+        ].join('\n'),
+      },
+      [
+        fixtureEntry(
+          'src/helpers.ts',
+          'neutralTarget',
+          'bootstrap-only',
+          'phase-0-inventory-and-denial',
+          'Provides a neutral helper for bounded alias-resolution coverage.',
+        ),
+      ],
+      ['src/helpers.ts::neutralTarget'],
+      /\[callable-alias-depth-exceeded\].*callThroughDeepNeutralAliases/,
+    );
+  });
+
+  it('rejects a callable alias resolution fixed point', () => {
+    assertMutationViolation(
+      {
+        'src/callers.ts': [
+          'const fixedPoint: () => string = fixedPoint;',
+          'export function callFixedPointAlias(): string { return fixedPoint(); }',
+        ].join('\n'),
+      },
+      [],
+      [],
+      /\[callable-alias-fixed-point\].*callFixedPointAlias/,
+    );
+  });
+
+  it('rejects an unclassified .omx/state builder through aliased templates and concatenation', () => {
+    assertMutationViolation(
+      {
+        'src/builders.ts': [
+          "function join(...segments: string[]): string { return segments.join('/'); }",
+          "const omxSegment = '.omx/';",
+          "const concatenatedStatePath = omxSegment + 'state';",
+          "const templatedStatePath = `.omx/${'state'}`;",
+          'const templateAlias = templatedStatePath;',
+          'export function buildAliasedTemplateStatePath(root: string): string {',
+          '  return join(root, concatenatedStatePath, templateAlias);',
+          '}',
+        ].join('\n'),
+      },
+      [],
+      [],
+      /\[unclassified-state-path-builder\].*buildAliasedTemplateStatePath/,
     );
   });
 

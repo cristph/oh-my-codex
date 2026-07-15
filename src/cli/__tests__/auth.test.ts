@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -14,6 +14,38 @@ import {
   rolloverStateAuthorityToAlternateRoot,
   validateStateAuthorityTransportCapability,
 } from "../../state/authority.js";
+import {
+  OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+  OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+  OMX_STATE_AUTHORITY_ID_ENV,
+  OMX_STATE_AUTHORITY_PATH_ENV,
+  OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV,
+} from "../../state/transport-env.js";
+
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+const stateAuthorityTransportEnvKeys = [
+  OMX_STATE_AUTHORITY_PATH_ENV,
+  OMX_STATE_AUTHORITY_ID_ENV,
+  OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+  OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV,
+  OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+] as const;
+
+const ambientSessionEnvKeys = [
+  "GJC_SESSION_CWD",
+  "GJC_SESSION_FILE",
+  "GJC_SESSION_ID",
+  "OMX_CODEX_LAUNCH_ID",
+  "OMX_STARTUP_CWD",
+  "OMX_ROOT",
+  "OMX_STATE_ROOT",
+  "OMX_TEAM_STATE_ROOT",
+  "OMX_RUNS_DIR",
+  "OMX_SESSION_ID",
+] as const;
+
 
 function omxBin(): string {
   const testDir = dirname(fileURLToPath(import.meta.url));
@@ -24,6 +56,7 @@ function runOmx(cwd: string, argv: string[], env: Record<string, string> = {}) {
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: env.HOME,
+    PWD: cwd,
     CODEX_HOME: env.CODEX_HOME ?? "",
     NODE_OPTIONS: "",
     OMX_AUTO_UPDATE: "0",
@@ -31,6 +64,12 @@ function runOmx(cwd: string, argv: string[], env: Record<string, string> = {}) {
     OMX_HOOK_DERIVED_SIGNALS: "0",
     ...env,
   };
+  for (const key of stateAuthorityTransportEnvKeys) {
+    if (env[key] === undefined) delete childEnv[key];
+  }
+  for (const key of ambientSessionEnvKeys) {
+    if (env[key] === undefined) delete childEnv[key];
+  }
   if (env.PATH !== undefined) {
     for (const key of Object.keys(childEnv)) {
       if (key.toLowerCase() === "path") delete childEnv[key];
@@ -53,6 +92,21 @@ function testPath(binDir?: string): string {
     .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
     .join(delimiter);
 }
+
+async function secureTempDir(prefix: string): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), prefix));
+  const omxRoot = join(path, ".omx");
+  const stateRoot = join(omxRoot, "state");
+  const bootstrapRoot = join(omxRoot, "bootstrap");
+  await mkdir(stateRoot, { recursive: true, mode: 0o700 });
+  await mkdir(bootstrapRoot, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700);
+  await chmod(omxRoot, 0o700);
+  await chmod(stateRoot, 0o700);
+  await chmod(bootstrapRoot, 0o700);
+  return path;
+}
+
 
 async function writeFakeCodex(binDir: string, script: string): Promise<string> {
   await mkdir(binDir, { recursive: true });
@@ -82,7 +136,7 @@ async function writeFakeCodex(binDir: string, script: string): Promise<string> {
 
 describe("omx auth CLI", () => {
   it("shows nested help and top-level hotswap help", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-help-"));
+    const wd = await secureTempDir("omx-auth-help-");
     try {
       const help = runOmx(wd, ["auth", "--help"], { HOME: wd });
       assert.equal(help.status, 0, help.stderr);
@@ -96,7 +150,7 @@ describe("omx auth CLI", () => {
   });
 
   it("adds, lists, and uses slots through the compiled CLI without leaking tokens", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-cli-"));
+    const wd = await secureTempDir("omx-auth-cli-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -121,7 +175,7 @@ describe("omx auth CLI", () => {
   });
 
   it("adds slots through isolated login CODEX_HOME and forwards device auth", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-isolated-add-"));
+    const wd = await secureTempDir("omx-auth-isolated-add-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -155,7 +209,7 @@ exit 2
   });
 
   it("sets subscription Codex defaults when auth add sees empty config", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-defaults-"));
+    const wd = await secureTempDir("omx-auth-defaults-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -171,7 +225,7 @@ exit 2
   });
 
   it("preserves explicit model and provider when auth add succeeds", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-preserve-defaults-"));
+    const wd = await secureTempDir("omx-auth-preserve-defaults-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -190,7 +244,7 @@ exit 2
 
 
   it("adds project-scope slots from the same CODEX_HOME used by launch", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-project-add-"));
+    const wd = await secureTempDir("omx-auth-project-add-");
     try {
       const home = join(wd, "home");
       const bin = join(wd, "bin");
@@ -216,7 +270,7 @@ exit 2
   });
 
   it("fails soft when no slots are configured", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-noslots-"));
+    const wd = await secureTempDir("omx-auth-noslots-");
     try {
       const result = runOmx(wd, ["--hotswap", "--direct"], { HOME: join(wd, "home"), PATH: testPath() });
       assert.equal(result.status, 1);
@@ -227,7 +281,7 @@ exit 2
   });
 
   it("hotswaps on 429 and resumes the latest rollout with the next slot", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-hotswap-"));
+    const wd = await secureTempDir("omx-auth-hotswap-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -236,7 +290,14 @@ exit 2
       const countFile = join(wd, "count");
       const argvFile = join(wd, "argv.log");
       await mkdir(authDir, { recursive: true });
+      await chmod(home, 0o700);
+      await chmod(join(home, ".omx"), 0o700);
+      await chmod(authDir, 0o700);
       await mkdir(codexHome, { recursive: true });
+      await chmod(codexHome, 0o700);
+      await mkdir(join(codexHome, ".omx", "state"), { recursive: true, mode: 0o700 });
+      await chmod(join(codexHome, ".omx"), 0o700);
+      await chmod(join(codexHome, ".omx", "state"), 0o700);
       await writeFile(join(authDir, "first.json"), '{"access_token":"first-secret"}\n');
       await writeFile(join(authDir, "second.json"), '{"access_token":"second-secret"}\n');
       await writeFile(join(authDir, "slots.json"), JSON.stringify({ version: 1, currentSlot: "first", slots: [
@@ -259,7 +320,7 @@ exit 2
   });
 
   it("skips invalidated hotswap slots without requiring a rollout session", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-invalidated-hotswap-"));
+    const wd = await secureTempDir("omx-auth-invalidated-hotswap-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -267,7 +328,14 @@ exit 2
       const bin = join(wd, "bin");
       const argvFile = join(wd, "argv.log");
       await mkdir(authDir, { recursive: true });
+      await chmod(home, 0o700);
+      await chmod(join(home, ".omx"), 0o700);
+      await chmod(authDir, 0o700);
       await mkdir(codexHome, { recursive: true });
+      await chmod(codexHome, 0o700);
+      await mkdir(join(codexHome, ".omx", "state"), { recursive: true, mode: 0o700 });
+      await chmod(join(codexHome, ".omx"), 0o700);
+      await chmod(join(codexHome, ".omx", "state"), 0o700);
       await writeFile(join(authDir, "first.json"), '{"access_token":"first-secret"}\n');
       await writeFile(join(authDir, "second.json"), '{"access_token":"second-secret"}\n');
       await writeFile(join(authDir, "slots.json"), JSON.stringify({ version: 1, currentSlot: "first", slots: [
@@ -297,14 +365,21 @@ exit 0
   });
 
   it("emits one clean error when all hotswap slots are exhausted", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-exhausted-"));
+    const wd = await secureTempDir("omx-auth-exhausted-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
       const authDir = join(home, ".omx", "auth");
       const bin = join(wd, "bin");
       await mkdir(authDir, { recursive: true });
+      await chmod(home, 0o700);
+      await chmod(join(home, ".omx"), 0o700);
+      await chmod(authDir, 0o700);
       await mkdir(codexHome, { recursive: true });
+      await chmod(codexHome, 0o700);
+      await mkdir(join(codexHome, ".omx", "state"), { recursive: true, mode: 0o700 });
+      await chmod(join(codexHome, ".omx"), 0o700);
+      await chmod(join(codexHome, ".omx", "state"), 0o700);
       await writeFile(join(authDir, "first.json"), '{"access_token":"first-secret"}\n');
       await writeFile(join(authDir, "second.json"), '{"access_token":"second-secret"}\n');
       await writeFile(join(authDir, "slots.json"), JSON.stringify({ version: 1, currentSlot: "first", slots: [
@@ -322,7 +397,7 @@ exit 0
     }
   });
   it("rebuilds hotswap child transport after preLaunch bearer rotation and refuses an expired replacement before spawn", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-hotswap-authority-"));
+    const wd = await secureTempDir("omx-auth-hotswap-authority-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -440,7 +515,7 @@ exit 0
     }
   });
   it("keeps hotswap credential mutations and cleanup pinned while spawned children release the authority lock", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-hotswap-generation-rollover-"));
+    const wd = await secureTempDir("omx-auth-hotswap-generation-rollover-");
     try {
       const home = join(wd, "home");
       const codexHome = join(home, ".codex");
@@ -528,13 +603,25 @@ exit 0
     }
   });
   it("arms authority-pinned hotswap cleanup before runtime-home preparation fails", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-auth-hotswap-prepare-cleanup-"));
+    const wd = await secureTempDir("omx-auth-hotswap-prepare-cleanup-");
     try {
       const home = join(wd, "home");
       const authDir = join(home, ".omx", "auth");
       const sessionId = "hotswap-prepare-cleanup";
+      const partialRuntimeHome = join(wd, "partially-prepared-runtime-home");
+      const partialRuntimeSentinel = join(partialRuntimeHome, "partial-effect");
       let postLaunchCalled = false;
       let cleanupArguments: [string | undefined, string | undefined] | undefined;
+      let cleanupSawPartialRuntimeSentinel = false;
+      let cleanupAuthority:
+        | {
+            authorityPath: string;
+            authorityId: string;
+            generationId: string;
+            workspaceDigest: string;
+            bindingId: string | undefined;
+          }
+        | undefined;
       await mkdir(authDir, { recursive: true });
       await writeFile(join(authDir, "primary.json"), '{"access_token":"primary-secret"}\n');
       await writeFile(join(authDir, "slots.json"), JSON.stringify({
@@ -553,12 +640,23 @@ exit 0
         authority,
         lifecycle: {
           prepareCodexHomeForLaunch: async () => {
+            await mkdir(partialRuntimeHome, { recursive: true });
+            await writeFile(partialRuntimeSentinel, "partial runtime effect\n");
             throw new Error("prepared runtime home failed after partial effects");
           },
           preLaunch: async () => {},
           postLaunch: async () => { postLaunchCalled = true; },
-          cleanupRuntimeCodexHome: async (runtimeCodexHome, projectCodexHome) => {
+          cleanupRuntimeCodexHome: async (runtimeCodexHome, projectCodexHome, cleanupContext) => {
             cleanupArguments = [runtimeCodexHome, projectCodexHome];
+            cleanupSawPartialRuntimeSentinel = existsSync(partialRuntimeSentinel);
+            cleanupAuthority = {
+              authorityPath: cleanupContext.authority_path,
+              authorityId: cleanupContext.generation.authority_id,
+              generationId: cleanupContext.generation.generation_id,
+              workspaceDigest: cleanupContext.workspace_identity.digest,
+              bindingId: cleanupContext.session_binding?.binding_id,
+            };
+            await rm(partialRuntimeHome, { recursive: true, force: true });
           },
           normalizeCodexLaunchArgs: (args: string[]) => args,
           injectModelInstructionsBypassArgs: (_cwd: string, args: string[]) => args,
@@ -570,6 +668,15 @@ exit 0
       assert.equal(status, 1);
       assert.equal(postLaunchCalled, false);
       assert.deepEqual(cleanupArguments, [undefined, undefined]);
+      assert.equal(cleanupSawPartialRuntimeSentinel, true);
+      assert.deepEqual(cleanupAuthority, {
+        authorityPath: authority.authority_path,
+        authorityId: authority.generation.authority_id,
+        generationId: authority.generation.generation_id,
+        workspaceDigest: authority.workspace_identity.digest,
+        bindingId: authority.session_binding?.binding_id,
+      });
+      assert.equal(existsSync(partialRuntimeSentinel), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

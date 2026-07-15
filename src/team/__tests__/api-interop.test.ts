@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it as nodeIt, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -12,7 +12,7 @@ import {
   type TeamApiOperation,
 } from '../api-interop.js';
 import {
-  initTeamState,
+  initTeamState as rawInitTeamState,
   createTask,
   readTeamLeaderAttention,
   readTeamManifestV2,
@@ -31,17 +31,133 @@ import {
   writeMonitorSnapshot,
   writeWorkerStatus,
 } from '../state.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+function it(name: string, fn: (t: TestContext) => void | Promise<void>): void {
+  nodeIt(name, { concurrency: false }, async (t) => withClearedTeamTransport(() => fn(t)));
+}
+
+async function withProcessEnvironment<T>(
+  values: NodeJS.ProcessEnv,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(values)) {
+    previous.set(name, process.env[name]);
+    if (typeof value === 'string') process.env[name] = value;
+    else delete process.env[name];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of previous) {
+      if (typeof value === 'string') process.env[name] = value;
+      else delete process.env[name];
+    }
+  }
+}
+
+const AUTHENTICATED_TEAM_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
+
+interface AuthenticatedTeamFixture {
+  authority: Awaited<ReturnType<typeof initializeStateAuthority>>;
+  transport: NodeJS.ProcessEnv;
+  restore: () => void;
+}
+
+async function withClearedTeamTransport<T>(fn: () => Promise<T> | T): Promise<T> {
+  const cwd = process.cwd();
+  const previous = new Map(AUTHENTICATED_TEAM_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of AUTHENTICATED_TEAM_ENV_KEYS) delete process.env[key];
+  try {
+    return await fn();
+  } finally {
+    process.chdir(cwd);
+    for (const key of AUTHENTICATED_TEAM_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  }
+}
+
+async function establishAuthenticatedTeamFixture(cwd: string, sessionId: string): Promise<AuthenticatedTeamFixture> {
+  const previous = new Map(AUTHENTICATED_TEAM_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of AUTHENTICATED_TEAM_ENV_KEYS) delete process.env[key];
+  try {
+    const stateRoot = join(cwd, '.omx', 'state');
+    await mkdir(stateRoot, { recursive: true });
+    await chmod(join(cwd, '.omx'), 0o700);
+    await chmod(stateRoot, 0o700);
+    const authority = await initializeStateAuthority({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      launch_id: `api-interop-${sessionId}`,
+      session_binding: { canonical_session_id: sessionId },
+    });
+    await mintStateAuthorityTransportCapability(authority);
+    const transport = buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+    Object.assign(process.env, transport);
+    return {
+      authority,
+      transport,
+      restore: () => {
+        for (const key of AUTHENTICATED_TEAM_ENV_KEYS) {
+          const value = previous.get(key);
+          if (typeof value === 'string') process.env[key] = value;
+          else delete process.env[key];
+        }
+      },
+    };
+  } catch (error) {
+    for (const key of AUTHENTICATED_TEAM_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+    throw error;
+  }
+}
+
+async function withAuthenticatedTeamFixture<T>(
+  cwd: string,
+  sessionId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const fixture = await establishAuthenticatedTeamFixture(cwd, sessionId);
+  try {
+    return await fn();
+  } finally {
+    fixture.restore();
+  }
+}
 
 async function setupTeam(name: string): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-interop-${name}-`));
-  const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-  delete process.env.OMX_TEAM_STATE_ROOT;
-  await initTeamState(name, 'test task', 'executor', 2, cwd);
+  const fixture = await establishAuthenticatedTeamFixture(cwd, `api-interop-${name}`);
+  try {
+    await rawInitTeamState(name, 'test task', 'executor', 2, cwd);
+  } catch (error) {
+    fixture.restore();
+    await rm(cwd, { recursive: true, force: true });
+    throw error;
+  }
   return {
     cwd,
     cleanup: async () => {
-      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
+      fixture.restore();
       await rm(cwd, { recursive: true, force: true });
     },
   };
@@ -54,28 +170,27 @@ async function setupDisplayTeam(
   workerCount = 2,
 ): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-interop-${internalName}-`));
-  const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-  const previousSessionId = process.env.OMX_SESSION_ID;
-  delete process.env.OMX_TEAM_STATE_ROOT;
-  process.env.OMX_SESSION_ID = sessionId;
-  await initTeamState(internalName, 'display-name API test', 'executor', workerCount, cwd, undefined, {
-    OMX_SESSION_ID: sessionId,
-  }, {
-    display_name: displayName,
-    requested_name: displayName,
-    identity_source: 'env-session',
-  });
+  const fixture = await establishAuthenticatedTeamFixture(cwd, sessionId);
+  try {
+    await rawInitTeamState(internalName, 'display-name API test', 'executor', workerCount, cwd, undefined, fixture.transport, {
+      display_name: displayName,
+      requested_name: displayName,
+      identity_source: 'env-session',
+    });
+  } catch (error) {
+    fixture.restore();
+    await rm(cwd, { recursive: true, force: true });
+    throw error;
+  }
   return {
     cwd,
     cleanup: async () => {
-      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
-      if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
-      else delete process.env.OMX_SESSION_ID;
+      fixture.restore();
       await rm(cwd, { recursive: true, force: true });
     },
   };
 }
+
 
 async function withMailboxCompatHoleRuntime<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
   const fakeBin = join(cwd, 'runtime-bin');
@@ -242,8 +357,10 @@ describe('validateCommonFields', () => {
 
   it('resolves a long display team_name before applying internal key validation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-api-long-display-'));
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
-      await initTeamState('long-display-aaaaaaaa', 'test task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-long' }, {
+      fixture = await establishAuthenticatedTeamFixture(cwd, 'session-long');
+      await rawInitTeamState('long-display-aaaaaaaa', 'test task', 'executor', 1, cwd, undefined, fixture.transport, {
         display_name: 'this-is-a-long-display-name-that-exceeds-thirty-chars',
         requested_name: 'this-is-a-long-display-name-that-exceeds-thirty-chars',
         identity_source: 'env-session',
@@ -261,6 +378,7 @@ describe('validateCommonFields', () => {
         else process.env.OMX_SESSION_ID = previousSessionId;
       }
     } finally {
+      fixture?.restore();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -339,15 +457,16 @@ describe('executeTeamApiOperation: send-message', () => {
     }
   });
 
-  it('returns the persisted leader mailbox message when hook-targeted sends are deduped from a worker worktree', async () => {
+  it('routes authenticated worker API mailbox sends to the leader canonical state root', async () => {
     const teamName = 'msg-team-leader-dedupe';
     const repoCwd = await realpath(await mkdtemp(join(tmpdir(), 'omx-interop-send-root-')));
-    const workerCwd = await realpath(await mkdtemp(join(tmpdir(), 'omx-interop-send-worktree-')));
-    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    delete process.env.OMX_TEAM_STATE_ROOT;
-
+    const workerCwd = join(repoCwd, 'worktrees', 'worker-1');
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
-      await initTeamState(teamName, 'leader mailbox dedupe', 'executor', 2, repoCwd);
+      await mkdir(workerCwd, { recursive: true });
+      fixture = await establishAuthenticatedTeamFixture(repoCwd, 'api-worker-mailbox-session');
+      const { authority } = fixture;
+      await rawInitTeamState(teamName, 'leader mailbox dedupe', 'executor', 2, repoCwd, undefined, fixture.transport);
 
       const configPath = join(repoCwd, '.omx', 'state', 'team', teamName, 'config.json');
       const config = JSON.parse(await readFile(configPath, 'utf-8')) as {
@@ -363,56 +482,60 @@ describe('executeTeamApiOperation: send-message', () => {
       manifest.leader_pane_id = '%55';
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
-      process.env.OMX_TEAM_STATE_ROOT = join(repoCwd, '.omx', 'state');
+      await withProcessEnvironment(buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: 'api-worker-mailbox-session',
+      }), async () => {
+        const first = await executeTeamApiOperation('send-message', {
+          team_name: teamName,
+          from_worker: 'worker-1',
+          to_worker: 'leader-fixed',
+          body: 'ACK: worker-1 initialized',
+        }, workerCwd);
+        assert.equal(first.ok, true);
+        if (!first.ok) throw new Error('expected first send-message call to succeed');
 
-      const first = await executeTeamApiOperation('send-message', {
-        team_name: teamName,
-        from_worker: 'worker-1',
-        to_worker: 'leader-fixed',
-        body: 'ACK: worker-1 initialized',
-      }, workerCwd);
-      assert.equal(first.ok, true);
-      if (!first.ok) throw new Error('expected first send-message call to succeed');
+        const second = await executeTeamApiOperation('send-message', {
+          team_name: teamName,
+          from_worker: 'worker-1',
+          to_worker: 'leader-fixed',
+          body: 'ACK: worker-1 initialized',
+        }, workerCwd);
+        assert.equal(second.ok, true);
+        if (!second.ok) throw new Error('expected duplicate send-message call to succeed');
 
-      const second = await executeTeamApiOperation('send-message', {
-        team_name: teamName,
-        from_worker: 'worker-1',
-        to_worker: 'leader-fixed',
-        body: 'ACK: worker-1 initialized',
-      }, workerCwd);
-      assert.equal(second.ok, true);
-      if (!second.ok) throw new Error('expected duplicate send-message call to succeed');
+        const firstMessage = first.data.message as Record<string, unknown>;
+        const secondMessage = second.data.message as Record<string, unknown>;
+        assert.equal(secondMessage.message_id, firstMessage.message_id);
+        assert.equal(secondMessage.to_worker, 'leader-fixed');
+        assert.equal(secondMessage.body, 'ACK: worker-1 initialized');
 
-      const firstMessage = first.data.message as Record<string, unknown>;
-      const secondMessage = second.data.message as Record<string, unknown>;
-      assert.equal(secondMessage.message_id, firstMessage.message_id);
-      assert.equal(secondMessage.to_worker, 'leader-fixed');
-      assert.equal(secondMessage.body, 'ACK: worker-1 initialized');
+        const mailbox = JSON.parse(await readFile(
+          join(repoCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'),
+          'utf-8',
+        )) as { messages?: Array<Record<string, unknown>> };
+        const workerMessages = (mailbox.messages ?? []).filter((message) =>
+          message.from_worker === 'worker-1' && message.to_worker === 'leader-fixed',
+        );
+        assert.equal(workerMessages.length, 1, 'deduped leader sends should not append duplicate worker mailbox rows');
+        await assert.rejects(
+          readFile(join(workerCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'), 'utf-8'),
+          { code: 'ENOENT' },
+        );
 
-      const mailbox = JSON.parse(await readFile(
-        join(repoCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'),
-        'utf-8',
-      )) as { messages?: Array<Record<string, unknown>> };
-      const workerMessages = (mailbox.messages ?? []).filter((message) =>
-        message.from_worker === 'worker-1' && message.to_worker === 'leader-fixed',
-      );
-      assert.equal(workerMessages.length, 1, 'deduped leader sends should not append duplicate worker mailbox rows');
-
-      const deliveryLog = [
-        ...(await readTeamDeliveryLog(repoCwd)),
-        ...(await readTeamDeliveryLog(workerCwd)),
-      ];
-      const createdEvents = deliveryLog.filter((entry) =>
-        entry.event === 'mailbox_created'
-        && entry.from_worker === 'worker-1'
-        && entry.to_worker === 'leader-fixed'
-        && entry.message_id === firstMessage.message_id);
-      assert.equal(createdEvents.length, 1, 'deduped leader sends should only emit one mailbox_created event');
+        const deliveryLog = [
+          ...(await readTeamDeliveryLog(repoCwd)),
+          ...(await readTeamDeliveryLog(workerCwd)),
+        ];
+        const createdEvents = deliveryLog.filter((entry) =>
+          entry.event === 'mailbox_created'
+          && entry.from_worker === 'worker-1'
+          && entry.to_worker === 'leader-fixed'
+          && entry.message_id === firstMessage.message_id);
+        assert.equal(createdEvents.length, 1, 'deduped leader sends should only emit one mailbox_created event');
+      });
     } finally {
-      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
+      fixture?.restore();
       await rm(repoCwd, { recursive: true, force: true });
-      await rm(workerCwd, { recursive: true, force: true });
     }
   });
 
@@ -420,9 +543,11 @@ describe('executeTeamApiOperation: send-message', () => {
     const teamName = 'msg-team-canonical-root';
     const root = await mkdtemp(join(tmpdir(), 'omx-interop-canonical-root-'));
     const leaderCwd = join(root, 'leader');
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
       await mkdir(leaderCwd, { recursive: true });
-      await initTeamState(teamName, 'canonical mailbox fallback', 'executor', 2, leaderCwd);
+      fixture = await establishAuthenticatedTeamFixture(leaderCwd, 'api-canonical-root');
+      await rawInitTeamState(teamName, 'canonical mailbox fallback', 'executor', 2, leaderCwd);
       await withMailboxCompatHoleRuntime(root, async () => {
         const result = await executeTeamApiOperation('send-message', {
           team_name: teamName,
@@ -444,6 +569,7 @@ describe('executeTeamApiOperation: send-message', () => {
         assert.equal(mailbox.messages?.length, 1);
       });
     } finally {
+      fixture?.restore();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -582,60 +708,62 @@ describe('executeTeamApiOperation: mailbox-mark-delivered', () => {
     }
   });
 
-  it('marks leader-fixed mailbox delivery from a worker worktree and resolves the matching dispatch receipt', async () => {
+  it('marks leader mailbox delivery through authenticated worker authority', async () => {
     const teamName = 'mark-dlv-leader-worktree';
     const repoCwd = await mkdtemp(join(tmpdir(), 'omx-interop-mark-dlv-root-'));
-    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-interop-mark-dlv-worktree-'));
-    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    delete process.env.OMX_TEAM_STATE_ROOT;
-
+    const workerCwd = join(repoCwd, 'worktrees', 'worker-1');
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
-      await initTeamState(teamName, 'leader mailbox delivery receipt', 'executor', 2, repoCwd);
-      process.env.OMX_TEAM_STATE_ROOT = join(repoCwd, '.omx', 'state');
+      await mkdir(workerCwd, { recursive: true });
+      fixture = await establishAuthenticatedTeamFixture(repoCwd, 'api-worker-delivery-session');
+      const { authority } = fixture;
+      await rawInitTeamState(teamName, 'leader mailbox delivery receipt', 'executor', 2, repoCwd, undefined, fixture.transport);
 
-      const sendResult = await executeTeamApiOperation('send-message', {
-        team_name: teamName,
-        from_worker: 'worker-1',
-        to_worker: 'leader-fixed',
-        body: 'DONE: worker-1 finished a mailbox integrity probe',
-      }, workerCwd);
-      assert.equal(sendResult.ok, true);
-      if (!sendResult.ok) throw new Error('expected successful leader send-message result');
+      await withProcessEnvironment(buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: 'api-worker-delivery-session',
+      }), async () => {
+        const sendResult = await executeTeamApiOperation('send-message', {
+          team_name: teamName,
+          from_worker: 'worker-1',
+          to_worker: 'leader-fixed',
+          body: 'DONE: worker-1 finished a mailbox integrity probe',
+        }, workerCwd);
+        assert.equal(sendResult.ok, true);
+        if (!sendResult.ok) throw new Error('expected successful leader send-message result');
 
-      const message = sendResult.data.message as Record<string, unknown>;
-      const messageId = String(message.message_id ?? '');
-      assert.ok(messageId, 'leader mailbox message should include a message_id');
+        const message = sendResult.data.message as Record<string, unknown>;
+        const messageId = String(message.message_id ?? '');
+        assert.ok(messageId, 'leader mailbox message should include a message_id');
 
-      const pendingRequests = await listDispatchRequests(teamName, repoCwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
-      const pendingDispatch = pendingRequests.find((request) => request.message_id === messageId);
-      assert.ok(pendingDispatch, 'leader mailbox send should enqueue a matching dispatch request');
+        const pendingRequests = await listDispatchRequests(teamName, repoCwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
+        const pendingDispatch = pendingRequests.find((request) => request.message_id === messageId);
+        assert.ok(pendingDispatch, 'leader mailbox send should enqueue a matching dispatch request');
 
-      const result = await executeTeamApiOperation('mailbox-mark-delivered', {
-        team_name: teamName,
-        worker: 'leader-fixed',
-        message_id: messageId,
-      }, workerCwd);
-      assert.equal(result.ok, true);
-      if (!result.ok) throw new Error('expected successful leader mailbox-mark-delivered result');
-      assert.equal(result.data.updated, true);
-      assert.equal(result.data.dispatch_request_id, pendingDispatch?.request_id);
-      assert.equal(result.data.dispatch_updated, true);
+        const result = await executeTeamApiOperation('mailbox-mark-delivered', {
+          team_name: teamName,
+          worker: 'leader-fixed',
+          message_id: messageId,
+        }, workerCwd);
+        assert.equal(result.ok, true);
+        if (!result.ok) throw new Error('expected successful leader mailbox-mark-delivered result');
+        assert.equal(result.data.updated, true);
+        assert.equal(result.data.dispatch_request_id, pendingDispatch?.request_id);
+        assert.equal(result.data.dispatch_updated, true);
 
-      const updatedDispatch = await readDispatchRequest(teamName, pendingDispatch!.request_id, repoCwd);
-      assert.equal(updatedDispatch?.status, 'delivered');
-      assert.ok(updatedDispatch?.delivered_at, 'leader dispatch receipt should record delivered_at');
+        const updatedDispatch = await readDispatchRequest(teamName, pendingDispatch!.request_id, repoCwd);
+        assert.equal(updatedDispatch?.status, 'delivered');
+        assert.ok(updatedDispatch?.delivered_at, 'leader dispatch receipt should record delivered_at');
 
-      const leaderMailbox = JSON.parse(await readFile(
-        join(repoCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'),
-        'utf-8',
-      )) as { messages?: Array<Record<string, unknown>> };
-      const deliveredMessage = (leaderMailbox.messages ?? []).find((entry) => entry.message_id === messageId);
-      assert.equal(typeof deliveredMessage?.delivered_at, 'string');
+        const leaderMailbox = JSON.parse(await readFile(
+          join(repoCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'),
+          'utf-8',
+        )) as { messages?: Array<Record<string, unknown>> };
+        const deliveredMessage = (leaderMailbox.messages ?? []).find((entry) => entry.message_id === messageId);
+        assert.equal(typeof deliveredMessage?.delivered_at, 'string');
+      });
     } finally {
-      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
+      fixture?.restore();
       await rm(repoCwd, { recursive: true, force: true });
-      await rm(workerCwd, { recursive: true, force: true });
     }
   });
 
@@ -804,60 +932,57 @@ describe('executeTeamApiOperation: list-tasks', () => {
   });
 
 
-  it('resolves team working directory from manifest metadata over worker identity/config fallbacks', async () => {
+  it('does not route API calls through manifest state-root metadata', async () => {
     const teamName = 'list-tsk-meta';
     const cwdA = await mkdtemp(join(tmpdir(), 'omx-interop-meta-a-'));
     const cwdB = await mkdtemp(join(tmpdir(), 'omx-interop-meta-b-'));
-    const prevTeamWorker = process.env.OMX_TEAM_WORKER;
-    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    delete process.env.OMX_TEAM_STATE_ROOT;
-    process.env.OMX_TEAM_WORKER = `${teamName}/worker-1`;
-
+    let fixtureA: AuthenticatedTeamFixture | undefined;
+    let fixtureB: AuthenticatedTeamFixture | undefined;
     try {
-      await initTeamState(teamName, 'metadata precedence', 'executor', 2, cwdA);
-      await initTeamState(teamName, 'metadata precedence', 'executor', 2, cwdB);
+      fixtureA = await establishAuthenticatedTeamFixture(cwdA, 'api-metadata-a');
+      await rawInitTeamState(teamName, 'metadata precedence', 'executor', 2, cwdA);
+      fixtureB = await establishAuthenticatedTeamFixture(cwdB, 'api-metadata-b');
+      await rawInitTeamState(teamName, 'metadata precedence', 'executor', 2, cwdB);
       await createTask(teamName, { subject: 'From manifest root', description: 'B lane', status: 'pending' }, cwdB);
+      fixtureB.restore();
 
-      const teamRootA = join(cwdA, '.omx', 'state', 'team', teamName);
-      const configPath = join(teamRootA, 'config.json');
-      const manifestPath = join(teamRootA, 'manifest.v2.json');
-
-      const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
+      const manifestPath = join(cwdA, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
-
-      config.team_state_root = join(cwdA, '.omx', 'state');
       manifest.team_state_root = join(cwdB, '.omx', 'state');
-
-      await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
       await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
       const result = await executeTeamApiOperation('list-tasks', { team_name: teamName }, cwdA);
       assert.equal(result.ok, true);
       if (!result.ok) throw new Error('expected list-tasks to succeed');
-      assert.equal(result.data.count, 1);
+      assert.equal(result.data.count, 0);
     } finally {
-      if (typeof prevTeamWorker === 'string') process.env.OMX_TEAM_WORKER = prevTeamWorker;
-      else delete process.env.OMX_TEAM_WORKER;
-      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
+      fixtureA?.restore();
       await rm(cwdA, { recursive: true, force: true });
       await rm(cwdB, { recursive: true, force: true });
     }
   });
 
 
-  it('resolves display team names from OMX_TEAM_STATE_ROOT when API calls run outside the leader cwd', async () => {
-    const { cwd: leaderCwd, cleanup } = await setupDisplayTeam('api-root-display-11111111', 'api-root-display', 'session-api-root-display');
-    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-interop-api-root-worker-'));
+  it('resolves display team names through authenticated worker authority', async () => {
+    const teamName = 'api-root-display-11111111';
+    const sessionId = 'session-api-root-display';
+    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-interop-api-root-leader-'));
+    const workerCwd = join(leaderCwd, 'worker');
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
-      process.env.OMX_TEAM_STATE_ROOT = join(leaderCwd, '.omx', 'state');
-      await createTask('api-root-display-11111111', { subject: 'From shared root', description: 'D', status: 'pending' }, leaderCwd);
-      const event = await appendTeamEvent('api-root-display-11111111', {
+      await mkdir(workerCwd, { recursive: true });
+      fixture = await establishAuthenticatedTeamFixture(leaderCwd, sessionId);
+      const { authority } = fixture;
+      await rawInitTeamState(teamName, 'display-name API test', 'executor', 2, leaderCwd, undefined, fixture.transport, {
+        display_name: 'api-root-display', requested_name: 'api-root-display', identity_source: 'env-session',
+      });
+      await createTask(teamName, { subject: 'From shared root', description: 'D', status: 'pending' }, leaderCwd);
+      const event = await appendTeamEvent(teamName, {
         type: 'task_completed',
         worker: 'worker-1',
         task_id: '1',
       }, leaderCwd);
-      await writeMonitorSnapshot('api-root-display-11111111', {
+      await writeMonitorSnapshot(teamName, {
         taskStatusById: { '1': 'pending' },
         workerAliveByName: { 'worker-1': true, 'worker-2': true },
         workerStateByName: { 'worker-1': 'idle', 'worker-2': 'working' },
@@ -867,68 +992,84 @@ describe('executeTeamApiOperation: list-tasks', () => {
         completedEventTaskIds: {},
       }, leaderCwd);
 
-      const listResult = await executeTeamApiOperation('list-tasks', { team_name: 'api-root-display' }, workerCwd);
-      assert.equal(listResult.ok, true);
-      if (!listResult.ok) throw new Error('expected list-tasks to succeed');
-      assert.equal(listResult.data.count, 1);
-      assert.equal((listResult.data.tasks as Array<{ subject?: string }>)[0]?.subject, 'From shared root');
+      await withProcessEnvironment(buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: sessionId,
+      }), async () => {
+        const listResult = await executeTeamApiOperation('list-tasks', { team_name: 'api-root-display' }, workerCwd);
+        assert.equal(listResult.ok, true);
+        if (!listResult.ok) throw new Error('expected list-tasks to succeed');
+        assert.equal(listResult.data.count, 1);
+        assert.equal((listResult.data.tasks as Array<{ subject?: string }>)[0]?.subject, 'From shared root');
 
-      const eventsResult = await executeTeamApiOperation('read-events', {
-        team_name: 'api-root-display',
-        type: 'task_completed',
-      }, workerCwd);
-      assert.equal(eventsResult.ok, true);
-      if (!eventsResult.ok) throw new Error('expected read-events to succeed');
-      assert.equal(eventsResult.data.count, 1);
-      assert.equal((eventsResult.data.events as Array<{ event_id?: string }>)[0]?.event_id, event.event_id);
+        const eventsResult = await executeTeamApiOperation('read-events', {
+          team_name: 'api-root-display',
+          type: 'task_completed',
+        }, workerCwd);
+        assert.equal(eventsResult.ok, true);
+        if (!eventsResult.ok) throw new Error('expected read-events to succeed');
+        assert.equal(eventsResult.data.count, 1);
+        assert.equal((eventsResult.data.events as Array<{ event_id?: string }>)[0]?.event_id, event.event_id);
 
-      const idleResult = await executeTeamApiOperation('read-idle-state', { team_name: 'api-root-display' }, workerCwd);
-      assert.equal(idleResult.ok, true);
-      if (!idleResult.ok) throw new Error('expected read-idle-state to succeed');
-      assert.equal(idleResult.data.team_name, 'api-root-display-11111111');
-      assert.deepEqual(idleResult.data.idle_workers, ['worker-1']);
+        const idleResult = await executeTeamApiOperation('read-idle-state', { team_name: 'api-root-display' }, workerCwd);
+        assert.equal(idleResult.ok, true);
+        if (!idleResult.ok) throw new Error('expected read-idle-state to succeed');
+        assert.equal(idleResult.data.team_name, teamName);
+        assert.deepEqual(idleResult.data.idle_workers, ['worker-1']);
+      });
     } finally {
-      await rm(workerCwd, { recursive: true, force: true });
-      await cleanup();
+      fixture?.restore();
+      await rm(leaderCwd, { recursive: true, force: true });
     }
   });
 
-  it('prefers OMX_TEAM_STATE_ROOT over manifest metadata when resolving the team working directory', async () => {
+  it('fails closed when ambient aliases conflict with persisted authority', async () => {
     const teamName = 'list-tsk-env-root';
-    const cwdA = await mkdtemp(join(tmpdir(), 'omx-interop-env-a-'));
-    const cwdB = await mkdtemp(join(tmpdir(), 'omx-interop-env-b-'));
-    const prevTeamWorker = process.env.OMX_TEAM_WORKER;
-    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    delete process.env.OMX_TEAM_STATE_ROOT;
-    process.env.OMX_TEAM_WORKER = `${teamName}/worker-1`;
-
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-interop-env-canonical-'));
+    const foreignTeamStateRoot = await mkdtemp(join(tmpdir(), 'omx-interop-env-team-root-'));
+    const foreignOmxRoot = await mkdtemp(join(tmpdir(), 'omx-interop-env-root-'));
+    const foreignStateRoot = await mkdtemp(join(tmpdir(), 'omx-interop-env-state-root-'));
+    const previous = {
+      teamStateRoot: process.env.OMX_TEAM_STATE_ROOT,
+      root: process.env.OMX_ROOT,
+      stateRoot: process.env.OMX_STATE_ROOT,
+    };
+    let fixture: AuthenticatedTeamFixture | undefined;
     try {
-      await initTeamState(teamName, 'env root precedence', 'executor', 2, cwdA);
-      await initTeamState(teamName, 'env root precedence', 'executor', 2, cwdB);
-      await createTask(teamName, { subject: 'From env root', description: 'A lane', status: 'pending' }, cwdA);
-      await createTask(teamName, { subject: 'From manifest root', description: 'B lane', status: 'pending' }, cwdB);
+      delete process.env.OMX_TEAM_STATE_ROOT;
+      delete process.env.OMX_ROOT;
+      delete process.env.OMX_STATE_ROOT;
+      fixture = await establishAuthenticatedTeamFixture(cwd, 'api-ambient-root');
+      await rawInitTeamState(teamName, 'ambient root isolation', 'executor', 2, cwd);
+      await createTask(teamName, { subject: 'From canonical root', description: 'canonical', status: 'pending' }, cwd);
 
-      const teamRootA = join(cwdA, '.omx', 'state', 'team', teamName);
-      const manifestPath = join(teamRootA, 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
-      manifest.team_state_root = join(cwdB, '.omx', 'state');
-      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-
-      process.env.OMX_TEAM_STATE_ROOT = join(cwdA, '.omx', 'state');
-
-      const result = await executeTeamApiOperation('list-tasks', { team_name: teamName }, cwdB);
-      assert.equal(result.ok, true);
-      if (!result.ok) throw new Error('expected list-tasks to succeed');
-      assert.equal(result.data.count, 1);
-      const tasks = result.data.tasks as Array<{ subject?: string }>;
-      assert.equal(tasks[0]?.subject, 'From env root');
+      process.env.OMX_TEAM_STATE_ROOT = foreignTeamStateRoot;
+      process.env.OMX_ROOT = foreignOmxRoot;
+      process.env.OMX_STATE_ROOT = foreignStateRoot;
+      const result = await executeTeamApiOperation('list-tasks', { team_name: teamName }, cwd);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error.message, /authority|state root|workspace/i);
+      for (const root of [
+        foreignTeamStateRoot,
+        join(foreignOmxRoot, '.omx', 'state'),
+        join(foreignStateRoot, '.omx', 'state'),
+      ]) {
+        await assert.rejects(
+          readFile(join(root, 'team', teamName, 'config.json'), 'utf-8'),
+          { code: 'ENOENT' },
+        );
+      }
     } finally {
-      if (typeof prevTeamWorker === 'string') process.env.OMX_TEAM_WORKER = prevTeamWorker;
-      else delete process.env.OMX_TEAM_WORKER;
-      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
+      fixture?.restore();
+      if (typeof previous.teamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previous.teamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
-      await rm(cwdA, { recursive: true, force: true });
-      await rm(cwdB, { recursive: true, force: true });
+      if (typeof previous.root === 'string') process.env.OMX_ROOT = previous.root;
+      else delete process.env.OMX_ROOT;
+      if (typeof previous.stateRoot === 'string') process.env.OMX_STATE_ROOT = previous.stateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(foreignTeamStateRoot, { recursive: true, force: true });
+      await rm(foreignOmxRoot, { recursive: true, force: true });
+      await rm(foreignStateRoot, { recursive: true, force: true });
     }
   });
 
@@ -1829,17 +1970,18 @@ describe('executeTeamApiOperation: read-stall-state', () => {
     }
   });
 
-  it('reads leader runtime activity from boxed OMX_ROOT state consistently with writer path', async () => {
+  it('does not treat boxed OMX_ROOT activity as authoritative', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-interop-boxed-cwd-'));
     const box = await mkdtemp(join(tmpdir(), 'omx-interop-boxed-root-'));
     const previousRoot = process.env.OMX_ROOT;
     const previousStateRoot = process.env.OMX_STATE_ROOT;
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
-      process.env.OMX_ROOT = box;
+      delete process.env.OMX_ROOT;
       delete process.env.OMX_STATE_ROOT;
       delete process.env.OMX_TEAM_STATE_ROOT;
-      await initTeamState('stall-state-boxed-activity', 'boxed activity test', 'executor', 1, cwd);
+      await withAuthenticatedTeamFixture(cwd, 'api-boxed-activity', async () => {
+        await rawInitTeamState('stall-state-boxed-activity', 'boxed activity test', 'executor', 1, cwd);
       await writeTeamLeaderAttention('stall-state-boxed-activity', {
         team_name: 'stall-state-boxed-activity',
         updated_at: '2026-03-10T10:05:00.000Z',
@@ -1856,12 +1998,14 @@ describe('executeTeamApiOperation: read-stall-state', () => {
         work_remaining: false,
         stalled_for_ms: null,
       }, cwd);
+      process.env.OMX_ROOT = box;
       await mkdir(join(box, '.omx', 'state'), { recursive: true });
       await writeFile(join(box, '.omx', 'state', 'leader-runtime-activity.json'), JSON.stringify({
         last_activity_at: '2026-03-10T10:06:00.000Z',
         last_source: 'team_status',
         last_team_name: 'stall-state-boxed-activity',
       }, null, 2));
+      delete process.env.OMX_ROOT;
 
       const result = await executeTeamApiOperation('read-stall-state', {
         team_name: 'stall-state-boxed-activity',
@@ -1869,9 +2013,10 @@ describe('executeTeamApiOperation: read-stall-state', () => {
 
       assert.equal(result.ok, true);
       if (result.ok) {
-        assert.equal(result.data.leader_attention_pending, false);
-        assert.equal(result.data.leader_stale, false);
+        assert.equal(result.data.leader_attention_pending, true);
+        assert.equal(result.data.leader_stale, true);
       }
+      });
     } finally {
       if (typeof previousRoot === 'string') process.env.OMX_ROOT = previousRoot;
       else delete process.env.OMX_ROOT;
@@ -1980,7 +2125,7 @@ describe('executeTeamApiOperation: read-stall-state', () => {
   it('marks only active leader-owned teams as stopped on session end', async () => {
     const { cwd, cleanup } = await setupTeam('owned-team');
     try {
-      await initTeamState('other-team', 'Other', 'executor', 1, cwd);
+      await rawInitTeamState('other-team', 'Other', 'executor', 1, cwd);
       const ownedManifest = await readTeamManifestV2('owned-team', cwd);
       const otherManifest = await readTeamManifestV2('other-team', cwd);
       assert.ok(ownedManifest);
@@ -2247,14 +2392,18 @@ describe('executeTeamApiOperation: cleanup', () => {
 
 describe('executeTeamApiOperation: orphan-cleanup', () => {
   it('uses destructive orphan cleanup explicitly', async () => {
-    const { cwd } = await setupTeam('cleanup-orphan');
-    const result = await executeTeamApiOperation('orphan-cleanup', {
-      team_name: 'cleanup-orphan',
-    }, cwd);
-    assert.equal(result.ok, true);
-    if (result.ok) {
-      assert.equal(result.data.team_name, 'cleanup-orphan');
-      assert.equal(result.data.cleanup_mode, 'orphan_cleanup');
+    const { cwd, cleanup } = await setupTeam('cleanup-orphan');
+    try {
+      const result = await executeTeamApiOperation('orphan-cleanup', {
+        team_name: 'cleanup-orphan',
+      }, cwd);
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.equal(result.data.team_name, 'cleanup-orphan');
+        assert.equal(result.data.cleanup_mode, 'orphan_cleanup');
+      }
+    } finally {
+      await cleanup();
     }
   });
 

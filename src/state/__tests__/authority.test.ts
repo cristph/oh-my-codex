@@ -1,14 +1,16 @@
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 
 import { spawn } from 'node:child_process';
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 
 import { dirname, join } from 'node:path';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
 
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
@@ -51,14 +53,21 @@ import {
   validateStateAuthorityTransportCapability,
   validateCommittedStateAuthorityLaunchTransportPublication,
   validateCommittedStateAuthorityLaunchTransportJournal,
+  withStateAuthorityTransaction,
   stateAuthorityFilesystemPrimitiveForPlatform,
 
   type StateAuthorityFilesystemCapability,
   type StateAuthorityGeneration,
 } from '../authority.js';
-import { resolveAuthenticatedTransportAuthority } from '../../hooks/session.js';
+import {
+  resolveAuthenticatedStateAuthorityStartupCwd,
+  resolveAuthenticatedTransportAuthority,
+} from '../../hooks/session.js';
+import { resolveAuthorityRuntimeStateScope } from '../../mcp/state-paths.js';
+import { executeStateOperation } from '../operations.js';
 
 function verifiedCapability(path: string): StateAuthorityFilesystemCapability {
+  const primitive = stateAuthorityFilesystemPrimitiveForPlatform();
   return {
     schema_version: 1,
     platform: process.platform,
@@ -67,7 +76,8 @@ function verifiedCapability(path: string): StateAuthorityFilesystemCapability {
     atomic_rename: 'verified',
     file_sync: 'verified',
     directory_sync: 'verified',
-    no_follow_directories: 'verified',
+    no_follow_directories: primitive.descriptor_relative ? 'verified' : 'unsupported',
+    ...(primitive.descriptor_relative ? {} : { revalidated_path_mutation: 'verified' as const }),
     strong_root_identity: 'verified',
     probed_at: new Date(0).toISOString(),
   };
@@ -347,13 +357,16 @@ describe('state authority foundation', () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
-  it('revalidates cached child bearers against persisted metadata while preserving alias revisions', async () => {
+  it('revokes cached child bearers on lease revision and rejects stale lease metadata', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-child-capability-cache-'));
     try {
       const authority = await initializeStateAuthority({
         startup_cwd: workspace,
         launch_id: 'child-capability-cache',
-        session_binding: { canonical_session_id: 'child-capability-session' },
+        session_binding: {
+          canonical_session_id: 'child-capability-session',
+          aliases: { native_session_id: 'child-capability-session' },
+        },
       });
       const minted = await mintStateAuthorityTransportCapability(authority);
       assert.equal(stateAuthorityTransportCapabilityForChild(authority), minted.capability);
@@ -363,21 +376,49 @@ describe('state authority foundation', () => {
         launch_id: 'child-capability-alias',
         session_binding: {
           canonical_session_id: 'child-capability-session',
-          aliases: { current_session_aliases: ['child-capability-alias'] },
+          aliases: {
+            current_session_aliases: ['child-capability-alias'],
+            owner_session_aliases: ['child-capability-session'],
+            previous_session_aliases: ['child-capability-session'],
+          },
         },
       });
       assert.ok(aliased.session_binding!.binding_revision > minted.metadata.binding_revision);
-      assert.equal(stateAuthorityTransportCapabilityForChild(aliased), minted.capability);
+      await assert.rejects(
+        validateStateAuthorityTransportCapability(aliased, minted.capability),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+      );
+      await assert.rejects(
+        mintStateAuthorityTransportCapability(authority),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      );
+      const rotatedCapability = stateAuthorityTransportCapabilityForChild(aliased);
+      assert.notEqual(rotatedCapability, minted.capability);
+      await validateStateAuthorityTransportCapability(aliased, rotatedCapability);
 
+      const replacement = await mintStateAuthorityTransportCapability(aliased);
+      assert.equal(stateAuthorityTransportCapabilityForChild(aliased), replacement.capability);
       const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
       assert.ok(anchor?.transport_capability);
+      assert.ok(anchor.active_lease);
       await writeFile(authority.anchor_path, `${JSON.stringify({
-        ...anchor!,
+        ...anchor,
         transport_capability: {
-          ...anchor!.transport_capability!,
-          capability_digest: 'f'.repeat(64),
+          ...anchor.transport_capability,
+          lease_owner_nonce: 'stale-owner-nonce',
+          fencing_token: anchor.active_lease.fencing_token - 1,
         },
       }, null, 2)}\n`);
+      await assert.rejects(
+        validateStateAuthorityTransportCapability(aliased, replacement.capability),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+      );
       assert.throws(
         () => stateAuthorityTransportCapabilityForChild(aliased),
         (error: unknown) => error instanceof Error
@@ -411,12 +452,150 @@ describe('state authority foundation', () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+  it('rejects alias-only takeover of a live authority binding', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-alias-takeover-'));
+    try {
+      await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'alias-takeover-owner',
+        session_binding: {
+          canonical_session_id: 'owner-session',
+          aliases: { current_session_aliases: ['owner-native-session'] },
+        },
+      });
+      await assert.rejects(
+        initializeStateAuthority({
+          startup_cwd: workspace,
+          launch_id: 'alias-takeover-foreign',
+          session_binding: {
+            canonical_session_id: 'foreign-session',
+            aliases: { previous_session_aliases: ['owner-native-session'] },
+          },
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects same-canonical alias injection when native identity is omitted', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-same-canonical-alias-injection-'));
+    try {
+      await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'same-canonical-owner',
+        session_binding: {
+          canonical_session_id: 'owner-session',
+          aliases: { native_session_id: 'owner-native-session' },
+        },
+      });
+      await assert.rejects(
+        initializeStateAuthority({
+          startup_cwd: workspace,
+          launch_id: 'same-canonical-foreign-alias',
+          session_binding: {
+            canonical_session_id: 'owner-session',
+            aliases: { owner_session_aliases: ['foreign-owner-session'] },
+          },
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when persisted startup and observed workspaces disagree without authenticated transport', async () => {
+    const startupWorkspace = await mkdtemp(join(tmpdir(), 'omx-authority-startup-workspace-'));
+    const observedWorkspace = await mkdtemp(join(tmpdir(), 'omx-authority-observed-workspace-'));
+    try {
+      await assert.rejects(
+        resolveAuthenticatedStateAuthorityStartupCwd(observedWorkspace, { OMX_STARTUP_CWD: startupWorkspace }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch
+          && error.message.includes(join(startupWorkspace, '.omx', 'state'))
+          && error.message.includes(join(observedWorkspace, '.omx', 'state'))
+          && error.message.includes('restart')
+          && error.message.includes('rebind'),
+      );
+    } finally {
+      await Promise.all([
+        rm(startupWorkspace, { recursive: true, force: true }),
+        rm(observedWorkspace, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  it('derives authority runtime scope from the committed binding and rejects a mismatched session pointer', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-runtime-scope-'));
+    const priorSessionId = process.env.SESSION_ID;
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'authority-runtime-scope',
+        session_binding: { canonical_session_id: 'bound-session' },
+      });
+      process.env.SESSION_ID = 'foreign-session';
+      const scope = await resolveAuthorityRuntimeStateScope(workspace);
+      assert.equal(scope.sessionId, 'bound-session');
+      assert.equal(scope.source, 'authority-binding');
+
+      await writeFile(join(authority.canonical_state_root, 'session.json'), JSON.stringify({ session_id: 'foreign-session' }));
+      await assert.rejects(
+        resolveAuthorityRuntimeStateScope(workspace),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      );
+    } finally {
+      if (priorSessionId === undefined) delete process.env.SESSION_ID;
+      else process.env.SESSION_ID = priorSessionId;
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps authoritative protocol loss and malformed authoritative state outcome-bearing', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-outcome-bearing-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'authority-outcome-bearing',
+        session_binding: { canonical_session_id: 'outcome-session' },
+      });
+      await mkdir(join(authority.canonical_state_root, 'sessions', 'outcome-session'), { recursive: true });
+      await writeFile(join(authority.canonical_state_root, 'sessions', 'outcome-session', 'ralplan-state.json'), '{malformed');
+      const malformed = await executeStateOperation('state_list_active', { workingDirectory: workspace });
+      assert.equal(malformed.isError, true);
+      assert.ok(typeof malformed.payload === 'object' && malformed.payload !== null);
+      assert.ok('error' in malformed.payload);
+      const malformedError = malformed.payload.error;
+      assert.equal(typeof malformedError, 'string');
+      assert.match(malformedError as string, /malformed JSON/i);
+
+      await rm(authority.anchor_path);
+      const missingAnchor = await executeStateOperation('state_get_status', { workingDirectory: workspace });
+      assert.equal(missingAnchor.isError, true);
+      assert.ok(typeof missingAnchor.payload === 'object' && missingAnchor.payload !== null);
+      assert.ok('error' in missingAnchor.payload);
+      const missingAnchorError = missingAnchor.payload.error;
+      assert.equal(typeof missingAnchorError, 'string');
+      assert.match(missingAnchorError as string, /surviving generation, journal, tombstone, or bootstrap protocol evidence/i);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 
   it('migrates one workspace-bound legacy session and rejects ambiguous legacy evidence', async () => {
     const proven = await mkdtemp(join(tmpdir(), 'omx-authority-legacy-proven-'));
     const ambiguous = await mkdtemp(join(tmpdir(), 'omx-authority-legacy-ambiguous-'));
     try {
-      await mkdir(join(proven, '.omx', 'state'), { recursive: true });
+      await mkdir(join(proven, '.omx', 'state'), { recursive: true, mode: 0o700 });
       await writeFile(join(proven, '.omx', 'state', 'session.json'), JSON.stringify({
         session_id: 'legacy-session',
         cwd: proven,
@@ -432,7 +611,7 @@ describe('state authority foundation', () => {
         canonicalizeExistingAuthorityPath(join(proven, '.omx', 'state')),
       );
 
-      await mkdir(join(ambiguous, '.omx', 'state'), { recursive: true });
+      await mkdir(join(ambiguous, '.omx', 'state'), { recursive: true, mode: 0o700 });
       await writeFile(join(ambiguous, '.omx', 'state', 'session.json'), JSON.stringify({
         session_id: 'legacy-session',
         cwd: join(ambiguous, 'foreign-workspace'),
@@ -588,11 +767,19 @@ describe('state authority foundation', () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-authority-win32-directory-'));
     const outside = await mkdtemp(join(tmpdir(), 'omx-authority-win32-outside-'));
     try {
-      const lexicalSpelling = root.toUpperCase();
-      assert.equal(
-        canonicalizeTrustedAuthorityWindowsDirectoryAliasComponentsSync(lexicalSpelling),
-        canonicalizeExistingAuthorityPath(lexicalSpelling),
-      );
+      const canonicalRoot = realpathSync.native(root);
+      const lexicalSpellings = [...new Set([
+        root.toUpperCase(),
+        root.replaceAll('\\', '/'),
+      ])].filter((candidate) => candidate !== canonicalRoot);
+      assert.ok(lexicalSpellings.length > 0, 'expected at least one distinct Win32 textual alias');
+      for (const lexicalSpelling of lexicalSpellings) {
+        assert.notEqual(lexicalSpelling, canonicalRoot);
+        assert.equal(
+          canonicalizeTrustedAuthorityWindowsDirectoryAliasComponentsSync(lexicalSpelling),
+          canonicalRoot,
+        );
+      }
 
       const junction = join(root, 'junction');
       await symlink(outside, junction, 'junction');
@@ -607,26 +794,36 @@ describe('state authority foundation', () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-authority-darwin-directory-'));
     const outside = await mkdtemp(join(tmpdir(), 'omx-authority-darwin-outside-'));
     try {
-      const canonicalRoot = canonicalizeExistingAuthorityPath(root);
-      const lexicalAlias = canonicalRoot.startsWith('/private/var/')
-        ? canonicalRoot.replace(/^\/private\/var\//, '/var/')
-        : canonicalRoot.startsWith('/private/tmp/')
-          ? canonicalRoot.replace(/^\/private\/tmp\//, '/tmp/')
+      for (const [lexicalAlias, canonicalRoot] of [
+        ['/var', '/private/var'],
+        ['/tmp', '/private/tmp'],
+      ] as const) {
+        assert.equal(realpathSync.native(lexicalAlias), canonicalRoot);
+        assert.notEqual(lexicalAlias, canonicalRoot);
+        assert.equal(
+          canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(lexicalAlias),
+          canonicalRoot,
+        );
+        assert.equal(
+          canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(canonicalRoot),
+          canonicalRoot,
+        );
+      }
+
+      const canonicalTemporaryRoot = realpathSync.native(root);
+      const lexicalTemporaryAlias = canonicalTemporaryRoot.startsWith('/private/var/')
+        ? canonicalTemporaryRoot.replace(/^\/private\/var\//, '/var/')
+        : canonicalTemporaryRoot.startsWith('/private/tmp/')
+          ? canonicalTemporaryRoot.replace(/^\/private\/tmp\//, '/tmp/')
           : '';
       assert.notEqual(
-        lexicalAlias,
+        lexicalTemporaryAlias,
         '',
-        `expected macOS temporary directory under /private/var or /private/tmp: ${canonicalRoot}`,
-      );
-      assert.notEqual(lexicalAlias, canonicalRoot);
-      assert.equal(canonicalizeExistingAuthorityPath(lexicalAlias), canonicalRoot);
-      assert.equal(
-        canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(lexicalAlias),
-        canonicalRoot,
+        `expected macOS temporary directory under /private/var or /private/tmp: ${canonicalTemporaryRoot}`,
       );
       assert.equal(
-        canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(canonicalRoot),
-        canonicalRoot,
+        canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync(lexicalTemporaryAlias),
+        canonicalTemporaryRoot,
       );
 
       const symlinked = join(root, 'symlinked');
@@ -657,7 +854,7 @@ describe('state authority foundation', () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-fingerprint-'));
     try {
       const stateRootPath = join(workspace, 'state-root');
-      await mkdir(stateRootPath);
+      await mkdir(stateRootPath, { mode: 0o700 });
       const stateRoot = canonicalizeExistingAuthorityPath(stateRootPath);
       const workspaceIdentity = resolveWorkspaceIdentity(workspace);
       const rootIdentity = await captureRootFilesystemIdentity(stateRoot);
@@ -680,7 +877,7 @@ describe('state authority foundation', () => {
 
       await rm(stateRoot, { recursive: true, force: true });
       await new Promise((resolve) => setTimeout(resolve, 5));
-      await mkdir(stateRoot);
+      await mkdir(stateRoot, { mode: 0o700 });
       const validation = await validateStateAuthority(generation, {
         workspace_identity: workspaceIdentity,
       });
@@ -857,7 +1054,7 @@ describe('state authority foundation', () => {
         }),
         (error: unknown) => error instanceof Error
           && 'code' in error
-          && error.code === AUTHORITY_DIAGNOSTIC_CODES.resumeEvidenceMissing,
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.journalConflict,
       );
     } finally {
       await rm(workspace, { recursive: true, force: true });
@@ -916,6 +1113,99 @@ describe('state authority foundation', () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a world-writable state root before authority establishment', { skip: process.platform === 'win32' }, async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-world-writable-root-'));
+    try {
+      const stateRoot = join(workspace, '.omx', 'state');
+      await mkdir(stateRoot, { recursive: true });
+      await chmod(stateRoot, 0o777);
+      await assert.rejects(
+        initializeStateAuthority({
+          startup_cwd: workspace,
+          launch_id: 'world-writable-root',
+          session_binding: { canonical_session_id: 'world-writable-root-session' },
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+  it('rejects group-writable state, bootstrap, and authority custody directories', { skip: process.platform === 'win32' }, async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-group-writable-custody-'));
+    try {
+      const stateRoot = join(workspace, '.omx', 'state');
+      await mkdir(stateRoot, { recursive: true });
+      await chmod(stateRoot, 0o770);
+      await assert.rejects(
+        initializeStateAuthority({
+          startup_cwd: workspace,
+          launch_id: 'group-writable-state-root',
+          session_binding: { canonical_session_id: 'group-writable-state-root-session' },
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      );
+
+      await chmod(stateRoot, 0o700);
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'group-writable-directory-custody',
+        session_binding: { canonical_session_id: 'group-writable-directory-custody-session' },
+      });
+      const paths = stateAuthorityPaths(authority.workspace_identity);
+      await chmod(paths.bootstrap_directory, 0o770);
+      let resolution = await resolveStateAuthority({ startup_cwd: workspace });
+      assert.equal(resolution.can_mutate, false);
+      assert.equal(resolution.diagnostics.some((entry) => entry.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak), true);
+
+      await chmod(paths.bootstrap_directory, 0o700);
+      await chmod(join(authority.canonical_state_root, 'authority'), 0o770);
+      resolution = await resolveStateAuthority({ startup_cwd: workspace });
+      assert.equal(resolution.can_mutate, false);
+      assert.equal(resolution.diagnostics.some((entry) => entry.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak), true);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+  it('rejects forged persisted filesystem capability claims before mutation', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-forged-capability-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'forged-capability',
+        session_binding: { canonical_session_id: 'forged-capability-session' },
+      });
+      const generation = JSON.parse(await readFile(authority.authority_path, 'utf8')) as StateAuthorityGeneration;
+      const forgedClaims: Array<[string, Record<string, unknown>]> = [
+        ['schema', { schema_version: 2 }],
+        ['platform', { platform: process.platform === 'win32' ? 'linux' : 'win32' }],
+        ['canonical root', { canonical_path: join(workspace, 'forged-root') }],
+        ['exclusive create status', { exclusive_create: 'forged' }],
+        ['atomic rename status', { atomic_rename: 'forged' }],
+        ['file sync status', { file_sync: 'forged' }],
+        ['directory sync status', { directory_sync: 'forged' }],
+        ['no-follow status', { no_follow_directories: 'forged' }],
+        ['root identity status', { strong_root_identity: 'forged' }],
+        ['path revalidation status', { revalidated_path_mutation: 'forged' }],
+      ];
+      for (const [_claim, forged] of forgedClaims) {
+        await writeFile(authority.authority_path, `${JSON.stringify({
+          ...generation,
+          root_capability: { ...generation.root_capability, ...forged },
+        }, null, 2)}\n`);
+        const resolution = await resolveStateAuthority({ startup_cwd: workspace });
+        assert.equal(resolution.can_mutate, false);
+        assert.equal(resolution.diagnostics.some((entry) => entry.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak), true);
+      }
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 
@@ -1603,9 +1893,12 @@ describe('state authority foundation', () => {
               ? { test_only_after_validation_before_open: replaceRoot }
               : { test_only_before_rename: replaceRoot }),
           }),
-          (error: unknown) => error instanceof Error
-            && 'code' in error
-            && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+          (error: unknown) => {
+            const failures = error instanceof AggregateError ? error.errors : [error];
+            return failures.some((failure) => failure instanceof Error
+              && 'code' in failure
+              && failure.code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch);
+          },
         );
         assert.equal(seamReached, true);
         assert.equal(existsSync(join(outside, 'anchor.json')), false);
@@ -1826,7 +2119,7 @@ describe('state authority foundation', () => {
     }
   });
 
-  it('rejects alternate-root replacement while a prepared intent is restart-pending', async () => {
+  it('aborts an unowned alternate target while preserving the source authority', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-rollover-replaced-'));
     const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-rollover-replaced-run-'));
     try {
@@ -1852,8 +2145,11 @@ describe('state authority foundation', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       await mkdir(alternateStateRoot, { recursive: true });
       const resolution = await resolveStateAuthority({ startup_cwd: workspace });
-      assert.equal(resolution.can_mutate, false);
-      assert.equal(resolution.diagnostics.at(-1)?.code, AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch);
+      assert.equal(resolution.can_mutate, true);
+      assert.equal(resolution.context?.generation.generation_id, initial.generation.generation_id);
+      const anchor = await readWorkspaceAuthorityAnchor(resolveWorkspaceIdentity(workspace));
+      assert.equal(anchor?.pending_operation, undefined);
+      assert.ok(anchor?.alternate_intents.every((intent) => intent.status !== 'prepared' && intent.status !== 'preparing'));
     } finally {
       await rm(workspace, { recursive: true, force: true });
       await rm(runRoot, { recursive: true, force: true });
@@ -1982,6 +2278,32 @@ describe('state authority foundation', () => {
       await assert.rejects(
         () => validateCommittedStateAuthorityLaunchTransportPublication(context, publication),
         /authority tuple changed/i,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+  it('preserves lock-release failure when an authority transaction callback also fails', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-transaction-dual-failure-'));
+    try {
+      const context = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'transaction-dual-failure',
+        session_binding: { canonical_session_id: 'transaction-dual-failure-session' },
+      });
+      await assert.rejects(
+        withStateAuthorityTransaction(context, async (_active, lock) => {
+          await writeFile(lock.path, `${JSON.stringify({
+            ...lock.record,
+            owner_nonce: 'replacement-lock-owner',
+          })}\n`);
+          throw new Error('transaction callback failure');
+        }),
+        (error: unknown) => error instanceof AggregateError
+          && error.errors.some((cause) => cause instanceof Error && cause.message === 'transaction callback failure')
+          && error.errors.some((cause) => cause instanceof Error
+            && 'code' in cause
+            && cause.code === AUTHORITY_DIAGNOSTIC_CODES.lockOwnerMismatch),
       );
     } finally {
       await rm(workspace, { recursive: true, force: true });

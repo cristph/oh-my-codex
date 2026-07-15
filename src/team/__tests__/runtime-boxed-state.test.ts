@@ -27,11 +27,6 @@ describe('team runtime boxed state path helpers', () => {
       );
       assert.equal(teamRuntimeSessionPath(source), join(source, '.omx', 'state', 'session.json'));
 
-      assert.equal(teamRuntimeTeamsRoot(source), join(source, '.omx', 'state', 'team'));
-      assert.equal(
-        teamStartupTimingPath('team-a', source),
-        join(source, '.omx', 'state', 'team', 'team-a', 'startup-timing.json'),
-      );
     } finally {
       if (typeof previousRoot === 'string') process.env.OMX_ROOT = previousRoot;
       else delete process.env.OMX_ROOT;

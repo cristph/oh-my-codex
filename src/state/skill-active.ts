@@ -1,5 +1,5 @@
 import { constants } from 'fs';
-import { lstat, mkdir, open, readdir, unlink } from 'fs/promises';
+import { lstat, mkdir, open, readdir, stat, unlink } from 'fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import { getBaseStateDir, validateSessionId } from '../mcp/state-paths.js';
 import {
@@ -9,6 +9,9 @@ import {
   captureRootFilesystemIdentity,
   fsyncAuthorityDirectory,
   isTrustedAuthorityPlatformRootAlias,
+  sameRootFilesystemIdentity,
+  stateAuthorityFilesystemPrimitiveForPlatform,
+  type RootFilesystemIdentity,
 } from './authority.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import {
@@ -77,6 +80,7 @@ export interface SyncCanonicalSkillStateOptions {
   source?: string;
   allSessions?: boolean;
   allSessionIds?: readonly string[];
+  expectedRootIdentity?: RootFilesystemIdentity;
 
 }
 
@@ -293,6 +297,21 @@ function skillStateError(
   throw new StateAuthorityError(code, message);
 }
 
+async function assertPersistedSkillStateRootIdentity(
+  stateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity | undefined,
+  label: string,
+): Promise<void> {
+  if (!expectedRootIdentity) return;
+  const actualRootIdentity = await captureRootFilesystemIdentity(stateDir);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    skillStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      `${label} does not match the persisted active state-root identity`,
+    );
+  }
+}
+
 function isPathWithinStateRoot(root: string, candidate: string): boolean {
   const relativePath = relative(root, candidate);
   return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
@@ -350,9 +369,16 @@ async function assertSkillStateDirectoryIfPresent(path: string, label: string): 
   }
 }
 
-async function ensureSkillStateDirectory(path: string, label: string): Promise<void> {
+async function ensureSkillStateDirectory(
+  path: string,
+  label: string,
+  stateDir: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
+  await assertPersistedSkillStateRootIdentity(stateDir, expectedRootIdentity, label);
   await assertNoSkillStateSymlinkComponents(path, label);
-  await mkdir(path, { recursive: true });
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await assertPersistedSkillStateRootIdentity(stateDir, expectedRootIdentity, label);
   await assertNoSkillStateSymlinkComponents(path, label);
   await assertSkillStateDirectory(path, label);
 }
@@ -361,10 +387,11 @@ async function assertCanonicalSkillStatePath(
   stateDir: string,
   path: string,
   sessionId?: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<boolean> {
   const root = resolve(stateDir);
   const target = resolve(path);
+  await assertPersistedSkillStateRootIdentity(root, options.expectedRootIdentity, 'canonical skill state root');
   if (!isPathWithinStateRoot(root, target)) {
     skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill state escapes the active authority root: ${target}`);
   }
@@ -377,7 +404,7 @@ async function assertCanonicalSkillStatePath(
   }
 
   if (options.create) {
-    await ensureSkillStateDirectory(root, 'canonical skill state root');
+    await ensureSkillStateDirectory(root, 'canonical skill state root', root, options.expectedRootIdentity);
   } else if (!await assertSkillStateDirectoryIfPresent(root, 'canonical skill state root')) {
     return false;
   }
@@ -388,12 +415,13 @@ async function assertCanonicalSkillStatePath(
   const sessionsDir = join(root, 'sessions');
   const sessionDir = join(sessionsDir, normalizedSessionId);
   if (options.create) {
-    await ensureSkillStateDirectory(sessionsDir, 'canonical skill sessions directory');
-    await ensureSkillStateDirectory(sessionDir, 'canonical skill session directory');
+    await ensureSkillStateDirectory(sessionsDir, 'canonical skill sessions directory', root, options.expectedRootIdentity);
+    await ensureSkillStateDirectory(sessionDir, 'canonical skill session directory', root, options.expectedRootIdentity);
   } else if (!await assertSkillStateDirectoryIfPresent(sessionsDir, 'canonical skill sessions directory')
     || !await assertSkillStateDirectoryIfPresent(sessionDir, 'canonical skill session directory')) {
     return false;
   }
+  await assertPersistedSkillStateRootIdentity(root, options.expectedRootIdentity, 'canonical skill state root');
   await assertNoSkillStateSymlinkComponents(sessionDir, 'canonical skill session directory');
   await assertSkillStateDirectory(sessionsDir, 'canonical skill sessions directory');
   await assertSkillStateDirectory(sessionDir, 'canonical skill session directory');
@@ -463,8 +491,11 @@ async function readCanonicalSkillStateFile(
     await assertCanonicalSkillStatePath(root, target, sessionId);
     try {
       return normalizeSkillActiveState(JSON.parse(content));
-    } catch {
-      return null;
+    } catch (error) {
+      return skillStateError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+        `canonical skill state is malformed: ${target}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   } finally {
     await handle?.close();
@@ -476,11 +507,27 @@ async function writeCanonicalSkillStateFile(
   path: string,
   state: SkillActiveStateLike,
   sessionId?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<void> {
   const root = resolve(stateDir);
   const target = resolve(path);
-  await assertCanonicalSkillStatePath(root, target, sessionId, { create: true });
-  const rootIdentity = await captureRootFilesystemIdentity(root);
+  await assertCanonicalSkillStatePath(root, target, sessionId, { create: true, expectedRootIdentity });
+  let rootIdentity = expectedRootIdentity;
+  if (!rootIdentity) {
+    try {
+      const authorityDirectory = await lstat(join(root, 'authority'));
+      if (authorityDirectory.isDirectory()) {
+        skillStateError(
+          AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+          'canonical skill-state mutation under committed authority requires the persisted root identity',
+        );
+      }
+    } catch (error) {
+      if (error instanceof StateAuthorityError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    rootIdentity = await captureRootFilesystemIdentity(root);
+  }
   await atomicWriteAuthorityFile(target, JSON.stringify(state, null, 2), {
     authority_root: root,
     expected_root_identity: rootIdentity,
@@ -491,53 +538,118 @@ async function unlinkCanonicalSkillStateFile(
   stateDir: string,
   path: string,
   sessionId: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<boolean> {
   const root = resolve(stateDir);
   const target = resolve(path);
-  if (!await assertCanonicalSkillStatePath(root, target, sessionId)) return false;
-  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
-
-  let beforeOpen: Awaited<ReturnType<typeof lstat>>;
-  try {
-    beforeOpen = await lstat(target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw error;
-  }
-  if (beforeOpen.isSymbolicLink()) {
-    skillStateError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `canonical skill state must not be a symbolic link: ${target}`);
-  }
-  if (!beforeOpen.isFile()) {
-    skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill state must be a regular file: ${target}`);
+  if (!await assertCanonicalSkillStatePath(root, target, sessionId, { expectedRootIdentity })) return false;
+  const primitive = stateAuthorityFilesystemPrimitiveForPlatform();
+  if (process.platform === 'linux' && (
+    !primitive.descriptor_relative
+    || primitive.directory_open_flags === null
+    || primitive.file_open_flags === null
+  )) {
+    skillStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'the Linux runtime does not expose descriptor-relative no-follow canonical skill-state deletion',
+    );
   }
 
+  const parent = dirname(target);
+  let parentHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let operationParent = parent;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    handle = await open(target, constants.O_RDONLY | noFollow);
+    if (process.platform === 'linux') {
+      const beforeParentOpen = await lstat(parent);
+      if (beforeParentOpen.isSymbolicLink() || !beforeParentOpen.isDirectory()) {
+        skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill-state parent must be a regular directory: ${parent}`);
+      }
+      parentHandle = await open(parent, primitive.directory_open_flags!);
+      const openedParent = await parentHandle.stat();
+      const afterParentOpen = await lstat(parent);
+      if (
+        afterParentOpen.isSymbolicLink()
+        || !afterParentOpen.isDirectory()
+        || !sameSkillStateIdentity(beforeParentOpen, openedParent)
+        || !sameSkillStateIdentity(openedParent, afterParentOpen)
+      ) {
+        skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill-state parent changed while opening: ${parent}`);
+      }
+      let descriptorPath: string | null = null;
+      for (const candidate of [`/proc/self/fd/${parentHandle.fd}`, `/dev/fd/${parentHandle.fd}`]) {
+        try {
+          const details = await stat(candidate);
+          if (details.isDirectory() && sameSkillStateIdentity(details, openedParent)) {
+            descriptorPath = candidate;
+            break;
+          }
+        } catch {
+          // Try the next Linux descriptor namespace.
+        }
+      }
+      if (!descriptorPath) {
+        skillStateError(
+          AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+          'the Linux runtime cannot address an opened canonical skill-state parent descriptor',
+        );
+      }
+      operationParent = descriptorPath;
+    }
+
+    const operationTarget = join(operationParent, basename(target));
+    let beforeOpen: Awaited<ReturnType<typeof lstat>>;
+    try {
+      beforeOpen = await lstat(operationTarget);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (beforeOpen.isSymbolicLink()) {
+      skillStateError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `canonical skill state must not be a symbolic link: ${target}`);
+    }
+    if (!beforeOpen.isFile()) {
+      skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill state must be a regular file: ${target}`);
+    }
+    try {
+      handle = await open(operationTarget, constants.O_RDONLY | (primitive.file_open_flags ?? 0));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+        skillStateError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `canonical skill state must not be a symbolic link: ${target}`);
+      }
+      throw error;
+    }
     const opened = await handle.stat();
-    const beforeUnlink = await lstat(target);
+    const beforeUnlink = await lstat(operationTarget);
     if (beforeUnlink.isSymbolicLink() || !beforeUnlink.isFile()
       || !sameSkillStateIdentity(beforeOpen, opened)
       || !sameSkillStateIdentity(opened, beforeUnlink)) {
       skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill state was replaced before deletion: ${target}`);
     }
-    await assertCanonicalSkillStatePath(root, target, sessionId);
+    await assertCanonicalSkillStatePath(root, target, sessionId, { expectedRootIdentity });
     if (process.platform === 'win32') {
       await handle.close();
       handle = undefined;
-      const afterClose = await lstat(target);
+      await assertCanonicalSkillStatePath(root, target, sessionId, { expectedRootIdentity });
+      const afterClose = await lstat(operationTarget);
       if (afterClose.isSymbolicLink() || !afterClose.isFile() || !sameSkillStateIdentity(opened, afterClose)) {
         skillStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `canonical skill state was replaced before deletion: ${target}`);
       }
     }
-    await unlink(target);
-    await fsyncAuthorityDirectory(dirname(target));
+    await unlink(operationTarget);
+    if (process.platform === 'linux') {
+      await parentHandle?.sync();
+    } else {
+      await assertCanonicalSkillStatePath(root, target, sessionId, { expectedRootIdentity });
+      await fsyncAuthorityDirectory(parent);
+    }
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw error;
   } finally {
     await handle?.close().catch(() => undefined);
+    await parentHandle?.close().catch(() => undefined);
   }
 }
 
@@ -596,8 +708,16 @@ export async function writeSkillActiveStateCopies(
   state: SkillActiveStateLike,
   sessionId?: string,
   rootState?: SkillActiveStateLike | null,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<void> {
-  await writeSkillActiveStateCopiesForStateDir(getBaseStateDir(cwd), state, sessionId, rootState);
+  const stateDir = expectedRootIdentity?.canonical_path ?? getBaseStateDir(cwd);
+  await writeSkillActiveStateCopiesForStateDir(
+    stateDir,
+    state,
+    sessionId,
+    rootState,
+    expectedRootIdentity,
+  );
 }
 
 export async function writeSkillActiveStateCopiesForStateDir(
@@ -605,6 +725,7 @@ export async function writeSkillActiveStateCopiesForStateDir(
   state: SkillActiveStateLike,
   sessionId?: string,
   rootState?: SkillActiveStateLike | null,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
   const normalized = { version: 1, ...state };
@@ -612,10 +733,10 @@ export async function writeSkillActiveStateCopiesForStateDir(
     ? null
     : { version: 1, ...(rootState ?? normalized) };
   if (normalizedRoot !== null) {
-    await writeCanonicalSkillStateFile(stateDir, rootPath, normalizedRoot);
+    await writeCanonicalSkillStateFile(stateDir, rootPath, normalizedRoot, undefined, expectedRootIdentity);
   }
   if (sessionPath) {
-    await writeCanonicalSkillStateFile(stateDir, sessionPath, normalized, validateSessionId(sessionId));
+    await writeCanonicalSkillStateFile(stateDir, sessionPath, normalized, validateSessionId(sessionId), expectedRootIdentity);
   }
 }
 
@@ -640,7 +761,7 @@ export function tracksCanonicalWorkflowSkill(mode: string): mode is CanonicalWor
 export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkillStateOptions): Promise<void> {
   const {
     cwd,
-    baseStateDir = getBaseStateDir(cwd),
+    baseStateDir: requestedBaseStateDir,
     mode,
     active,
     currentPhase,
@@ -651,7 +772,18 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     source = 'state-server',
     allSessions = false,
     allSessionIds,
+    expectedRootIdentity,
   } = options;
+  const baseStateDir = requestedBaseStateDir ?? expectedRootIdentity?.canonical_path ?? getBaseStateDir(cwd);
+  if (expectedRootIdentity) {
+    const actualRootIdentity = await captureRootFilesystemIdentity(baseStateDir);
+    if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+      skillStateError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+        'canonical skill-state root no longer matches the persisted authority identity',
+      );
+    }
+  }
 
   if (!tracksCanonicalWorkflowSkill(mode)) return;
 
@@ -760,7 +892,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         mode,
         normalizedSessionId,
       );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState, expectedRootIdentity);
     return;
   }
 
@@ -786,7 +918,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : [...sessionScopedRootMirrorEntries, ...nextRootScopedEntries];
 
   const nextRootState = applyEntriesToState(existingRoot, nextRootEntries, mode);
-  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState);
+  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState, expectedRootIdentity);
 
   for (const candidateSessionId of canonicalSessionIds) {
     const sessionPath = join(baseStateDir, 'sessions', candidateSessionId, SKILL_ACTIVE_STATE_FILE);
@@ -798,7 +930,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     const nextSessionEntries = [...nextVisibleRootEntries, ...sessionOnlyEntries];
 
     if (nextSessionEntries.length === 0) {
-      await unlinkCanonicalSkillStateFile(baseStateDir, sessionPath, candidateSessionId);
+      await unlinkCanonicalSkillStateFile(baseStateDir, sessionPath, candidateSessionId, expectedRootIdentity);
       continue;
     }
 
@@ -808,6 +940,6 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       nextSessionEntries[0]?.skill || mode,
       candidateSessionId,
     );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, candidateSessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, candidateSessionId, nextRootState, expectedRootIdentity);
   }
 }

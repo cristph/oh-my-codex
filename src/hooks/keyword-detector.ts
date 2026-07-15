@@ -12,6 +12,14 @@
 
 import { constants as fsConstants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  sameRootFilesystemIdentity,
+  type RootFilesystemIdentity,
+} from '../state/authority.js';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { classifyTaskSize, isHeavyMode, type TaskSizeResult, type TaskSizeThresholds } from './task-size-detector.js';
@@ -49,6 +57,7 @@ import { deriveAutopilotChildPhase, AUTOPILOT_CHILD_PHASES } from '../autopilot/
 import { canAdvanceAutopilotDeepInterviewToRalplan } from '../autopilot/deep-interview-gate.js';
 import { canAdvanceAutopilotRalplanToUltragoal } from '../autopilot/ralplan-gate.js';
 import { validateAutopilotCompletionTransition } from '../autopilot/completion-gate.js';
+import { normalizeSessionId } from './session.js';
 
 export interface KeywordMatch {
   keyword: string;
@@ -111,12 +120,15 @@ export interface RecordSkillActivationInput {
   threadId?: string;
   turnId?: string;
   nowIso?: string;
+  expectedRootIdentity?: RootFilesystemIdentity;
 }
 
 export interface DeepInterviewModeStatePersistenceInput {
   sessionId?: string;
   threadId?: string;
   turnId?: string;
+  expectedRootIdentity?: RootFilesystemIdentity;
+
 }
 
 export const DEEP_INTERVIEW_STATE_FILE = 'deep-interview-state.json';
@@ -444,13 +456,97 @@ function releaseDeepInterviewInputLock(
   };
 }
 
-async function readExistingSkillState(statePath: string): Promise<SkillActiveState | null> {
-  try {
-    const raw = await readFile(statePath, 'utf-8');
-    return JSON.parse(raw) as SkillActiveState;
-  } catch {
-    return null;
+interface JsonStateReadResult {
+  state: Record<string, unknown> | null;
+  status: 'ok' | 'missing' | 'malformed' | 'unreadable';
+}
+
+function keywordStateError(
+  code: typeof AUTHORITY_DIAGNOSTIC_CODES[keyof typeof AUTHORITY_DIAGNOSTIC_CODES],
+  message: string,
+): never {
+  throw new StateAuthorityError(code, message);
+}
+
+async function assertKeywordMutationAuthority(
+  stateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity | undefined,
+): Promise<string> {
+  if (!expectedRootIdentity) {
+    keywordStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      'keyword state mutation requires the persisted state-root identity',
+    );
   }
+  const root = resolve(stateDir);
+  if (root !== resolve(expectedRootIdentity.canonical_path)) {
+    keywordStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      'keyword state directory does not match the persisted state-authority root',
+    );
+  }
+  const actualRootIdentity = await captureRootFilesystemIdentity(root);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    keywordStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'keyword state directory does not match the persisted state-root identity',
+    );
+  }
+  return root;
+}
+
+async function ensureKeywordStateDirectory(
+  root: string,
+  directory: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+): Promise<void> {
+  const target = resolve(directory);
+  const relativePath = relative(root, target);
+  if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    keywordStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `keyword state directory escapes the persisted authority root: ${target}`);
+  }
+  await assertKeywordMutationAuthority(root, expectedRootIdentity);
+  let current = root;
+  const components = relativePath ? relativePath.split(/[\\/]+/) : [];
+  for (const component of components) {
+    current = join(current, component);
+    try {
+      const details = await lstat(current);
+      if (details.isSymbolicLink()) {
+        keywordStateError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `keyword state directory must not be a symbolic link: ${current}`);
+      }
+      if (!details.isDirectory()) {
+        keywordStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `keyword state directory must be a directory: ${current}`);
+      }
+    } catch (error) {
+      if (error instanceof StateAuthorityError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      await mkdir(current);
+      await assertKeywordMutationAuthority(root, expectedRootIdentity);
+      const details = await lstat(current);
+      if (details.isSymbolicLink() || !details.isDirectory()) {
+        keywordStateError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `keyword state directory changed while being created: ${current}`);
+      }
+    }
+  }
+}
+
+async function writeKeywordModeState(
+  stateDir: string,
+  statePath: string,
+  state: Record<string, unknown>,
+  expectedRootIdentity: RootFilesystemIdentity | undefined,
+): Promise<void> {
+  const root = await assertKeywordMutationAuthority(stateDir, expectedRootIdentity);
+  await ensureKeywordStateDirectory(root, dirname(statePath), expectedRootIdentity!);
+  await atomicWriteAuthorityFile(statePath, JSON.stringify(state, null, 2), {
+    authority_root: root,
+    expected_root_identity: expectedRootIdentity,
+  });
+}
+
+async function readExistingSkillState(statePath: string): Promise<JsonStateReadResult> {
+  return readJsonStateWithStatus(statePath);
 }
 
 function buildActiveSkills(state: SkillActiveState): SkillActiveEntry[] | undefined {
@@ -470,32 +566,27 @@ function buildActiveSkills(state: SkillActiveState): SkillActiveEntry[] | undefi
   }];
 }
 
-async function readExistingDeepInterviewState(statePath: string): Promise<DeepInterviewModeState | null> {
-  try {
-    const raw = await readFile(statePath, 'utf-8');
-    return JSON.parse(raw) as DeepInterviewModeState;
-  } catch {
-    return null;
-  }
+async function readExistingDeepInterviewState(statePath: string): Promise<JsonStateReadResult> {
+  return readJsonStateWithStatus(statePath);
 }
 
-async function readJsonStateIfExists(path: string): Promise<Record<string, unknown> | null> {
-  return (await readJsonStateWithStatus(path)).state;
-}
 
-async function readJsonStateWithStatus(path: string): Promise<{
-  state: Record<string, unknown> | null;
-  status: 'ok' | 'missing' | 'malformed';
-}> {
+
+async function readJsonStateWithStatus(path: string): Promise<JsonStateReadResult> {
+  let raw: string;
   try {
-    const raw = await readFile(path, 'utf-8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) return { state: null, status: 'malformed' };
-    return { state: parsed, status: 'ok' };
+    raw = await readFile(path, 'utf-8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { state: null, status: 'missing' };
     }
+    return { state: null, status: 'unreadable' };
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return { state: null, status: 'malformed' };
+    return { state: parsed, status: 'ok' };
+  } catch {
     return { state: null, status: 'malformed' };
   }
 }
@@ -512,8 +603,12 @@ export async function persistDeepInterviewModeState(
     'deep-interview',
     nextSkill?.session_id ?? previousSkill?.session_id ?? input.sessionId,
   ).absolutePath;
-  await mkdir(dirname(statePath), { recursive: true });
-  const previousModeState = await readExistingDeepInterviewState(statePath);
+  const previousModeStateResult = await readExistingDeepInterviewState(statePath);
+  if (previousModeStateResult.status !== 'ok' && previousModeStateResult.status !== 'missing') {
+    throw new Error(`Cannot persist deep-interview mode state because the existing state is ${previousModeStateResult.status}`);
+  }
+  const previousModeState = previousModeStateResult.state as DeepInterviewModeState | null;
+
 
   if (nextSkill?.skill === 'deep-interview' && nextSkill.active) {
     const configStateFields = buildDeepInterviewConfigStateFields(nextSkill.deep_interview_config);
@@ -543,7 +638,9 @@ export async function persistDeepInterviewModeState(
       },
       { nowIso },
     );
-    await writeFile(statePath, JSON.stringify(nextState, null, 2));
+    await writeKeywordModeState(stateDir, statePath, nextState, input.expectedRootIdentity);
+
+
     return;
   }
 
@@ -577,7 +674,9 @@ export async function persistDeepInterviewModeState(
     ...(previousModeState?.downstream_authority ? { downstream_authority: previousModeState.downstream_authority } : {}),
     ...(previousModeState?.bypass_planning_gate_until ? { bypass_planning_gate_until: previousModeState.bypass_planning_gate_until } : {}),
   };
-  await writeFile(statePath, JSON.stringify(nextState, null, 2));
+  await writeKeywordModeState(stateDir, statePath, nextState, input.expectedRootIdentity);
+
+
 }
 
 function resolveSeedStateFilePath(
@@ -589,10 +688,11 @@ function resolveSeedStateFilePath(
   absolutePath: string;
   relativePath: string;
 } {
-  if (scope !== 'root' && sessionId?.trim()) {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (scope !== 'root' && normalizedSessionId) {
     return {
-      absolutePath: join(stateDir, 'sessions', sessionId, `${mode}-state.json`),
-      relativePath: `.omx/state/sessions/${sessionId}/${mode}-state.json`,
+      absolutePath: join(stateDir, 'sessions', normalizedSessionId, `${mode}-state.json`),
+      relativePath: `.omx/state/sessions/${normalizedSessionId}/${mode}-state.json`,
     };
   }
 
@@ -625,10 +725,20 @@ async function persistStatefulSkillSeedState(
   previousSkill: SkillActiveState | null,
   activationText: string,
   sourceCwd: string,
-  options: { activeContinuation?: boolean } = {},
+  options: { activeContinuation?: boolean; expectedRootIdentity?: RootFilesystemIdentity } = {},
+
 ): Promise<SkillActiveState> {
   const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
   if (!config) return nextSkill;
+  await assertKeywordMutationAuthority(stateDir, options.expectedRootIdentity);
+  if (resolve(sourceCwd, '.omx', 'state') !== resolve(stateDir)) {
+    keywordStateError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      'keyword source workspace does not match the persisted state-authority root',
+    );
+  }
+
+
 
   const { absolutePath, relativePath } = resolveSeedStateFilePath(
     stateDir,
@@ -638,6 +748,10 @@ async function persistStatefulSkillSeedState(
   );
   const existingModeStateResult = await readJsonStateWithStatus(absolutePath);
   const existingModeState = existingModeStateResult.state;
+  if (existingModeStateResult.status !== 'ok' && existingModeStateResult.status !== 'missing') {
+    throw new Error(`Cannot persist ${config.mode} mode state because the existing state is ${existingModeStateResult.status}`);
+  }
+
   const sameActiveSkill = previousSkill?.skill === nextSkill.skill && previousSkill.active;
   const existingModeMatches = safeString(existingModeState?.mode).trim() === config.mode;
   const existingPhase = safeString(existingModeState?.current_phase).trim();
@@ -705,8 +819,6 @@ async function persistStatefulSkillSeedState(
     if (options.activeContinuation === true && !preserveExistingModeState) {
       if (existingModeStateResult.status === 'missing') {
         recoveryReason = 'missing-autopilot-mode-state';
-      } else if (existingModeStateResult.status === 'malformed') {
-        recoveryReason = 'malformed-autopilot-mode-state';
       } else if (existingModeMatches && existingPhase === '') {
         recoveryReason = 'nonpreservable-autopilot-mode-state-missing-current-phase';
       }
@@ -780,8 +892,7 @@ async function persistStatefulSkillSeedState(
     };
   }
 
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, JSON.stringify(baseState, null, 2));
+  await writeKeywordModeState(stateDir, absolutePath, baseState, options.expectedRootIdentity);
 
   return {
     ...nextSkill,
@@ -1168,9 +1279,10 @@ async function resolveAutopilotSupervisedChildPhaseState(
   const existing = existingResult.state;
   const existingMode = safeString(existing?.mode).trim();
 
-  if (existingResult.status === 'malformed') {
-    throw new Error('Cannot advance supervised Autopilot child phase: autopilot detail state is malformed');
+  if (existingResult.status !== 'ok' && existingResult.status !== 'missing') {
+    throw new Error(`Cannot advance supervised Autopilot child phase: autopilot detail state is ${existingResult.status}`);
   }
+
   if (existing && existingMode !== 'autopilot') {
     throw new Error(`Cannot advance supervised Autopilot child phase: expected autopilot detail state, found ${existingMode || 'unknown'}`);
   }
@@ -1190,16 +1302,18 @@ async function persistAutopilotSupervisedChildPhaseState(
   sessionId: string | undefined,
   childSkill: string,
   nowIso: string,
-  options: { threadId?: string; turnId?: string } = {},
+  options: { threadId?: string; turnId?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
+
 ): Promise<string> {
   const { absolutePath } = resolveSeedStateFilePath(stateDir, 'autopilot', sessionId);
   const existingResult = await readJsonStateWithStatus(absolutePath);
   const existing = existingResult.state;
   const existingMode = safeString(existing?.mode).trim();
 
-  if (existingResult.status === 'malformed') {
-    throw new Error('Cannot advance supervised Autopilot child phase: autopilot detail state is malformed');
+  if (existingResult.status !== 'ok' && existingResult.status !== 'missing') {
+    throw new Error(`Cannot advance supervised Autopilot child phase: autopilot detail state is ${existingResult.status}`);
   }
+
   if (existing && existingMode !== 'autopilot') {
     throw new Error(`Cannot advance supervised Autopilot child phase: expected autopilot detail state, found ${existingMode || 'unknown'}`);
   }
@@ -1212,22 +1326,26 @@ async function persistAutopilotSupervisedChildPhaseState(
     childSkill,
   );
 
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, JSON.stringify(withModeRuntimeContext(
-    existing ?? {},
-    {
-      ...(existing ?? {}),
-      active: true,
-      mode: 'autopilot',
-      current_phase: effectivePhase,
-      started_at: safeString(existing?.started_at).trim() || nowIso,
-      updated_at: nowIso,
-      session_id: (sessionId ?? safeString(existing?.session_id).trim()) || undefined,
-      thread_id: (options.threadId ?? safeString(existing?.thread_id).trim()) || undefined,
-      turn_id: (options.turnId ?? safeString(existing?.turn_id).trim()) || undefined,
-    },
-    { nowIso },
-  ), null, 2));
+  await writeKeywordModeState(
+    stateDir,
+    absolutePath,
+    withModeRuntimeContext(
+      existing ?? {},
+      {
+        ...(existing ?? {}),
+        active: true,
+        mode: 'autopilot',
+        current_phase: effectivePhase,
+        started_at: safeString(existing?.started_at).trim() || nowIso,
+        updated_at: nowIso,
+        session_id: (sessionId ?? safeString(existing?.session_id).trim()) || undefined,
+        thread_id: (options.threadId ?? safeString(existing?.thread_id).trim()) || undefined,
+        turn_id: (options.turnId ?? safeString(existing?.turn_id).trim()) || undefined,
+      },
+      { nowIso },
+    ),
+    options.expectedRootIdentity,
+  );
 
   return effectivePhase;
 }
@@ -1238,8 +1356,10 @@ async function reconcileAutopilotSupervisedChildModeStates(
   sessionId: string | undefined,
   childSkill: string,
   nowIso: string,
-  options: { threadId?: string; turnId?: string } = {},
+  options: { threadId?: string; turnId?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<{ completedPaths: string[]; effectivePhase: string }> {
+  await assertKeywordMutationAuthority(stateDir, options.expectedRootIdentity);
+
   if (!isTrackedWorkflowMode(childSkill)) {
     const effectivePhase = await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
     return { completedPaths: [], effectivePhase };
@@ -1256,7 +1376,11 @@ async function reconcileAutopilotSupervisedChildModeStates(
       resolveSeedStateFilePath(stateDir, mode as StatefulSkillMode, sessionId).absolutePath,
     ];
     for (const candidatePath of candidatePaths) {
-      const existing = await readJsonStateIfExists(candidatePath);
+      const existingResult = await readJsonStateWithStatus(candidatePath);
+      if (existingResult.status !== 'ok' && existingResult.status !== 'missing') {
+        throw new Error(`Cannot reconcile supervised Autopilot child modes because ${mode} state is ${existingResult.status}`);
+      }
+      const existing = existingResult.state;
       if (!existing || existing.active !== true || safeString(existing.mode).trim() !== mode) continue;
       activeChildModes.push(mode);
       break;
@@ -1270,6 +1394,7 @@ async function reconcileAutopilotSupervisedChildModeStates(
     nowIso,
     sessionId,
     source: 'autopilot-supervised-child',
+    expectedRootIdentity: options.expectedRootIdentity,
   });
   await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
   return { completedPaths: transition.completedPaths, effectivePhase };
@@ -1354,15 +1479,36 @@ function selectRootSkillStateCopy(
   return null;
 }
 
-export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+export async function recordSkillActivation(rawInput: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+  const rawSessionId = safeString(rawInput.sessionId).trim();
+  const sessionId = rawSessionId ? normalizeSessionId(rawSessionId) : undefined;
+  if (rawSessionId && !sessionId) return null;
+  const input: RecordSkillActivationInput = { ...rawInput, sessionId };
+  try {
+    await assertKeywordMutationAuthority(input.stateDir, input.expectedRootIdentity);
+  } catch {
+    return null;
+  }
+
   const sourceCwd = input.sourceCwd ?? dirname(dirname(input.stateDir));
+  if (resolve(sourceCwd, '.omx', 'state') !== resolve(input.stateDir)) return null;
+
   const rootStatePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
   const sessionStatePath = input.sessionId
     ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
     : null;
-  const previousRoot = await readExistingSkillState(rootStatePath);
-  const previousSession = sessionStatePath ? await readExistingSkillState(sessionStatePath) : null;
-  const previous = input.sessionId ? previousSession : previousRoot;
+  const previousRootResult = await readExistingSkillState(rootStatePath);
+  const previousSessionResult = sessionStatePath ? await readExistingSkillState(sessionStatePath) : null;
+  if (
+    (previousRootResult.status !== 'ok' && previousRootResult.status !== 'missing')
+    || (previousSessionResult && previousSessionResult.status !== 'ok' && previousSessionResult.status !== 'missing')
+  ) {
+    return null;
+  }
+  const previousRoot = previousRootResult.state as SkillActiveState | null;
+  const previousSession = previousSessionResult?.state as SkillActiveState | null | undefined;
+  const previous = input.sessionId ? previousSession ?? null : previousRoot;
+
   const teamMode = readTeamModeConfig(sourceCwd);
   const match = resolveContinuationKeywordMatch(
     input.text,
@@ -1399,10 +1545,14 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         state,
         input.sessionId,
         selectRootSkillStateCopy(previousRoot, state, input.sessionId),
+        input.expectedRootIdentity,
       );
+
+
       await persistDeepInterviewModeState(input.stateDir, state, nowIso, previous, input);
     } catch (error) {
       console.warn('[omx] warning: failed to persist keyword activation state', error);
+      return null;
     }
 
     return state;
@@ -1412,14 +1562,19 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   const sameKeyword = previous?.keyword?.toLowerCase() === match.keyword.toLowerCase();
   const sameSkillContinuation = sameSkill && shouldReusePreviousSkillForContinuation(input.text, previous);
   const matchedSeedConfig = STATEFUL_SKILL_SEED_CONFIG[match.skill as StatefulSkillMode];
-  const matchedModeState = matchedSeedConfig
-    ? await readJsonStateIfExists(resolveSeedStateFilePath(
+  const matchedModeStateResult = matchedSeedConfig
+    ? await readJsonStateWithStatus(resolveSeedStateFilePath(
       input.stateDir,
       matchedSeedConfig.mode,
       input.sessionId,
       matchedSeedConfig.scope,
     ).absolutePath)
     : null;
+  if (matchedModeStateResult && matchedModeStateResult.status !== 'ok' && matchedModeStateResult.status !== 'missing') {
+    return null;
+  }
+  const matchedModeState = matchedModeStateResult?.state ?? null;
+
   const matchedModeTerminal = matchedSeedConfig
     ? isResettableTerminalModeState(matchedModeState as Record<string, unknown> | null, matchedSeedConfig.mode)
     : false;
@@ -1477,7 +1632,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         input.sessionId ?? previous.session_id,
         match.skill,
         nowIso,
-        { threadId: input.threadId, turnId: input.turnId },
+        { threadId: input.threadId, turnId: input.turnId, expectedRootIdentity: input.expectedRootIdentity },
       );
       const nextState: SkillActiveState = {
         ...previous,
@@ -1510,21 +1665,14 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         nextState,
         input.sessionId,
         selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+        input.expectedRootIdentity,
       );
+
+
       return nextState;
     } catch (error) {
-      return {
-        ...previous,
-        version: 1,
-        active: true,
-        updated_at: nowIso,
-        source: 'keyword-detector',
-        session_id: input.sessionId ?? previous.session_id,
-        thread_id: input.threadId ?? previous.thread_id,
-        turn_id: input.turnId ?? previous.turn_id,
-        active_skills: listActiveSkills(previous),
-        transition_error: error instanceof Error ? error.message : String(error),
-      };
+      console.warn('[omx] warning: failed to persist keyword activation state', error);
+      return null;
     }
   }
 
@@ -1572,6 +1720,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
               source: 'keyword-detector',
               baseStateDir: input.stateDir,
               currentModes: nextWorkflowEntries.map((entry) => entry.skill),
+              expectedRootIdentity: input.expectedRootIdentity,
             },
           );
         } catch (error) {
@@ -1677,7 +1826,11 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
           previous,
           input.text,
           sourceCwd,
-          { activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation },
+          {
+            activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation,
+            expectedRootIdentity: input.expectedRootIdentity,
+          },
+
         );
         if (requestedEntry.skill === workflowState.skill) {
           nextState = {
@@ -1693,14 +1846,16 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         nextState,
         input.sessionId,
         selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+        input.expectedRootIdentity,
       );
+
+
       await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
       return nextState;
     } catch (error) {
       console.warn('[omx] warning: failed to persist keyword activation state', error);
+      return null;
     }
-
-    return workflowState;
   }
 
   const state: SkillActiveState = {
@@ -1737,7 +1892,11 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       previous,
       input.text,
       sourceCwd,
-      { activeContinuation: match.skill === 'autopilot' && sameSkillContinuation },
+      {
+        activeContinuation: match.skill === 'autopilot' && sameSkillContinuation,
+        expectedRootIdentity: input.expectedRootIdentity,
+      },
+
     );
     nextState.active_skills = buildActiveSkills(nextState);
     await writeSkillActiveStateCopiesForStateDir(
@@ -1745,14 +1904,14 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       nextState,
       input.sessionId,
       selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
+      input.expectedRootIdentity,
     );
     await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
     return nextState;
   } catch (error) {
     console.warn('[omx] warning: failed to persist keyword activation state', error);
+    return null;
   }
-
-  return state;
 }
 
 /**

@@ -1,10 +1,18 @@
 import { createHash } from 'crypto';
 import { existsSync } from 'fs';
-import { mkdir, readFile, readdir, writeFile } from 'fs/promises';
+import { lstat, mkdir, readFile, readdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { comparePlanningArtifactPaths, planningArtifactTimestamp } from '../planning/artifact-names.js';
 import { getStateDir } from '../state/paths.js';
 import { VISUAL_NEXT_ACTIONS_LIMIT, type VisualVerdictStatus } from '../visual/constants.js';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  sameRootFilesystemIdentity,
+  type RootFilesystemIdentity,
+} from '../state/authority.js';
 
 const LEGACY_PRD_PATH = '.omx/prd.json';
 const LEGACY_PROGRESS_PATH = '.omx/progress.txt';
@@ -77,6 +85,51 @@ function stableJson(value: unknown): string {
   return `{${entries.join(',')}}`;
 }
 
+function ralphPersistenceError(
+  code: typeof AUTHORITY_DIAGNOSTIC_CODES[keyof typeof AUTHORITY_DIAGNOSTIC_CODES],
+  message: string,
+): never {
+  throw new StateAuthorityError(code, message);
+}
+
+async function assertPersistedRalphStateRootIdentity(
+  authorityStateRoot: string,
+  expectedRootIdentity: RootFilesystemIdentity | undefined,
+): Promise<void> {
+  if (!expectedRootIdentity) return;
+  const actualRootIdentity = await captureRootFilesystemIdentity(authorityStateRoot);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    ralphPersistenceError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'ralph persistence root does not match the persisted active state-root identity',
+    );
+  }
+}
+
+async function writeCanonicalProgressLedgerFile(
+  canonicalProgressPath: string,
+  content: string,
+  authorityStateRoot?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
+  if (authorityStateRoot) {
+    if (!expectedRootIdentity) {
+      ralphPersistenceError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+        'ralph persistence under an authority state root requires the persisted active state-root identity',
+      );
+    }
+    await assertPersistedRalphStateRootIdentity(authorityStateRoot, expectedRootIdentity);
+    await atomicWriteAuthorityFile(canonicalProgressPath, content, {
+      authority_root: authorityStateRoot,
+      expected_root_identity: expectedRootIdentity,
+    });
+    return;
+  }
+  await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
+  await writeFile(canonicalProgressPath, content);
+}
+
 function stableJsonPretty(value: unknown): string {
   return JSON.stringify(JSON.parse(stableJson(value)), null, 2);
 }
@@ -113,7 +166,11 @@ function splitProgressLines(content: string): string[] {
     .filter((line) => line.length > 0);
 }
 
-async function ensureCanonicalProgressLedgerFile(canonicalProgressPath: string): Promise<void> {
+async function ensureCanonicalProgressLedgerFile(
+  canonicalProgressPath: string,
+  authorityStateRoot?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
   if (existsSync(canonicalProgressPath)) return;
   const now = new Date().toISOString();
   const payload: RalphProgressLedger = {
@@ -123,8 +180,12 @@ async function ensureCanonicalProgressLedgerFile(canonicalProgressPath: string):
     entries: [],
     visual_feedback: [],
   };
-  await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
-  await writeFile(canonicalProgressPath, `${stableJsonPretty(payload)}\n`);
+  await writeCanonicalProgressLedgerFile(
+    canonicalProgressPath,
+    `${stableJsonPretty(payload)}\n`,
+    authorityStateRoot,
+    expectedRootIdentity,
+  );
 }
 
 async function readCanonicalProgressLedger(canonicalProgressPath: string): Promise<RalphProgressLedger> {
@@ -244,6 +305,8 @@ async function migrateLegacyPrdIfNeeded(
 async function migrateLegacyProgressIfNeeded(
   cwd: string,
   canonicalProgressPath: string,
+  authorityStateRoot?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<boolean> {
   if (existsSync(canonicalProgressPath)) return false;
 
@@ -265,8 +328,12 @@ async function migrateLegacyProgressIfNeeded(
     })),
     visual_feedback: [],
   };
-  await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
-  await writeFile(canonicalProgressPath, `${stableJsonPretty(payload)}\n`);
+  await writeCanonicalProgressLedgerFile(
+    canonicalProgressPath,
+    `${stableJsonPretty(payload)}\n`,
+    authorityStateRoot,
+    expectedRootIdentity,
+  );
 
   await writeMigrationMarker(cwd, {
     progress_migration: {
@@ -324,18 +391,41 @@ export async function ensureCanonicalRalphArtifacts(
   cwd: string,
   sessionId?: string,
   authorityStateRoot?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<RalphCanonicalArtifacts> {
   const canonicalStateDir = authorityStateRoot
     ? (sessionId ? join(authorityStateRoot, 'sessions', sessionId) : authorityStateRoot)
     : getStateDir(cwd, sessionId);
   const canonicalProgressPath = join(canonicalStateDir, 'ralph-progress.json');
   await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
-  await mkdir(canonicalStateDir, { recursive: true });
+  if (authorityStateRoot) {
+    if (!expectedRootIdentity) {
+      ralphPersistenceError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+        'ralph artifacts under an authority state root require the persisted active state-root identity',
+      );
+    }
+    await assertPersistedRalphStateRootIdentity(authorityStateRoot, expectedRootIdentity);
+    const stateDirectory = await lstat(canonicalStateDir);
+    if (stateDirectory.isSymbolicLink() || !stateDirectory.isDirectory()) {
+      ralphPersistenceError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `ralph canonical state directory must be a regular directory: ${canonicalStateDir}`,
+      );
+    }
+  } else {
+    await mkdir(canonicalStateDir, { recursive: true });
+  }
 
   const canonicalPrdFiles = await listCanonicalPrdFiles(cwd);
   const migratedPrdResult = await migrateLegacyPrdIfNeeded(cwd, canonicalPrdFiles.at(-1));
-  const migratedProgress = await migrateLegacyProgressIfNeeded(cwd, canonicalProgressPath);
-  await ensureCanonicalProgressLedgerFile(canonicalProgressPath);
+  const migratedProgress = await migrateLegacyProgressIfNeeded(
+    cwd,
+    canonicalProgressPath,
+    authorityStateRoot,
+    expectedRootIdentity,
+  );
+  await ensureCanonicalProgressLedgerFile(canonicalProgressPath, authorityStateRoot, expectedRootIdentity);
 
   return {
     canonicalPrdPath: migratedPrdResult.canonicalPrdPath,

@@ -1,25 +1,52 @@
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import TOML from '@iarna/toml';
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  initializeStateAuthority,
+  publishStateAuthorityLaunchTransport,
+  rolloverStateAuthorityToAlternateRoot,
+  mintStateAuthorityTransportCapability,
+  validateCommittedStateAuthorityLaunchTransportJournal,
+  validateCommittedStateAuthorityLaunchTransportPublication,
+  type ResolvedStateAuthorityContext,
+} from '../../state/authority.js';
+import { discoverProjectRuntimeCodexHomes } from '../project-runtime-codex-homes.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 function runOmx(
   cwd: string,
   argv: string[],
-  envOverrides: Record<string, string> = {},
+  envOverrides: NodeJS.ProcessEnv = {},
 ): { status: number | null; stdout: string; stderr: string; error: string } {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
   const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
+  const inheritedEnv = { ...process.env };
+  delete inheritedEnv.OMX_STARTUP_CWD;
+  delete inheritedEnv.OMX_ROOT;
+  delete inheritedEnv.OMX_STATE_ROOT;
+  delete inheritedEnv.OMX_TEAM_STATE_ROOT;
+  delete inheritedEnv.OMX_STATE_AUTHORITY_PATH;
+  delete inheritedEnv.OMX_STATE_AUTHORITY_ID;
+  delete inheritedEnv.OMX_STATE_AUTHORITY_GENERATION_ID;
+  delete inheritedEnv.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST;
+  delete inheritedEnv.OMX_STATE_AUTHORITY_CAPABILITY;
+  delete inheritedEnv.OMX_SESSION_ID;
   const result = spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: 'utf-8',
     env: {
-      ...process.env,
+      ...inheritedEnv,
       ...envOverrides,
     },
   });
@@ -29,6 +56,129 @@ function runOmx(
     stderr: result.stderr || '',
     error: result.error?.message || '',
   };
+}
+
+
+const TEST_AUTHORITY_ISSUER = {
+  kind: 'first-party-launcher' as const,
+  package_version: 'test',
+  package_digest: '0'.repeat(64),
+};
+
+function authorityTransport(authority: ResolvedStateAuthorityContext): NodeJS.ProcessEnv {
+  const sessionId = authority.session_binding?.canonical_session_id;
+  if (!sessionId) throw new Error('fixture authority must have a canonical session binding');
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
+
+function launchTransportEffectsDigest(
+  authority: Pick<ResolvedStateAuthorityContext, 'generation' | 'session_binding' | 'workspace_identity'>,
+  bindingKey: string,
+  effects: Record<string, string>,
+): string {
+  const ordered = Object.fromEntries(Object.entries({
+    authority_id: authority.generation.authority_id,
+    binding_id: authority.session_binding?.binding_id ?? '',
+    binding_key: bindingKey,
+    binding_revision: String(authority.session_binding?.binding_revision ?? -1),
+    generation_id: authority.generation.generation_id,
+    workspace_identity_digest: authority.workspace_identity.digest,
+    ...effects,
+  }).sort(([left], [right]) => left.localeCompare(right)));
+  return createHash('sha256').update(JSON.stringify(ordered)).digest('hex');
+}
+
+function canonicalizeLaunchCwd(cwd: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || cwd;
+  } catch {
+    return cwd;
+  }
+}
+
+function madmaxMetadataContentDigest(runDir: string, sourceCwd: string, argv: string[]): string {
+  return createHash('sha256').update(JSON.stringify({
+    run_dir: runDir,
+    source_cwd: sourceCwd,
+    argv,
+    detached_launch_context: createHash('sha256').update(JSON.stringify({
+      source_cwd: canonicalizeLaunchCwd(sourceCwd),
+      argv,
+      run_identity: runDir,
+    })).digest('hex').slice(0, 32),
+  })).digest('hex');
+}
+
+async function writeCommittedMadmaxPublication(
+  cwd: string,
+  runDir: string,
+  argv: string[] = ['--madmax'],
+): Promise<ResolvedStateAuthorityContext> {
+  await mkdir(runDir, { recursive: true });
+  const initial = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: 'resume-madmax-source',
+    session_binding: { canonical_session_id: 'resume-madmax' },
+  });
+  const authority = await rolloverStateAuthorityToAlternateRoot({
+    context: initial,
+    proposed_state_root: join(runDir, '.omx', 'state'),
+    creation_root: runDir,
+    launch_id: 'resume-madmax-run',
+    consumer_kind: 'madmax',
+    issuer: TEST_AUTHORITY_ISSUER,
+  });
+  const bindingKey = `madmax-root-${createHash('sha256').update(runDir).digest('hex').slice(0, 32)}`;
+  const effects = {
+    effect: 'madmax-metadata-registry',
+    run_dir_digest: createHash('sha256').update(runDir).digest('hex'),
+    source_cwd_digest: createHash('sha256').update(cwd).digest('hex'),
+    metadata_content_digest: madmaxMetadataContentDigest(runDir, cwd, argv),
+  };
+  const effectsDigest = launchTransportEffectsDigest(authority, bindingKey, effects);
+  await mintStateAuthorityTransportCapability(authority);
+  const publication = await publishStateAuthorityLaunchTransport({
+    context: authority,
+    binding_key: bindingKey,
+    effects,
+    publish: async (_context, record) => {
+      await writeFile(join(runDir, '.omxbox-run.json'), `${JSON.stringify({
+        launcher: 'omx --madmax',
+        cwd: runDir,
+        source_cwd: cwd,
+        run_dir: runDir,
+        argv,
+        transport_status: 'committed',
+        authority_protocol_version: record.authority_protocol_version,
+        authority_operation_id: record.operation_id,
+        authority_id: record.authority_id,
+        authority_generation_id: record.generation_id,
+        authority_binding_id: record.binding_id,
+        authority_binding_revision: record.binding_revision,
+        authority_workspace_digest: record.workspace_identity_digest,
+        authority_anchor_revision: record.anchor_revision,
+        authority_fencing_token: record.fencing_token,
+        authority_state_root: join(runDir, '.omx', 'state'),
+        authority_root_identity: record.root_identity,
+        authority_effects_digest: effectsDigest,
+      })}\n`);
+      return record;
+    },
+    verify: async (context, record) => {
+      await validateCommittedStateAuthorityLaunchTransportPublication(context, record);
+    },
+  });
+  await validateCommittedStateAuthorityLaunchTransportPublication(authority, publication);
+  await validateCommittedStateAuthorityLaunchTransportJournal(authority, {
+    operation_id: publication.operation_id,
+    effects_digest: effectsDigest,
+  });
+  return authority;
 }
 
 describe('omx resume', () => {
@@ -417,6 +567,13 @@ printf '{"type":"session_meta","payload":{"id":"new-project-resume"}}\n' > "$COD
       await writeFile(unrelatedRolloutPath, '{"type":"session_meta","payload":{"id":"unrelated-session"}}\n');
       await writeFile(join(runsRoot, 'registry.jsonl'), `${JSON.stringify({ source_cwd: wd, run_dir: join(runsRoot, 'run-associated') })}\n${JSON.stringify({ source_cwd: unrelatedSource, run_dir: join(runsRoot, 'run-unrelated') })}\n`);
       await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+      const authority = await initializeStateAuthority({
+        startup_cwd: wd,
+        observed_cwd: wd,
+        launch_id: 'resume-bare-madmax',
+        session_binding: { canonical_session_id: 'resume-bare-madmax' },
+      });
+      await mintStateAuthorityTransportCapability(authority);
       await writeFile(fakeCodexPath, `#!/bin/sh
 printf 'fake-codex:%s\n' "$*"
 if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-madmax-session.jsonl" ]; then echo madmax-rollout-present=yes; else echo madmax-rollout-present=no; fi
@@ -427,6 +584,7 @@ if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-unrelated-session.jsonl" ]; the
       await chmod(fakePsPath, 0o755);
 
       const result = runOmx(wd, ['resume'], {
+        ...authorityTransport(authority),
         HOME: home,
         OMX_RUNS_DIR: runsRoot,
         PATH: `${fakeBin}:/usr/bin:/bin`,
@@ -440,6 +598,109 @@ if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-unrelated-session.jsonl" ]; the
       assert.match(result.stdout, /madmax-rollout-present=no/);
       assert.match(result.stdout, /unrelated-rollout-present=no/);
     } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('includes a committed madmax runtime publication when OMX_RUNS_DIR is foreign', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-resume-madmax-committed-'));
+    try {
+      const home = join(wd, 'home');
+      const runsRoot = join(wd, 'runs');
+      const foreignRunsRoot = join(wd, 'foreign-runs');
+      const projectCodexHome = join(wd, '.codex');
+      const associatedRun = join(runsRoot, 'run-associated');
+      const unrelatedRun = join(runsRoot, 'run-unrelated');
+      const madmaxCodexHome = join(associatedRun, '.omx', 'runtime', 'codex-home', 'omx-madmax-runtime');
+      const unrelatedCodexHome = join(unrelatedRun, '.omx', 'runtime', 'codex-home', 'omx-unrelated-runtime');
+      const unrelatedSource = join(wd, 'unrelated-source');
+      const fakeBin = join(wd, 'bin');
+      const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
+      const associatedRolloutPath = join(madmaxCodexHome, 'sessions', '2026', '06', '17', 'rollout-madmax-session.jsonl');
+      const unrelatedRolloutPath = join(unrelatedCodexHome, 'sessions', '2026', '06', '17', 'rollout-unrelated-session.jsonl');
+
+      await Promise.all([
+        mkdir(home, { recursive: true }),
+        mkdir(fakeBin, { recursive: true }),
+        mkdir(projectCodexHome, { recursive: true }),
+        mkdir(dirname(associatedRolloutPath), { recursive: true }),
+        mkdir(dirname(unrelatedRolloutPath), { recursive: true }),
+        mkdir(unrelatedSource, { recursive: true }),
+        mkdir(foreignRunsRoot, { recursive: true }),
+      ]);
+      await writeFile(associatedRolloutPath, '{"type":"session_meta","payload":{"id":"madmax-session"}}\n');
+      await writeFile(unrelatedRolloutPath, '{"type":"session_meta","payload":{"id":"unrelated-session"}}\n');
+      const authority = await writeCommittedMadmaxPublication(wd, associatedRun);
+      await writeFile(join(unrelatedRun, '.omxbox-run.json'), JSON.stringify({
+        source_cwd: unrelatedSource,
+        run_dir: unrelatedRun,
+      }));
+      await writeFile(
+        join(runsRoot, 'registry.jsonl'),
+        `${JSON.stringify({ source_cwd: wd, run_dir: associatedRun })}\n${JSON.stringify({ source_cwd: unrelatedSource, run_dir: unrelatedRun })}\n`,
+      );
+      await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+      await writeFile(fakeCodexPath, `#!/bin/sh
+printf 'fake-codex:%s\n' "$*"
+if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-madmax-session.jsonl" ]; then echo madmax-rollout-present=yes; else echo madmax-rollout-present=no; fi
+if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-unrelated-session.jsonl" ]; then echo unrelated-rollout-present=yes; else echo unrelated-rollout-present=no; fi
+`);
+      await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
+
+      const result = runOmx(wd, ['resume'], {
+        ...authorityTransport(authority),
+        HOME: home,
+        OMX_RUNS_DIR: foreignRunsRoot,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+      });
+
+      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      assert.match(result.stdout, /fake-codex:resume\b/);
+      assert.match(result.stdout, /madmax-rollout-present=yes/);
+      assert.match(result.stdout, /unrelated-rollout-present=no/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails resume closed for forged current-workspace madmax publication evidence', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-resume-madmax-forged-'));
+    const previousRunsDir = process.env.OMX_RUNS_DIR;
+    try {
+      const runsRoot = join(wd, '.omxbox-runs');
+      const foreignRunsRoot = join(wd, 'foreign-runs');
+      const runDir = join(runsRoot, 'run-forged');
+      const authority = await writeCommittedMadmaxPublication(wd, runDir);
+      await mkdir(foreignRunsRoot, { recursive: true });
+      await writeFile(join(runsRoot, 'registry.jsonl'), `${JSON.stringify({ source_cwd: authority.workspace_identity.canonical_path, run_dir: runDir })}\n`);
+      await writeFile(join(runDir, '.omxbox-run.json'), JSON.stringify({
+        cwd: runDir,
+        source_cwd: authority.workspace_identity.canonical_path,
+        run_dir: runDir,
+        argv: ['--madmax'],
+        transport_status: 'committed',
+        authority_protocol_version: 1,
+        authority_operation_id: 'forged-launch-transport-operation',
+      }));
+
+      process.env.OMX_RUNS_DIR = foreignRunsRoot;
+      await assert.rejects(
+        () => discoverProjectRuntimeCodexHomes(wd),
+        (error: unknown) => error instanceof StateAuthorityError
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.journalMalformed,
+      );
+      const result = runOmx(wd, ['resume'], { ...authorityTransport(authority), OMX_RUNS_DIR: foreignRunsRoot });
+      assert.equal(result.status, 1, result.error || result.stderr || result.stdout);
+      assert.match(result.stderr, /current workspace madmax metadata has an incomplete or malformed committed authority publication/);
+    } finally {
+      if (typeof previousRunsDir === 'string') process.env.OMX_RUNS_DIR = previousRunsDir;
+      else delete process.env.OMX_RUNS_DIR;
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -485,7 +746,6 @@ if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-unrelated-session.jsonl" ]; the
       }, null, 2));
       await writeFile(join(oldCacheDir, 'hooks', 'hooks.json'), '{}\n');
       await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
-      await writeFile(join(runsRoot, 'registry.jsonl'), `${JSON.stringify({ source_cwd: wd, run_dir: join(runsRoot, 'run-associated') })}\n`);
       await rm(oldCacheDir, { recursive: true, force: true });
 
       await writeFile(fakeCodexPath, `#!/bin/sh

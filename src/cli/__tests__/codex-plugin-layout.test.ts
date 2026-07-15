@@ -439,18 +439,7 @@ async function assertPluginCacheLaunchable(entrypoint: string): Promise<void> {
       },
         },
       );
-    let result = launch();
-    for (
-      let attempt = 1;
-      attempt < 5 &&
-      result.status === null &&
-      result.signal === 'SIGTERM' &&
-      result.stdout === '' &&
-      result.stderr === '';
-      attempt += 1
-    ) {
-      result = launch();
-    }
+    const result = launch();
 
     assert.equal(
       result.status,

@@ -12,6 +12,7 @@ import {
 } from '../state/authority.js';
 import {
   isSessionStateUsable,
+  readCommittedSessionState,
   readUsableSessionState,
   resolveAuthenticatedStateAuthorityStartupCwd,
   resolveAuthenticatedTransportAuthority,
@@ -43,7 +44,7 @@ function observedAmbientRootSources(): StateRootSource[] {
   if (process.env[OMX_STATE_ROOT_ENV]?.trim()) sources.push('omx-state-root-env');
   return sources;
 }
-export type SessionScopeSource = 'explicit' | 'env' | 'session-json' | 'native-alias' | 'root';
+export type SessionScopeSource = 'explicit' | 'env' | 'session-json' | 'native-alias' | 'authority-binding' | 'root';
 
 export interface ResolvedSessionMetadata {
   sessionId: string;
@@ -444,61 +445,105 @@ function isKnownSessionAlias(sessionId: string, metadata: ResolvedSessionMetadat
     || metadata.ownerCodexSessionId === sessionId;
 }
 
+function authoritativeSessionMetadata(
+  authority: ResolvedStateAuthorityContext,
+  state: SessionState | null,
+): ResolvedSessionMetadata {
+  const binding = authority.session_binding;
+  if (!binding) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      'committed authority has no active session binding',
+    );
+  }
+  const nativeSessionAliases = [...new Set([
+    binding.aliases.native_session_id,
+    ...binding.aliases.current_session_aliases,
+    ...binding.aliases.previous_session_aliases,
+  ].filter((value): value is string => typeof value === 'string' && value.trim() !== ''))];
+  return {
+    sessionId: binding.canonical_session_id,
+    ...(binding.aliases.native_session_id ? { nativeSessionId: binding.aliases.native_session_id } : {}),
+    nativeSessionAliases,
+    ...(binding.aliases.owner_session_aliases[0] ? { ownerOmxSessionId: binding.aliases.owner_session_aliases[0] } : {}),
+    raw: state ?? undefined,
+    sourcePath: join(authority.canonical_state_root, 'session.json'),
+  };
+}
+
+function authorityAmbientSessionIds(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [env[OMX_SESSION_ID_ENV], env.CODEX_SESSION_ID]
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+    .map((value) => {
+      const sessionId = normalizeSessionId(value);
+      if (!sessionId) {
+        throw new StateAuthorityError(
+          AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+          'authenticated authority session aliases must match ^[A-Za-z0-9_-]{1,64}$',
+        );
+      }
+      return sessionId;
+    });
+}
+
+function buildAuthorityRuntimeStateScope(
+  cwd: string,
+  authority: ResolvedStateAuthorityContext,
+  state: SessionState | null,
+  explicitSessionId?: string,
+): ResolvedRuntimeStateScope {
+  const metadata = authoritativeSessionMetadata(authority, state);
+  const validatedExplicit = validateSessionId(explicitSessionId);
+  let sessionId = metadata.sessionId;
+  let source: SessionScopeSource = 'authority-binding';
+  if (validatedExplicit) {
+    sessionId = resolveCanonicalSessionId(validatedExplicit, metadata) ?? validatedExplicit;
+    source = sessionId === metadata.sessionId && validatedExplicit !== metadata.sessionId
+      ? 'native-alias'
+      : 'explicit';
+  } else {
+    for (const ambientSessionId of authorityAmbientSessionIds()) {
+      if (ambientSessionId !== metadata.sessionId && !isKnownSessionAlias(ambientSessionId, metadata)) {
+        throw new StateAuthorityError(
+          AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+          'ambient session identity is not authenticated by the committed authority binding',
+        );
+      }
+      if (ambientSessionId !== metadata.sessionId) source = 'native-alias';
+    }
+  }
+  const stateDir = join(authority.canonical_state_root, 'sessions', sessionId);
+  return {
+    cwd,
+    baseStateDir: authority.canonical_state_root,
+    stateDir,
+    rootSource: 'authority',
+    sessionId,
+    source,
+    metadata,
+    isSessionScoped: true,
+    authoritativeActiveDirs: [stateDir],
+    compatibilityReadDirs: source === 'explicit' ? [stateDir] : [stateDir, authority.canonical_state_root],
+  };
+}
+
 
 /**
  * Writable scope precedence:
  * - explicit session_id preserves explicit fork writes;
- * - a usable session.json supplies the only implicit session scope;
- * - OMX_SESSION_ID may bind a known alias only when the live tmux pane proves
- *   the canonical session tag;
- * - root writes are allowed only when session.json is absent.
+ * - implicit scope is the committed authority binding's canonical session;
+ * - OMX_SESSION_ID/CODEX_SESSION_ID may name only authenticated aliases;
+ * - generic SESSION_ID and session.json never select authoritative writes.
  */
 export async function resolveWritableStateScope(
   workingDirectory?: string,
   explicitSessionId?: string,
 ): Promise<ResolvedStateScope> {
-  const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const baseStateDir = getBaseStateDir(cwd);
-  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir, false, true);
-  const validatedExplicit = validateSessionId(explicitSessionId);
-  if (validatedExplicit) {
-    const sessionId = resolveCanonicalSessionId(validatedExplicit, metadata) ?? validatedExplicit;
-    return {
-      source: 'explicit',
-      sessionId,
-      stateDir: join(baseStateDir, 'sessions', sessionId),
-    };
-  }
-
-  if (!metadata) {
-    if (existsSync(join(baseStateDir, 'session.json'))) {
-      throw new Error(WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
-    }
-    if (normalizeSessionId(process.env[OMX_SESSION_ID_ENV])) {
-      throw new Error(WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment);
-    }
-    return {
-      source: 'root',
-      stateDir: baseStateDir,
-    };
-  }
-
-  const envSessionId = normalizeSessionId(process.env[OMX_SESSION_ID_ENV]);
-  if (!envSessionId || envSessionId === metadata.sessionId) {
-    return {
-      source: 'session',
-      sessionId: metadata.sessionId,
-      stateDir: join(baseStateDir, 'sessions', metadata.sessionId),
-    };
-  }
-
-  if (!isKnownSessionAlias(envSessionId, metadata)) {
-    throw new Error(WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment);
-  }
+  const authorityScope = await resolveAuthorityRuntimeStateScope(workingDirectory, explicitSessionId);
   return {
-    source: 'session',
-    sessionId: metadata.sessionId,
-    stateDir: join(baseStateDir, 'sessions', metadata.sessionId),
+    source: authorityScope.source === 'explicit' ? 'explicit' : 'session',
+    sessionId: authorityScope.sessionId,
+    stateDir: authorityScope.stateDir,
   };
 }
 
@@ -533,13 +578,13 @@ export async function resolveStateScope(
     stateDir: getStateDir(workingDirectory),
   };
 }
-export async function resolveRuntimeStateScope(
-  workingDirectory?: string,
+function buildRuntimeStateScope(
+  cwd: string,
+  baseStateDir: string,
+  rootSource: StateRootSource,
+  metadata: ResolvedSessionMetadata | undefined,
   explicitSessionId?: string,
-): Promise<ResolvedRuntimeStateScope> {
-  const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
-  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
+): ResolvedRuntimeStateScope {
   const validatedExplicit = validateSessionId(explicitSessionId);
   const envSessionId = readSessionIdFromEnvironment();
   let sessionId: string | undefined;
@@ -574,6 +619,16 @@ export async function resolveRuntimeStateScope(
   };
 }
 
+export async function resolveRuntimeStateScope(
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<ResolvedRuntimeStateScope> {
+  const cwd = resolveWorkingDirectoryForState(workingDirectory);
+  const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
+  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
+  return buildRuntimeStateScope(cwd, baseStateDir, rootSource, metadata, explicitSessionId);
+}
+
 /**
  * Resolves active runtime state through the committed workspace authority.
  * Ambient root variables remain observable diagnostics only; they never select
@@ -588,48 +643,23 @@ export async function resolveAuthorityRuntimeStateScope(
   explicitSessionId?: string,
 ): Promise<ResolvedAuthorityRuntimeStateScope> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const transportedAuthority = await resolveAuthenticatedTransportAuthority(cwd);
+  const transportEnv = explicitSessionId
+    ? { ...process.env, OMX_SESSION_ID: undefined, CODEX_SESSION_ID: undefined }
+    : process.env;
+  const transportedAuthority = await resolveAuthenticatedTransportAuthority(cwd, transportEnv);
   const authority = transportedAuthority ?? await resolveStateAuthorityForGuard({
     startup_cwd: await resolveAuthorityStartupCwd(cwd),
     observed_cwd: cwd,
   });
-  const baseStateDir = authority.canonical_state_root;
-  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir, true);
-  const validatedExplicit = validateSessionId(explicitSessionId);
-  const envSessionId = readSessionIdFromEnvironment();
-  let sessionId: string | undefined;
-  let source: SessionScopeSource = 'root';
-
-  if (validatedExplicit) {
-    const canonicalSessionId = resolveCanonicalSessionId(validatedExplicit, metadata);
-    sessionId = canonicalSessionId ?? validatedExplicit;
-    source = metadata && canonicalSessionId === metadata.sessionId && validatedExplicit !== metadata.sessionId
-      ? 'native-alias'
-      : 'explicit';
-  } else if (envSessionId) {
-    const canonicalSessionId = resolveCanonicalSessionId(envSessionId, metadata);
-    sessionId = canonicalSessionId ?? envSessionId;
-    source = metadata && canonicalSessionId === metadata.sessionId && envSessionId !== metadata.sessionId
-      ? 'native-alias'
-      : 'env';
-  } else if (metadata?.sessionId) {
-    sessionId = metadata.sessionId;
-    source = 'session-json';
+  const sessionState = await readCommittedSessionState(authority);
+  if (sessionState && !sessionStateMatchesWorkingDirectory(sessionState, cwd)) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      'committed authority session metadata belongs to a different workspace and requires explicit restart or rebind',
+    );
   }
-
-  const stateDir = sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir;
-  const isSessionScoped = Boolean(sessionId);
   return {
-    cwd,
-    baseStateDir,
-    stateDir,
-    rootSource: 'authority',
-    ...(sessionId ? { sessionId } : {}),
-    source,
-    ...(metadata && (!sessionId || metadata.sessionId === sessionId) ? { metadata } : {}),
-    isSessionScoped,
-    authoritativeActiveDirs: [stateDir],
-    compatibilityReadDirs: isSessionScoped && source !== 'explicit' ? [stateDir, baseStateDir] : [stateDir],
+    ...buildAuthorityRuntimeStateScope(cwd, authority, sessionState, explicitSessionId),
     authority,
     observedRootSources: observedAmbientRootSources(),
   };

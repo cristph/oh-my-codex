@@ -1,9 +1,17 @@
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { constants, existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+const ORIGINAL_TEST_UMASK = process.umask(0o077);
+after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+function errorHasAuthorityCode(error: unknown, code: string): boolean {
+  if ((error as { code?: string } | null)?.code === code) return true;
+  return error instanceof AggregateError && error.errors.some((entry) => errorHasAuthorityCode(entry, code));
+}
 import {
   appendToLog,
   resetSessionMetrics,
@@ -25,6 +33,7 @@ import {
   initializeStateAuthority,
   mintStateAuthorityTransportCapability,
 } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 interface SessionHistoryEntry {
   session_id: string;
@@ -219,7 +228,7 @@ describe('session lifecycle manager', () => {
 
         await assert.rejects(
           publication.publish(cwd),
-          (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+          (error: unknown) => errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch),
         );
         assert.equal(existsSync(join(omxRoot, ...publication.replacementTarget)), false);
       } finally {
@@ -284,7 +293,7 @@ describe('session lifecycle manager', () => {
 
       await assert.rejects(
         writeSessionEnd(cwd, 'sess-delete-replacement'),
-        (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+        (error: unknown) => errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch),
       );
       assert.equal(await readFile(attackerPath, 'utf-8'), 'attacker delete target must survive');
       assert.equal(existsSync(movedSessionPath), true);
@@ -312,7 +321,7 @@ describe('session lifecycle manager', () => {
     }
   });
 
-  it('preserves an inherited bearer across a proven session alias revision', async () => {
+  it('revokes an inherited bearer and remints process transport across a proven session alias revision', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-transport-rotation-'));
     const keys = [
       'OMX_STATE_AUTHORITY_PATH',
@@ -320,6 +329,10 @@ describe('session lifecycle manager', () => {
       'OMX_STATE_AUTHORITY_GENERATION_ID',
       'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
       'OMX_STATE_AUTHORITY_CAPABILITY',
+      'OMX_STARTUP_CWD',
+      'OMX_ROOT',
+      'OMX_STATE_ROOT',
+      'OMX_TEAM_STATE_ROOT',
     ] as const;
     const previous = new Map(keys.map((key) => [key, process.env[key]]));
     try {
@@ -329,20 +342,16 @@ describe('session lifecycle manager', () => {
         session_binding: { canonical_session_id: 'session-transport' },
       });
       const minted = await mintStateAuthorityTransportCapability(authority);
-      const inherited = {
-        OMX_STATE_AUTHORITY_PATH: authority.authority_path,
-        OMX_STATE_AUTHORITY_ID: authority.generation.authority_id,
-        OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
-        OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: authority.workspace_identity.digest,
-        OMX_STATE_AUTHORITY_CAPABILITY: minted.capability,
-      };
+      const inherited = buildStateAuthorityTransportEnv(authority, {});
       Object.assign(process.env, inherited);
 
       await writeSessionStart(cwd, 'session-transport', { nativeSessionId: 'codex-transport' });
-      const preservedCapability = process.env.OMX_STATE_AUTHORITY_CAPABILITY;
-      assert.equal(preservedCapability, minted.capability);
-      const inheritedResolved = await resolveAuthenticatedTransportAuthority(cwd, inherited);
-      assert.equal(inheritedResolved?.session_binding?.aliases.native_session_id, 'codex-transport');
+      const remintedCapability = process.env.OMX_STATE_AUTHORITY_CAPABILITY;
+      assert.notEqual(remintedCapability, minted.capability);
+      await assert.rejects(
+        resolveAuthenticatedTransportAuthority(cwd, inherited),
+        (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+      );
       const resolved = await resolveAuthenticatedTransportAuthority(cwd, process.env);
       assert.equal(resolved?.session_binding?.aliases.native_session_id, 'codex-transport');
     } finally {
@@ -435,6 +444,43 @@ describe('session lifecycle manager', () => {
       assert.equal(historyEntry.session_id, 'sess-ending');
       assert.equal(historyEntry.started_at, 'unknown');
       assert.equal(historyEntry.preserved_active_session_id, 'sess-current');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects caller and persisted traversal session IDs before lifecycle cleanup can compose deletion paths', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-traversal-id-'));
+    const outsideHudPath = join(cwd, 'outside', 'hud-state.json');
+    try {
+      await writeSessionStart(cwd, 'sess-current');
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionStatePath = join(stateDir, 'session.json');
+      await mkdir(join(cwd, 'outside'), { recursive: true });
+      await writeFile(outsideHudPath, 'outside HUD must survive', 'utf-8');
+
+      for (const operation of [
+        () => writeSessionStart(cwd, '../../../outside'),
+        () => resetSessionMetrics(cwd, '../../../outside'),
+        () => reconcileNativeSessionStart(cwd, '../../../outside'),
+        () => writeSessionEnd(cwd, '../../../outside'),
+      ]) {
+        await assert.rejects(operation(), /must match \^\[A-Za-z0-9_-\]\{1,64\}\$/);
+      }
+      assert.equal(await readFile(outsideHudPath, 'utf-8'), 'outside HUD must survive');
+      assert.equal(existsSync(sessionStatePath), true);
+
+      const persisted = JSON.parse(await readFile(sessionStatePath, 'utf-8')) as SessionState;
+      await writeFile(sessionStatePath, JSON.stringify({
+        ...persisted,
+        native_session_id: '../../../outside',
+      }));
+      await assert.rejects(
+        writeSessionEnd(cwd, 'sess-current'),
+        (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      );
+      assert.equal(await readFile(outsideHudPath, 'utf-8'), 'outside HUD must survive');
+      assert.equal(existsSync(sessionStatePath), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -688,54 +734,54 @@ describe('session lifecycle manager', () => {
     }
   });
 
-  it('falls back to a fresh canonical session when reconciling without authoritative launch state', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-fallback-'));
+  it('fails closed when reconciling session artifacts without committed authority', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-uncommitted-'));
     try {
       const statePath = join(cwd, '.omx', 'state', 'session.json');
-      await resetSessionMetrics(cwd);
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeFile(statePath, JSON.stringify({
-        session_id: 'sess-other-worktree',
-        cwd: join(cwd, '..', 'different-worktree'),
+        session_id: 'sess-uncommitted',
+        cwd,
       }), 'utf-8');
 
-      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-fallback-1', {
-        pid: 67890,
-        platform: 'win32',
-      });
-
-      assert.equal(reconciled.session_id, 'codex-fallback-1');
-      assert.equal(reconciled.native_session_id, 'codex-fallback-1');
-      assert.equal(reconciled.pid, 67890);
+      await assert.rejects(
+        reconcileNativeSessionStart(cwd, 'codex-fallback-1', {
+          pid: 67890,
+          platform: 'win32',
+        }),
+        /no committed active authority exists for this pristine workspace/,
+      );
+      assert.equal(existsSync(statePath), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('treats invalid session JSON as absent state', async () => {
+  it('preserves malformed session JSON and requires explicit recovery', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-invalid-'));
     try {
       const statePath = join(cwd, '.omx', 'state', 'session.json');
       await resetSessionMetrics(cwd);
       await writeFile(statePath, '{ not-json', 'utf-8');
-      const state = await readSessionState(cwd);
-      assert.equal(state, null);
+      await assert.rejects(readSessionState(cwd), /malformed and requires explicit recovery/);
+      assert.equal(await readFile(statePath, 'utf-8'), '{ not-json');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('ignores session.json when its recorded cwd points at another worktree', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-mismatched-cwd-'));
+  it('does not let recorded cwd retarget a binding-matching committed session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-diagnostic-cwd-'));
     try {
       const statePath = join(cwd, '.omx', 'state', 'session.json');
       await resetSessionMetrics(cwd);
       await writeFile(statePath, JSON.stringify({
-        session_id: 'sess-other-worktree',
+        session_id: 'session-metrics',
         cwd: join(cwd, '..', 'different-worktree'),
       }), 'utf-8');
 
       const state = await readUsableSessionState(cwd);
-      assert.equal(state, null);
+      assert.equal(state?.session_id, 'session-metrics');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -747,7 +793,7 @@ describe('session lifecycle manager', () => {
       const statePath = join(cwd, '.omx', 'state', 'session.json');
       await resetSessionMetrics(cwd);
       await writeFile(statePath, JSON.stringify({
-        session_id: 'sess-stale-pointer',
+        session_id: 'session-metrics',
         cwd,
         pid: 4242,
         pid_start_ticks: 11,
@@ -765,13 +811,16 @@ describe('session lifecycle manager', () => {
     }
   });
 
-  it('marks dead PIDs as stale', () => {
-    const impossiblePid = Number.MAX_SAFE_INTEGER;
+  it('marks an exited PID as stale', () => {
+    const child = spawnSync(process.execPath, ['-e', '']);
+    assert.equal(child.status, 0);
+    const exitedPid = child.pid;
+    assert.ok(exitedPid);
     const stale = isSessionStale({
       session_id: 'sess-stale',
       started_at: '2026-01-01T00:00:00.000Z',
       cwd: '/tmp',
-      pid: impossiblePid,
+      pid: exitedPid,
     });
     assert.equal(stale, true);
   });
@@ -852,6 +901,15 @@ describe('isSessionStale', () => {
       readLinuxIdentity: () => null,
     });
 
+    assert.equal(stale, false);
+  });
+  it('preserves ownership when PID liveness is indeterminate, including EPERM', () => {
+    const state = makeState({ pid_start_ticks: 111 });
+    const stale = isSessionStale(state, {
+      platform: 'linux',
+      isPidAlive: () => undefined,
+      readLinuxIdentity: () => null,
+    });
     assert.equal(stale, false);
   });
 });

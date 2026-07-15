@@ -5,6 +5,13 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
 import { existsSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve as resolvePath } from 'path';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+  StateAuthorityError,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 import {
   getAllScopedStateDirs,
@@ -16,6 +23,7 @@ import {
   getReadScopedStateFilePaths,
   readCurrentSessionId,
   resolveRuntimeStateScope,
+  resolveAuthorityRuntimeStateScope,
   resolveStateScope,
   resolveWritableStateScope,
   resolveWorkingDirectoryForState,
@@ -26,7 +34,6 @@ import {
   validateStateFileName,
   validateStateModeSegment,
   validateSessionId,
-  WRITABLE_STATE_SCOPE_ERRORS,
 
 } from '../state-paths.js';
 
@@ -41,6 +48,12 @@ const isolatedEnvKeys = [
   'SESSION_ID',
   'TMUX',
   'TMUX_PANE',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
 ] as const;
 
 const originalEnv = Object.fromEntries(
@@ -58,6 +71,25 @@ afterEach(() => {
     else delete process.env[key];
   }
 });
+
+async function installWritableScopeAuthority(
+  cwd: string,
+  sessionId: string,
+  aliases?: { owner_session_aliases?: string[]; current_session_aliases?: string[] },
+) {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `mcp-writable-${sessionId}`,
+    session_binding: {
+      canonical_session_id: sessionId,
+      ...(aliases ? { aliases } : {}),
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {}));
+  return authority;
+}
 
 async function mkRealTemp(prefix: string): Promise<string> {
   return await realpath(await mkdtemp(join(await realpath(tmpdir()), prefix)));
@@ -316,6 +348,91 @@ describe('state paths', () => {
       }
     },
   );
+
+  it(
+    'accepts the trusted Darwin /tmp directory alias in the MCP allowlist',
+    { skip: process.platform !== 'darwin' },
+    () => {
+      const previous = process.env.OMX_MCP_WORKDIR_ROOTS;
+      process.env.OMX_MCP_WORKDIR_ROOTS = '/tmp';
+      try {
+        assert.equal(resolveWorkingDirectoryForState('/private/tmp'), realpathSync.native('/tmp'));
+      } finally {
+        if (typeof previous === 'string') process.env.OMX_MCP_WORKDIR_ROOTS = previous;
+        else delete process.env.OMX_MCP_WORKDIR_ROOTS;
+      }
+    },
+  );
+
+  it('fails closed when committed authority is missing', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-mcp-authority-missing-'));
+    try {
+      await assert.rejects(
+        resolveAuthorityRuntimeStateScope(workspace),
+        (error: unknown) => error instanceof StateAuthorityError
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('uses committed authority, canonicalizes aliases, and keeps ambient roots diagnostic-only', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-mcp-authority-scope-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'mcp-authority-scope',
+        session_binding: {
+          canonical_session_id: 'canonical-session',
+          aliases: { native_session_id: 'native-session' },
+        },
+      });
+      await mintStateAuthorityTransportCapability(authority);
+      Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: 'native-session' }));
+      process.env.OMX_ROOT = join(workspace, 'foreign-omx-root');
+      process.env.OMX_STATE_ROOT = join(workspace, 'foreign-state-root');
+      process.env.OMX_TEAM_STATE_ROOT = join(workspace, 'foreign-team-root');
+      await writeFile(join(authority.canonical_state_root, 'session.json'), JSON.stringify({
+        session_id: 'canonical-session',
+        native_session_id: 'native-session',
+        cwd: workspace,
+      }), 'utf-8');
+
+      const scope = await resolveAuthorityRuntimeStateScope(workspace, 'native-session');
+      assert.equal(scope.baseStateDir, authority.canonical_state_root);
+      assert.equal(scope.sessionId, 'canonical-session');
+      assert.equal(scope.source, 'native-alias');
+      assert.deepEqual(scope.authoritativeActiveDirs, [join(authority.canonical_state_root, 'sessions', 'canonical-session')]);
+      assert.deepEqual(scope.observedRootSources.sort(), ['omx-root-env', 'omx-state-root-env', 'team-env'].sort());
+      assert.equal(existsSync(join(workspace, 'foreign-omx-root')), false);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed session metadata under committed authority', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-mcp-authority-malformed-session-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'mcp-authority-malformed-session',
+        session_binding: { canonical_session_id: 'canonical-session' },
+      });
+      await mintStateAuthorityTransportCapability(authority);
+      Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {}));
+      await writeFile(join(authority.canonical_state_root, 'session.json'), '{ malformed', 'utf-8');
+      await assert.rejects(
+        resolveAuthorityRuntimeStateScope(workspace),
+        (error: unknown) => error instanceof StateAuthorityError
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 
   it('builds global state paths', () => {
     const base = getBaseStateDir('/repo');
@@ -632,17 +749,23 @@ describe('state paths', () => {
     }
   });
   describe('writable state scope', () => {
-    it('uses root only when session.json is absent and ignores compatibility-only environment aliases', async () => {
+    it('fails closed on an unbound compatibility alias before allowing authority-root scope', async () => {
       const wd = await mkRealTemp('omx-writable-root-');
       try {
+        const authority = await installWritableScopeAuthority(wd, 'sess-root-authority');
         process.env.CODEX_SESSION_ID = 'compat-read-session';
 
+        await assert.rejects(
+          resolveWritableStateScope(wd),
+          (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+        );
+        delete process.env.CODEX_SESSION_ID;
         const scope = await resolveWritableStateScope(wd);
         assert.deepEqual(scope, {
           source: 'root',
-          stateDir: getBaseStateDir(wd),
+          stateDir: authority.canonical_state_root,
         });
-        assert.equal(existsSync(join(wd, '.omx', 'state')), false);
+        assert.equal(existsSync(join(wd, '.omx', 'state')), true);
       } finally {
         await rm(wd, { recursive: true, force: true });
       }
@@ -651,7 +774,8 @@ describe('state paths', () => {
     it('uses a usable canonical session.json scope and rejects a present unusable session.json', async () => {
       const wd = await mkRealTemp('omx-writable-session-');
       try {
-        const stateDir = getBaseStateDir(wd);
+        const authority = await installWritableScopeAuthority(wd, 'sess-canonical');
+        const stateDir = authority.canonical_state_root;
         await mkdir(stateDir, { recursive: true });
         await writeFile(join(stateDir, 'session.json'), JSON.stringify({
           session_id: 'sess-canonical',
@@ -665,13 +789,13 @@ describe('state paths', () => {
         });
 
         await writeFile(join(stateDir, 'session.json'), JSON.stringify({
-          session_id: 'sess-unusable',
+          session_id: '../sess-unusable',
           cwd: join(wd, 'other-worktree'),
         }));
         await assert.rejects(
           () => resolveWritableStateScope(wd),
           (error: unknown) => {
-            assert.equal((error as Error).message, WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
+            assert.equal((error as { code?: string }).code, AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven);
             return true;
           },
         );
@@ -683,7 +807,8 @@ describe('state paths', () => {
     it('fails closed for an unmatched OMX_SESSION_ID while preserving explicit fork scope', async () => {
       const wd = await mkRealTemp('omx-writable-unmatched-env-');
       try {
-        const stateDir = getBaseStateDir(wd);
+        const authority = await installWritableScopeAuthority(wd, 'sess-canonical');
+        const stateDir = authority.canonical_state_root;
         await mkdir(stateDir, { recursive: true });
         await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-canonical', cwd: wd }));
         process.env.OMX_SESSION_ID = 'sess-unmatched';
@@ -691,7 +816,7 @@ describe('state paths', () => {
         await assert.rejects(
           () => resolveWritableStateScope(wd),
           (error: unknown) => {
-            assert.equal((error as Error).message, WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment);
+            assert.equal((error as { code?: string }).code, AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict);
             return true;
           },
         );
@@ -710,7 +835,10 @@ describe('state paths', () => {
     it('maps a persisted OMX owner alias to the canonical writable session without re-proving tmux evidence', async () => {
       const wd = await mkRealTemp('omx-writable-alias-');
       try {
-        const stateDir = getBaseStateDir(wd);
+        const authority = await installWritableScopeAuthority(wd, 'sess-canonical', {
+          owner_session_aliases: ['omx-owner-alias'],
+        });
+        const stateDir = authority.canonical_state_root;
         await mkdir(stateDir, { recursive: true });
         await writeFile(join(stateDir, 'session.json'), JSON.stringify({
           session_id: 'sess-canonical',

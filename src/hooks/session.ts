@@ -6,7 +6,7 @@
  */
 
 import { constants, existsSync, readFileSync, readdirSync } from 'fs';
-import { lstat, open, readFile, stat, unlink } from 'fs/promises';
+import { lstat, open, stat, unlink } from 'fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
@@ -16,6 +16,7 @@ import {
   captureRootFilesystemIdentity,
   ensureAuthorityDirectory,
   initializeStateAuthority,
+  stateAuthorityTransportCapabilityForChild,
   isObservedCwdCompatibleWithStateAuthority,
   readWorkspaceAuthorityAnchor,
   resolveOrdinaryStateRoot,
@@ -58,6 +59,53 @@ export function normalizeSessionId(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return SESSION_ID_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
+function requireSessionId(value: unknown, label = 'sessionId'): string {
+  const sessionId = normalizeSessionId(value);
+  if (!sessionId) throw new Error(`${label} must match ^[A-Za-z0-9_-]{1,64}$`);
+  return sessionId;
+}
+
+function validatePersistedSessionState(value: unknown, path: string): SessionState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      `session lifecycle state must be a JSON object and requires explicit recovery: ${path}`,
+    );
+  }
+  const state = value as SessionState;
+  const sessionId = normalizeSessionId(state.session_id);
+  if (!sessionId) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      `session lifecycle state contains an invalid session_id and requires explicit recovery: ${path}`,
+    );
+  }
+  const normalizeOptionalId = (field: 'native_session_id' | 'previous_native_session_id' | 'owner_omx_session_id' | 'owner_codex_session_id'): string | undefined => {
+    const value = state[field];
+    if (value === undefined) return undefined;
+    const sessionId = normalizeSessionId(value);
+    if (!sessionId) {
+      sessionIoError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+        `session lifecycle state contains an invalid ${field} and requires explicit recovery: ${path}`,
+      );
+    }
+    return sessionId;
+  };
+  const nativeSessionId = normalizeOptionalId('native_session_id');
+  const previousNativeSessionId = normalizeOptionalId('previous_native_session_id');
+  const ownerOmxSessionId = normalizeOptionalId('owner_omx_session_id');
+  const ownerCodexSessionId = normalizeOptionalId('owner_codex_session_id');
+  return {
+    ...state,
+    session_id: sessionId,
+    ...(nativeSessionId ? { native_session_id: nativeSessionId } : {}),
+    ...(previousNativeSessionId ? { previous_native_session_id: previousNativeSessionId } : {}),
+    ...(ownerOmxSessionId ? { owner_omx_session_id: ownerOmxSessionId } : {}),
+    ...(ownerCodexSessionId ? { owner_codex_session_id: ownerCodexSessionId } : {}),
+  };
 }
 // No age-based threshold: staleness is determined by PID liveness/identity.
 // Long-running sessions (>2h) are legitimate and should not be reaped.
@@ -324,15 +372,63 @@ async function openSessionIoScope(
     await assertSessionIoScopeCurrent(scope);
     return scope;
   } catch (error) {
-    await current?.handle?.close().catch(() => undefined);
-    if (openedRoot && openedRoot !== current) await openedRoot.handle?.close().catch(() => undefined);
+    const cleanupFailures: unknown[] = [];
+    try {
+      await current?.handle?.close();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (openedRoot && openedRoot !== current) {
+      try {
+        await openedRoot.handle?.close();
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError([error, ...cleanupFailures], 'session lifecycle scope setup failed and cleanup was incomplete');
+    }
     throw error;
   }
 }
 
 async function closeSessionIoScope(scope: SessionIoScope): Promise<void> {
-  if (scope.parent !== scope.root) await scope.parent.handle?.close();
-  await scope.root.handle?.close();
+  const cleanupFailures: unknown[] = [];
+  if (scope.parent !== scope.root) {
+    try {
+      await scope.parent.handle?.close();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+  }
+  try {
+    await scope.root.handle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'session lifecycle scope cleanup was incomplete');
+  }
+}
+
+async function closeSessionIoResources(
+  scope: SessionIoScope,
+  handle: SessionIoFileHandle | undefined,
+): Promise<void> {
+  const cleanupFailures: unknown[] = [];
+  try {
+    await handle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  try {
+    await closeSessionIoScope(scope);
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'session lifecycle file cleanup was incomplete');
+  }
 }
 
 async function readSessionIoFile(
@@ -385,8 +481,7 @@ async function readSessionIoFile(
     await assertSessionIoScopeCurrent(scope);
     return content;
   } finally {
-    await handle?.close().catch(() => undefined);
-    await closeSessionIoScope(scope).catch(() => undefined);
+    await closeSessionIoResources(scope, handle);
   }
 }
 
@@ -496,8 +591,7 @@ async function deleteSessionIoFile(
     await assertSessionIoScopeCurrent(scope);
     return true;
   } finally {
-    await handle?.close().catch(() => undefined);
-    await closeSessionIoScope(scope).catch(() => undefined);
+    await closeSessionIoResources(scope, handle);
   }
 }
 
@@ -543,7 +637,7 @@ function deriveWorkspaceFromAuthorityLocator(locator: string): string | null {
 
 function inheritedAuthoritySessionId(env: NodeJS.ProcessEnv): string | undefined {
   const sessionId = env.OMX_SESSION_ID?.trim() || env.CODEX_SESSION_ID?.trim();
-  return sessionId || undefined;
+  return sessionId ? requireSessionId(sessionId, 'inherited session ID') : undefined;
 }
 
 async function assertActiveAuthorityTransport(
@@ -635,8 +729,9 @@ export async function resolveAuthenticatedTransportAuthority(
 
 /**
  * A transported startup workspace is usable only after the inherited locator
- * authenticates the active anchor. Without authority evidence, startup cwd is
- * retained only within the same workspace for legacy bootstrap compatibility.
+ * authenticates the active anchor. An unverified persisted startup workspace
+ * must agree with the observed workspace; otherwise callers must restart or
+ * rebind with a complete authenticated authority transport.
  */
 export async function resolveAuthenticatedStateAuthorityStartupCwd(
   observedCwd: string,
@@ -646,13 +741,25 @@ export async function resolveAuthenticatedStateAuthorityStartupCwd(
   if (authority) return authority.workspace_identity.canonical_path;
   const startupCwd = env.OMX_STARTUP_CWD?.trim();
   if (!startupCwd) return observedCwd;
+
+  let startupWorkspace: ReturnType<typeof resolveWorkspaceIdentity>;
+  let observedWorkspace: ReturnType<typeof resolveWorkspaceIdentity>;
   try {
-    return resolveWorkspaceIdentity(startupCwd).digest === resolveWorkspaceIdentity(observedCwd).digest
-      ? startupCwd
-      : observedCwd;
+    startupWorkspace = resolveWorkspaceIdentity(startupCwd);
+    observedWorkspace = resolveWorkspaceIdentity(observedCwd);
   } catch {
-    return observedCwd;
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      `persisted startup authority cannot be reconciled with the observed workspace: startup_candidate_root=${resolve(startupCwd, '.omx', 'state')} observed_candidate_root=${resolve(observedCwd, '.omx', 'state')}; restart from the intended workspace or rebind with a complete authenticated state-authority transport`,
+    );
   }
+  if (startupWorkspace.digest !== observedWorkspace.digest) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+      `persisted startup authority conflicts with the observed workspace: startup_candidate_root=${resolveOrdinaryStateRoot(startupWorkspace)} observed_candidate_root=${resolveOrdinaryStateRoot(observedWorkspace)}; restart from the intended workspace or rebind with a complete authenticated state-authority transport`,
+    );
+  }
+  return startupWorkspace.canonical_path;
 }
 
 async function stateAuthorityStartupCwd(observedCwd: string): Promise<string> {
@@ -700,44 +807,19 @@ async function resolveExistingSessionAuthority(cwd: string): Promise<ResolvedSta
     throw error;
   }
 }
-async function legacySessionStateRoots(cwd: string): Promise<string[]> {
-  const roots: string[] = [];
-  const teamStateRoot = process.env.OMX_TEAM_STATE_ROOT?.trim();
-  if (teamStateRoot) roots.push(resolve(cwd, teamStateRoot));
-  const omxRoot = process.env.OMX_ROOT?.trim();
-  if (omxRoot) roots.push(join(resolve(cwd, omxRoot), '.omx', 'state'));
-  const omxStateRoot = process.env.OMX_STATE_ROOT?.trim();
-  if (omxStateRoot) roots.push(join(resolve(cwd, omxStateRoot), '.omx', 'state'));
-  roots.push(resolveOrdinaryStateRoot(resolveWorkspaceIdentity(await stateAuthorityStartupCwd(cwd))));
-  return [...new Set(roots)];
-}
-
-async function readLegacySessionState(cwd: string): Promise<SessionState | null> {
-  const workspace = resolveWorkspaceIdentity(await stateAuthorityStartupCwd(cwd));
-  const candidates: SessionState[] = [];
-  for (const stateRoot of await legacySessionStateRoots(cwd)) {
-    const state = await readSessionStateAt(stateRoot);
-    if (!state || !SESSION_ID_PATTERN.test(state.session_id)) continue;
-    if (typeof state.cwd !== 'string' || !state.cwd.trim()) {
-      candidates.push(state);
-      continue;
-    }
-    try {
-      const recordedWorkspace = resolveWorkspaceIdentity(state.cwd);
-      if (recordedWorkspace.canonical_path === workspace.canonical_path) candidates.push(state);
-    } catch {
-      // Invalid legacy cwd evidence is not a candidate.
-    }
-  }
-  return candidates.length === 1 ? candidates[0] : null;
-}
 
 function sessionAliases(
   options: Pick<SessionStartOptions, 'nativeSessionId' | 'previousNativeSessionId' | 'ownerOmxSessionId'>,
 ): Partial<SessionAliasSet> {
-  const native = options.nativeSessionId?.trim();
-  const previous = options.previousNativeSessionId?.trim();
-  const owner = options.ownerOmxSessionId?.trim();
+  const native = options.nativeSessionId === undefined
+    ? undefined
+    : requireSessionId(options.nativeSessionId, 'nativeSessionId');
+  const previous = options.previousNativeSessionId === undefined
+    ? undefined
+    : requireSessionId(options.previousNativeSessionId, 'previousNativeSessionId');
+  const owner = options.ownerOmxSessionId === undefined
+    ? undefined
+    : requireSessionId(options.ownerOmxSessionId, 'ownerOmxSessionId');
   return {
     ...(native ? { native_session_id: native, current_session_aliases: [native] } : {}),
     ...(previous ? { previous_session_aliases: [previous] } : {}),
@@ -762,19 +844,19 @@ function sessionIdMatchesAuthority(state: SessionState, authority: ResolvedState
 
 async function readSessionStateAt(
   stateDir: string,
-  rootIdentity?: RootFilesystemIdentity,
+  rootIdentity: RootFilesystemIdentity,
 ): Promise<SessionState | null> {
   const path = sessionPath(stateDir);
-  const content = rootIdentity
-    ? await readSessionIoFile(stateDir, rootIdentity, path)
-    : existsSync(path)
-      ? await readFile(path, 'utf-8').catch(() => null)
-      : null;
+  const content = await readSessionIoFile(stateDir, rootIdentity, path);
   if (content === null) return null;
   try {
-    return JSON.parse(content) as SessionState;
-  } catch {
-    return null;
+    return validatePersistedSessionState(JSON.parse(content), path);
+  } catch (error) {
+    if (error instanceof StateAuthorityError) throw error;
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+      `session lifecycle state is malformed and requires explicit recovery: ${path}`,
+    );
   }
 }
 
@@ -824,8 +906,8 @@ async function removeDeadSessionHudState(
 ): Promise<void> {
   const uniqueSessionIds = [...new Set(
     sessionIds
-      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-      .map((value) => value.trim()),
+      .filter((value): value is string => value !== undefined)
+      .map((value) => requireSessionId(value, 'session cleanup ID')),
   )];
   const candidatePaths = [
     ...(removeRootHudState ? [join(baseStateDir, 'hud-state.json')] : []),
@@ -837,9 +919,10 @@ async function removeDeadSessionHudState(
 }
 async function initializeSessionAuthority(
   cwd: string,
-  canonicalSessionId: string,
+  requestedSessionId: string,
   aliases?: Partial<SessionAliasSet>,
 ): Promise<ResolvedStateAuthorityContext> {
+  const canonicalSessionId = requireSessionId(requestedSessionId);
   let existing: ResolvedStateAuthorityContext | null = null;
   try {
     existing = await resolveExistingSessionAuthority(cwd);
@@ -848,16 +931,51 @@ async function initializeSessionAuthority(
       throw error;
     }
   }
+  const requestedOwnerAliases = aliases?.owner_session_aliases ?? [];
+  const hasOwnerContinuity = existing !== null && requestedOwnerAliases.some((alias) =>
+    alias === existing.session_binding?.canonical_session_id
+    || existing.session_binding?.aliases.owner_session_aliases.includes(alias),
+  );
+  const effectiveAliases = existing && aliases ? {
+    ...aliases,
+    previous_session_aliases: [...new Set([
+      ...(hasOwnerContinuity ? [existing.session_binding?.aliases.native_session_id] : []),
+      ...(aliases.previous_session_aliases ?? []),
+    ].filter((value): value is string => typeof value === 'string' && value.trim() !== ''))],
+  } : aliases;
   const authority = await initializeStateAuthority({
     startup_cwd: existing?.workspace_identity.canonical_path ?? cwd,
     observed_cwd: cwd,
     launch_id: `session-${canonicalSessionId}`,
     session_binding: {
       canonical_session_id: canonicalSessionId,
-      ...(aliases ? { aliases } : {}),
+      ...(effectiveAliases ? { aliases: effectiveAliases } : {}),
     },
   });
   return authority;
+}
+
+function hasCompleteProcessAuthorityTransport(): boolean {
+  return [
+    'OMX_STATE_AUTHORITY_PATH',
+    'OMX_STATE_AUTHORITY_ID',
+    'OMX_STATE_AUTHORITY_GENERATION_ID',
+    'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+    'OMX_STATE_AUTHORITY_CAPABILITY',
+    'OMX_STARTUP_CWD',
+  ].every((key) => Boolean(process.env[key]?.trim()));
+}
+
+async function withSessionAuthorityTransaction<T>(
+  authority: ResolvedStateAuthorityContext,
+  callback: (context: ResolvedStateAuthorityContext) => Promise<T>,
+): Promise<T> {
+  const refreshProcessTransport = hasCompleteProcessAuthorityTransport();
+  const result = await withStateAuthorityTransaction(authority, callback);
+  if (refreshProcessTransport) {
+    process.env.OMX_STATE_AUTHORITY_CAPABILITY = stateAuthorityTransportCapabilityForChild(authority);
+  }
+  return result;
 }
 
 /**
@@ -865,13 +983,12 @@ async function initializeSessionAuthority(
  * into a new Codex session.
  */
 export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
-  const requestedSessionId = sessionId?.trim();
-  const canonicalSessionId = requestedSessionId || 'session-metrics';
-  if (!SESSION_ID_PATTERN.test(canonicalSessionId)) {
-    throw new Error('sessionId must match ^[A-Za-z0-9_-]{1,64}$');
-  }
+  const requestedSessionId = sessionId === undefined
+    ? undefined
+    : requireSessionId(sessionId);
+  const canonicalSessionId = requestedSessionId ?? 'session-metrics';
   const authority = await initializeSessionAuthority(cwd, canonicalSessionId);
-  await withStateAuthorityTransaction(authority, async (context) => {
+  await withSessionAuthorityTransaction(authority, async (context) => {
     const omxDir = context.generation.canonical_omx_root;
     const stateDir = context.canonical_state_root;
     const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
@@ -902,18 +1019,22 @@ export async function resetSessionMetrics(cwd: string, sessionId?: string): Prom
 /**
  * Read current session state. Returns null if no authority or session file exists.
  */
-export async function readSessionState(cwd: string): Promise<SessionState | null> {
-  try {
-    const authority = await resolveExistingSessionAuthority(cwd);
-    if (!authority) return null;
-    const state = await readSessionStateAt(authority.canonical_state_root, authority.generation.root_identity);
-    return state && sessionIdMatchesAuthority(state, authority) ? state : null;
-  } catch (error) {
-    if (error instanceof StateAuthorityError && error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) {
-      return await readLegacySessionState(cwd);
-    }
-    throw error;
+export async function readCommittedSessionState(authority: ResolvedStateAuthorityContext): Promise<SessionState | null> {
+  const state = await readSessionStateAt(authority.canonical_state_root, authority.generation.root_identity);
+  if (!state) return null;
+  if (!sessionIdMatchesAuthority(state, authority)) {
+    sessionIoError(
+      AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      'session lifecycle state does not match the committed authority binding and requires explicit recovery',
+    );
   }
+  return state;
+}
+
+export async function readSessionState(cwd: string): Promise<SessionState | null> {
+  const authority = await resolveExistingSessionAuthority(cwd);
+  if (!authority) return null;
+  return readCommittedSessionState(authority);
 }
 
 export function isSessionStateAuthoritativeForCwd(state: SessionState, _cwd: string): boolean {
@@ -953,7 +1074,7 @@ interface LinuxProcessIdentity {
 
 interface SessionStaleCheckOptions {
   platform?: NodeJS.Platform;
-  isPidAlive?: (pid: number) => boolean;
+  isPidAlive?: (pid: number) => boolean | undefined;
   readLinuxIdentity?: (pid: number) => LinuxProcessIdentity | null;
 }
 
@@ -968,12 +1089,12 @@ interface SessionStartOptions {
   tmuxPaneId?: string;
 }
 
-function defaultIsPidAlive(pid: number): boolean {
+function defaultIsPidAlive(pid: number): boolean | undefined {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : undefined;
   }
 }
 
@@ -1089,7 +1210,9 @@ export function isSessionStale(
   if (!Number.isInteger(state.pid) || state.pid <= 0) return true;
 
   const isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
-  if (!isPidAlive(state.pid)) return true;
+  const pidAlive = isPidAlive(state.pid);
+  if (pidAlive === false) return true;
+  if (pidAlive === undefined) return false;
 
   const platform = options.platform ?? process.platform;
   if (platform !== 'linux') return false;
@@ -1119,12 +1242,13 @@ export async function writeSessionStart(
   sessionId: string,
   options: SessionStartOptions = {},
 ): Promise<SessionState> {
-  const authority = await initializeSessionAuthority(cwd, sessionId, sessionAliases(options));
+  const canonicalSessionId = requireSessionId(sessionId);
+  const authority = await initializeSessionAuthority(cwd, canonicalSessionId, sessionAliases(options));
 
-  return await withStateAuthorityTransaction(authority, async (context) => {
+  return await withSessionAuthorityTransaction(authority, async (context) => {
     const stateDir = context.canonical_state_root;
     const existing = await readSessionStateAt(stateDir, context.generation.root_identity);
-    const sameSession = existing?.session_id === sessionId;
+    const sameSession = existing?.session_id === canonicalSessionId;
     const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
       ? options.pid
       : process.pid;
@@ -1132,7 +1256,7 @@ export async function writeSessionStart(
     const linuxIdentity = platform === 'linux'
       ? readLinuxProcessIdentity(pid)
       : null;
-    const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
+    const state = createSessionState(cwd, canonicalSessionId, pid, platform, linuxIdentity, {
       nativeSessionId: options.nativeSessionId ?? (sameSession ? existing?.native_session_id : undefined),
       previousNativeSessionId: options.previousNativeSessionId ?? (sameSession ? existing?.previous_native_session_id : undefined),
       nativeSessionSwitchedAt: options.nativeSessionSwitchedAt ?? (sameSession ? existing?.native_session_switched_at : undefined),
@@ -1150,7 +1274,7 @@ export async function writeSessionStart(
     const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
     await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, {
       event: 'session_start',
-      session_id: sessionId,
+      session_id: canonicalSessionId,
       ...(state.native_session_id ? { native_session_id: state.native_session_id } : {}),
       pid,
       timestamp: state.started_at,
@@ -1180,22 +1304,21 @@ export async function reconcileNativeSessionStart(
   nativeSessionId: string,
   options: SessionStartOptions = {},
 ): Promise<SessionState> {
+  const canonicalNativeSessionId = requireSessionId(nativeSessionId, 'nativeSessionId');
   const existing = await readUsableSessionState(cwd, {
     ...(options.platform ? { platform: options.platform } : {}),
   });
   if (!existing) {
     const previousAuthoritySessionId = (await resolveExistingSessionAuthority(cwd))?.session_binding?.canonical_session_id;
-    return await writeSessionStart(cwd, nativeSessionId, {
+    return await writeSessionStart(cwd, previousAuthoritySessionId ?? canonicalNativeSessionId, {
       ...options,
-      nativeSessionId,
-      ...(previousAuthoritySessionId ? { previousNativeSessionId: previousAuthoritySessionId } : {}),
+      nativeSessionId: canonicalNativeSessionId,
+      ...(previousAuthoritySessionId ? { ownerOmxSessionId: previousAuthoritySessionId } : {}),
     });
   }
 
-  const existingNativeSessionId = typeof existing.native_session_id === 'string'
-    ? existing.native_session_id.trim()
-    : '';
-  if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
+  const existingNativeSessionId = existing.native_session_id ?? '';
+  if (existingNativeSessionId && existingNativeSessionId !== canonicalNativeSessionId) {
     const ownerOmxSessionId = getOmxLaunchSessionId(existing);
     if (ownerOmxSessionId) {
       const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
@@ -1207,23 +1330,23 @@ export async function reconcileNativeSessionStart(
         session_id: ownerOmxSessionId,
         ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
         previous_native_session_id: existingNativeSessionId,
-        replaced_by_native_session_id: nativeSessionId,
+        replaced_by_native_session_id: canonicalNativeSessionId,
         pid,
         timestamp: nowIso,
       });
 
-      return await writeSessionStart(cwd, nativeSessionId, {
+      return await writeSessionStart(cwd, canonicalNativeSessionId, {
         ...options,
-        nativeSessionId,
+        nativeSessionId: canonicalNativeSessionId,
         previousNativeSessionId: existingNativeSessionId,
         nativeSessionSwitchedAt: nowIso,
         ownerOmxSessionId,
       });
     }
 
-    return await writeSessionStart(cwd, nativeSessionId, {
+    return await writeSessionStart(cwd, canonicalNativeSessionId, {
       ...options,
-      nativeSessionId,
+      nativeSessionId: canonicalNativeSessionId,
     });
   }
 
@@ -1239,15 +1362,15 @@ export async function reconcileNativeSessionStart(
     cwd,
     existing.session_id,
     sessionAliases({
-      nativeSessionId,
+      nativeSessionId: canonicalNativeSessionId,
       previousNativeSessionId: options.previousNativeSessionId ?? existing.previous_native_session_id,
       ownerOmxSessionId: options.ownerOmxSessionId ?? existing.owner_omx_session_id,
     }),
   );
-  return await withStateAuthorityTransaction(authority, async (context) => {
+  return await withSessionAuthorityTransaction(authority, async (context) => {
     const state = createSessionState(cwd, existing.session_id, pid, platform, linuxIdentity, {
       nowIso,
-      nativeSessionId,
+      nativeSessionId: canonicalNativeSessionId,
       previousNativeSessionId: existing.previous_native_session_id,
       nativeSessionSwitchedAt: existing.native_session_switched_at,
       ownerOmxSessionId: options.ownerOmxSessionId ?? existing.owner_omx_session_id,
@@ -1265,7 +1388,7 @@ export async function reconcileNativeSessionStart(
     await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, {
       event: 'session_start_reconciled',
       session_id: state.session_id,
-      native_session_id: nativeSessionId,
+      native_session_id: canonicalNativeSessionId,
       pid,
       timestamp: nowIso,
     });
@@ -1278,17 +1401,18 @@ export async function reconcileNativeSessionStart(
  * remove only the owned session pointer.
  */
 export async function writeSessionEnd(cwd: string, sessionId: string): Promise<void> {
+  const canonicalSessionId = requireSessionId(sessionId);
   const authority = await resolveSessionAuthorityForGuard(cwd);
-  await withStateAuthorityTransaction(authority, async (context) => {
+  await withSessionAuthorityTransaction(authority, async (context) => {
     const state = await readSessionStateAt(context.canonical_state_root, context.generation.root_identity);
     const endTime = new Date().toISOString();
     const ownsCurrentSessionFile = state == null
-      || state.session_id === sessionId
-      || state.native_session_id === sessionId
-      || state.owner_omx_session_id === sessionId;
+      || state.session_id === canonicalSessionId
+      || state.native_session_id === canonicalSessionId
+      || state.owner_omx_session_id === canonicalSessionId;
     const recordedSessionId = ownsCurrentSessionFile
-      ? (state?.owner_omx_session_id === sessionId ? sessionId : state?.session_id || sessionId)
-      : sessionId;
+      ? (state?.owner_omx_session_id === canonicalSessionId ? canonicalSessionId : state?.session_id || canonicalSessionId)
+      : canonicalSessionId;
     const preservedActiveSessionId = !ownsCurrentSessionFile && state?.session_id
       ? state.session_id
       : undefined;
@@ -1296,7 +1420,7 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
     await appendStateAuthorityEvidence(context.generation, {
       kind: 'session_end',
       session_id: recordedSessionId,
-      requested_session_id: sessionId,
+      requested_session_id: canonicalSessionId,
       owns_current_session_file: ownsCurrentSessionFile,
       timestamp: endTime,
     });
@@ -1308,7 +1432,7 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
       ended_at: endTime,
       cwd,
       pid: ownsCurrentSessionFile ? state?.pid || process.pid : process.pid,
-      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
+      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === canonicalSessionId && state?.session_id
         ? { active_session_id: state.session_id }
         : {}),
       ...(preservedActiveSessionId ? { preserved_active_session_id: preservedActiveSessionId } : {}),
@@ -1327,7 +1451,7 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
       context.generation.root_identity,
       [
         ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
-        sessionId,
+        canonicalSessionId,
       ],
       ownsCurrentSessionFile && state !== null,
     );
@@ -1343,7 +1467,7 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
       event: 'session_end',
       session_id: recordedSessionId,
       ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
-      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
+      ...(ownsCurrentSessionFile && state?.owner_omx_session_id === canonicalSessionId && state?.session_id
         ? { active_session_id: state.session_id }
         : {}),
       ...(preservedActiveSessionId ? { preserved_active_session_id: preservedActiveSessionId } : {}),
@@ -1357,7 +1481,7 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
  */
 export async function appendToLog(cwd: string, entry: Record<string, unknown>): Promise<void> {
   const authority = await resolveSessionAuthorityForGuard(cwd);
-  await withStateAuthorityTransaction(authority, async (context) => {
+  await withSessionAuthorityTransaction(authority, async (context) => {
     const omxRootIdentity = await capturePinnedParentOmxRootIdentity(context);
     await appendToLogAt(context.generation.canonical_omx_root, omxRootIdentity, entry);
   });

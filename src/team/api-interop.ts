@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve as resolvePath } from 'node:path';
+import { join } from 'node:path';
 import { omxStateDir } from '../utils/paths.js';
 import { sendWorkerMessage, shutdownTeam } from './runtime.js';
 import {
@@ -445,66 +445,6 @@ function parseValidatedTaskIdArray(value: unknown, fieldName: string): string[] 
   return taskIds;
 }
 
-function teamStateExists(teamName: string, candidateCwd: string): boolean {
-  if (!TEAM_NAME_SAFE_PATTERN.test(teamName)) return false;
-  const teamRoot = join(resolveCanonicalTeamStateRoot(candidateCwd), 'team', teamName);
-  return existsSync(join(teamRoot, 'config.json')) || existsSync(join(teamRoot, 'tasks')) || existsSync(teamRoot);
-}
-
-function readTeamStateRootFromManifest(path: string): string | null {
-  if (!existsSync(path)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { team_state_root?: unknown };
-    return typeof parsed.team_state_root === 'string' && parsed.team_state_root.trim() !== ''
-      ? parsed.team_state_root.trim()
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function stateRootToWorkingDirectory(stateRoot: string): string {
-  const absolute = resolvePath(stateRoot);
-  return dirname(dirname(absolute));
-}
-
-function resolveTeamWorkingDirectoryFromMetadata(teamName: string, candidateCwd: string): string | null {
-  const teamRoot = join(resolveCanonicalTeamStateRoot(candidateCwd), 'team', teamName);
-  if (!existsSync(teamRoot)) return null;
-
-  const fromManifest = readTeamStateRootFromManifest(join(teamRoot, 'manifest.v2.json'));
-  if (!fromManifest) return null;
-
-  return stateRootToWorkingDirectory(fromManifest);
-}
-
-function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): string {
-  const normalizedTeamName = String(teamName || '').trim();
-  if (!normalizedTeamName) return preferredCwd;
-  const envTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-  if (typeof envTeamStateRoot === 'string' && envTeamStateRoot.trim() !== '') {
-    return stateRootToWorkingDirectory(envTeamStateRoot.trim());
-  }
-
-  const seeds: string[] = [];
-  for (const seed of [preferredCwd, process.cwd()]) {
-    if (typeof seed !== 'string' || seed.trim() === '') continue;
-    if (!seeds.includes(seed)) seeds.push(seed);
-  }
-
-  for (const seed of seeds) {
-    let cursor = seed;
-    while (cursor) {
-      if (teamStateExists(normalizedTeamName, cursor)) {
-        return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor) ?? cursor;
-      }
-      const parent = dirname(cursor);
-      if (!parent || parent === cursor) break;
-      cursor = parent;
-    }
-  }
-  return preferredCwd;
-}
 
 function readLegacyMailboxMessages(
   teamName: string,
@@ -603,7 +543,7 @@ export async function executeTeamApiOperation(
     const rawTeamNameForCwd = String(args.team_name || '').trim();
     if (rawTeamNameForCwd) assertUnsafeTeamNameMatchesKnownDisplay(rawTeamNameForCwd, fallbackCwd);
     const resolvedTeamName = rawTeamNameForCwd ? resolveTeamNameForCurrentContext(rawTeamNameForCwd, fallbackCwd) : '';
-    const cwd = resolvedTeamName ? resolveTeamWorkingDirectory(resolvedTeamName, fallbackCwd) : fallbackCwd;
+    const cwd = fallbackCwd;
     const opArgs = resolvedTeamName ? { ...args, team_name: resolvedTeamName } : args;
     validateCommonFields(opArgs);
 

@@ -5,6 +5,7 @@ import {
   existsSync,
   fstatSync,
   lstatSync,
+  statSync,
   openSync,
   readFileSync,
   realpathSync,
@@ -107,6 +108,8 @@ export interface RootFilesystemIdentity {
   device: string;
   inode: string;
   mode: string;
+  uid: string;
+  gid: string;
   birthtime_ns: string;
   strong_identity: boolean;
 }
@@ -1104,6 +1107,10 @@ async function assertAuthorityLocator(
   if (canonicalizeExistingAuthorityPath(resolvedLocator, label) !== expected) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} canonical path does not match its expected authority locator`);
   }
+  for (let directory = dirname(resolvedLocator); ; directory = dirname(directory)) {
+    await assertSecureAuthorityDirectoryCustody(directory, `${label} directory`);
+    if (directory === canonicalRoot) break;
+  }
 }
 
 export async function ensureAuthorityDirectory(root: string, directory: string): Promise<string> {
@@ -1113,9 +1120,12 @@ export async function ensureAuthorityDirectory(root: string, directory: string):
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `authority directory escapes root: ${target}`);
   }
   const relativeTarget = relative(canonicalRoot, target);
-  if (relativeTarget === '') return canonicalRoot;
-  const segments = relativeTarget.split(/[\\/]+/);
   const rootIdentity = await captureRootFilesystemIdentity(canonicalRoot);
+  if (relativeTarget === '') {
+    assertSecureStateRootCustody(rootIdentity, 'authority directory');
+    return canonicalRoot;
+  }
+  const segments = relativeTarget.split(/[\\/]+/);
   let openedRoot: OpenedAuthorityDirectory | undefined;
   let current: OpenedAuthorityDirectory | undefined;
   try {
@@ -1139,6 +1149,12 @@ export async function ensureAuthorityDirectory(root: string, directory: string):
       }
       const child = await openNoFollowAuthorityDirectory(childPath, 'authority directory');
       child.path = stableChildPath;
+      try {
+        await assertSecureAuthorityDirectoryCustody(stableChildPath, 'authority directory');
+      } catch (error) {
+        await child.handle?.close().catch(() => undefined);
+        throw error;
+      }
       if (current !== openedRoot) await current.handle?.close();
       current = child;
       await assertOpenedAuthorityDirectoryCurrent(openedRoot, 'authority root');
@@ -1399,6 +1415,12 @@ async function openAuthorityMutationScope(
       canonicalCurrentPath = join(canonicalCurrentPath, segment);
       const opened = await openNoFollowAuthorityDirectory(childPath, 'authority mutation parent');
       opened.path = canonicalCurrentPath;
+      try {
+        await assertSecureAuthorityDirectoryCustody(canonicalCurrentPath, 'authority mutation parent');
+      } catch (error) {
+        await opened.handle?.close().catch(() => undefined);
+        throw error;
+      }
       if (current !== root) await current.handle?.close();
       current = opened;
     }
@@ -1412,15 +1434,63 @@ async function openAuthorityMutationScope(
     await assertAuthorityMutationScopeCurrent(scope);
     return scope;
   } catch (error) {
-    await parent?.handle?.close().catch(() => undefined);
-    if (root && root !== parent) await root.handle?.close().catch(() => undefined);
+    const cleanupFailures: unknown[] = [];
+    try {
+      await parent?.handle?.close();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (root && root !== parent) {
+      try {
+        await root.handle?.close();
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError([error, ...cleanupFailures], 'authority mutation scope setup failed and cleanup was incomplete');
+    }
     throw error;
   }
 }
 
 async function closeAuthorityMutationScope(scope: AuthorityMutationScope): Promise<void> {
-  if (scope.parent !== scope.root) await scope.parent.handle?.close();
-  await scope.root.handle?.close();
+  const cleanupFailures: unknown[] = [];
+  if (scope.parent !== scope.root) {
+    try {
+      await scope.parent.handle?.close();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+  }
+  try {
+    await scope.root.handle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'authority mutation scope cleanup was incomplete');
+  }
+}
+
+async function closeAuthorityMutationResources(
+  scope: AuthorityMutationScope,
+  handle: Awaited<ReturnType<typeof open>> | undefined,
+): Promise<void> {
+  const cleanupFailures: unknown[] = [];
+  try {
+    await handle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  try {
+    await closeAuthorityMutationScope(scope);
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'authority mutation file cleanup was incomplete');
+  }
 }
 
 async function assertAuthorityMutationTarget(
@@ -1513,6 +1583,8 @@ export async function atomicWriteAuthorityFile(
   let temporaryIdentity: { dev: number; ino: number } | undefined;
   let temporaryCreated = false;
   const expectedContent = Buffer.isBuffer(content) ? content : Buffer.from(content);
+  const cleanupFailures: unknown[] = [];
+  let primaryFailure: unknown;
   try {
     await assertAuthorityMutationTarget(scope, basenameTarget);
     handle = await open(
@@ -1577,6 +1649,7 @@ export async function atomicWriteAuthorityFile(
     }
     await assertAuthorityMutationScopeCurrent(scope);
   } catch (error) {
+    primaryFailure = error;
     if (temporaryCreated && temporaryIdentity) {
       try {
         const current = await lstat(temporaryPath);
@@ -1585,14 +1658,26 @@ export async function atomicWriteAuthorityFile(
           await unlink(temporaryPath);
           await syncOpenedAuthorityDirectory(scope.parent.handle);
         }
-      } catch {
+      } catch (cleanupError) {
         // A substituted temporary must never be deleted by this failed writer.
+        cleanupFailures.push(cleanupError);
       }
     }
-    throw error;
   } finally {
-    await handle?.close().catch(() => undefined);
-    await closeAuthorityMutationScope(scope).catch(() => undefined);
+    try {
+      await closeAuthorityMutationResources(scope, handle);
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+  }
+  if (primaryFailure !== undefined) {
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError([primaryFailure, ...cleanupFailures], 'authority file write failed and cleanup was incomplete');
+    }
+    throw primaryFailure;
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'authority file write cleanup was incomplete');
   }
 }
 
@@ -1840,35 +1925,108 @@ export function authorityJournalPath(
   );
 }
 
+function validateRootFilesystemIdentity(
+  identity: RootFilesystemIdentity,
+  label: string,
+): void {
+  if (!identity
+    || identity.schema_version !== 1
+    || typeof identity.platform !== 'string'
+    || identity.platform !== process.platform
+    || identity.canonical_path !== assertPathInput(identity.canonical_path, `${label} path`)
+    || !/^[0-9]+$/.test(identity.device)
+    || !/^[0-9]+$/.test(identity.inode)
+    || !/^[0-9]+$/.test(identity.mode)
+    || !/^[0-9]+$/.test(identity.uid)
+    || !/^[0-9]+$/.test(identity.gid)
+    || !/^[0-9]+$/.test(identity.birthtime_ns)
+    || identity.strong_identity !== true) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, `${label} has malformed or weak filesystem identity evidence`);
+  }
+}
+
+function assertSecureStateRootCustody(identity: RootFilesystemIdentity, label: string): void {
+  if (identity.platform === 'win32') {
+    authorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      `${label} cannot establish mutation authority on Windows until owner and DACL custody are verified`,
+    );
+  }
+  const permissions = Number(identity.mode) & 0o777;
+  if ((permissions & 0o022) !== 0) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} is writable by group or other users`);
+  }
+  if (typeof process.getuid === 'function' && identity.uid !== String(process.getuid())) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} is not owned by the current user`);
+  }
+}
+
 export async function captureRootFilesystemIdentity(root: string): Promise<RootFilesystemIdentity> {
   const canonicalPath = canonicalizeExistingAuthorityPath(root, 'state root');
   const details = await stat(canonicalPath, { bigint: true });
   if (!details.isDirectory()) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootMissing, `state root is not a directory: ${canonicalPath}`);
   }
-  const device = details.dev.toString();
-  const inode = details.ino.toString();
-  return {
+  const identity: RootFilesystemIdentity = {
     schema_version: 1,
     platform: process.platform,
     canonical_path: canonicalPath,
-    device,
-    inode,
+    device: details.dev.toString(),
+    inode: details.ino.toString(),
     mode: details.mode.toString(),
+    uid: details.uid.toString(),
+    gid: details.gid.toString(),
     birthtime_ns: details.birthtimeNs.toString(),
     strong_identity: details.dev !== 0n && details.ino !== 0n,
   };
+  validateRootFilesystemIdentity(identity, 'state root');
+  return identity;
+}
+
+async function assertSecureAuthorityDirectoryCustody(directory: string, label: string): Promise<void> {
+  assertSecureStateRootCustody(await captureRootFilesystemIdentity(directory), label);
+}
+
+function assertSecureAuthorityDirectoryCustodySync(directory: string, label: string): void {
+  const canonicalPath = canonicalizeExistingAuthorityPath(directory, label);
+  const details = statSync(canonicalPath, { bigint: true });
+  if (!details.isDirectory()) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} must be a directory: ${canonicalPath}`);
+  }
+  const identity: RootFilesystemIdentity = {
+    schema_version: 1,
+    platform: process.platform,
+    canonical_path: canonicalPath,
+    device: details.dev.toString(),
+    inode: details.ino.toString(),
+    mode: details.mode.toString(),
+    uid: details.uid.toString(),
+    gid: details.gid.toString(),
+    birthtime_ns: details.birthtimeNs.toString(),
+    strong_identity: details.dev !== 0n && details.ino !== 0n,
+  };
+  validateRootFilesystemIdentity(identity, label);
+  assertSecureStateRootCustody(identity, label);
 }
 
 export function sameRootFilesystemIdentity(
   left: RootFilesystemIdentity,
   right: RootFilesystemIdentity,
 ): boolean {
+  try {
+    validateRootFilesystemIdentity(left, 'expected state root');
+    validateRootFilesystemIdentity(right, 'actual state root');
+  } catch {
+    return false;
+  }
   return left.schema_version === right.schema_version
     && left.platform === right.platform
     && left.canonical_path === right.canonical_path
     && left.device === right.device
     && left.inode === right.inode
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
     && (
       left.birthtime_ns === '0'
       || right.birthtime_ns === '0'
@@ -1972,17 +2130,45 @@ async function probeAuthorityMutationPrimitive(
   } catch {
     return unverified();
   } finally {
+    const cleanupFailures: unknown[] = [];
     if (directory && (temporaryCreated || finalPath)) {
+      let directoryCurrent = false;
       try {
         await assertOpenedAuthorityDirectoryCurrent(directory, 'state root');
-        if (temporaryCreated && temporaryPath) await unlink(temporaryPath).catch(() => undefined);
-        if (finalPath) await unlink(finalPath).catch(() => undefined);
-        await syncOpenedAuthorityDirectory(directory.handle);
-      } catch {
-        // The descriptor remains pinned, but a replaced path is not safe to mutate further.
+        directoryCurrent = true;
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+      if (directoryCurrent && temporaryCreated && temporaryPath) {
+        try {
+          await unlink(temporaryPath);
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
+        }
+      }
+      if (directoryCurrent && finalPath) {
+        try {
+          await unlink(finalPath);
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
+        }
+      }
+      if (directoryCurrent) {
+        try {
+          await syncOpenedAuthorityDirectory(directory.handle);
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
+        }
       }
     }
-    await directory?.handle?.close().catch(() => undefined);
+    try {
+      await directory?.handle?.close();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, 'authority filesystem capability probe cleanup was incomplete');
+    }
   }
 }
 
@@ -2009,6 +2195,53 @@ export async function probeStateAuthorityFilesystemCapability(
     strong_root_identity: identity.strong_identity ? 'verified' : 'unsupported',
     probed_at: nowIso(now),
   };
+}
+
+const STATE_AUTHORITY_CAPABILITY_STATUSES = new Set<StateAuthorityCapabilityStatus>([
+  'verified',
+  'unsupported',
+  'unverified',
+]);
+
+function validateStateAuthorityFilesystemCapability(
+  capability: StateAuthorityFilesystemCapability,
+  canonicalRoot: string,
+  label: string,
+): void {
+  const expectedRoot = assertPathInput(canonicalRoot, `${label} canonical root`);
+  if (!capability
+    || typeof capability !== 'object'
+    || capability.schema_version !== STATE_AUTHORITY_SCHEMA_VERSION
+    || capability.platform !== process.platform
+    || capability.canonical_path !== expectedRoot
+    || Number.isNaN(new Date(capability.probed_at).getTime())) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} has malformed filesystem capability evidence`);
+  }
+  for (const field of [
+    'exclusive_create',
+    'atomic_rename',
+    'file_sync',
+    'directory_sync',
+    'no_follow_directories',
+    'strong_root_identity',
+  ] as const) {
+    if (!STATE_AUTHORITY_CAPABILITY_STATUSES.has(capability[field])) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} has an invalid ${field} capability status`);
+    }
+  }
+  if (capability.revalidated_path_mutation !== undefined
+    && !STATE_AUTHORITY_CAPABILITY_STATUSES.has(capability.revalidated_path_mutation)) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} has an invalid revalidated_path_mutation capability status`);
+  }
+  const primitive = stateAuthorityFilesystemPrimitiveForPlatform(capability.platform);
+  if (primitive.descriptor_relative) {
+    if (capability.revalidated_path_mutation !== undefined) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} claims an inapplicable path-revalidation capability`);
+    }
+  } else if (capability.no_follow_directories !== 'unsupported'
+    || capability.revalidated_path_mutation === undefined) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} does not truthfully describe its path-mutation capability`);
+  }
 }
 
 function hasVerifiedAuthorityMutationSafety(capability: StateAuthorityFilesystemCapability): boolean {
@@ -2212,6 +2445,13 @@ function validatePendingAuthorityOperation(
   if (pending.source_generation_id) safeIdentifier(pending.source_generation_id, 'pending operation source generation ID');
   if (pending.source_authority_locator) nonEmptyString(pending.source_authority_locator, 'pending operation source authority locator', AUTHORITY_DIAGNOSTIC_CODES.anchorMalformed);
   if (pending.source_binding_locator) nonEmptyString(pending.source_binding_locator, 'pending operation source binding locator', AUTHORITY_DIAGNOSTIC_CODES.anchorMalformed);
+  if (pending.target_root_identity) {
+    validateRootFilesystemIdentity(pending.target_root_identity, 'pending operation target root');
+    const targetRoot = dirname(dirname(dirname(dirname(pending.generation_locator))));
+    if (pending.target_root_identity.canonical_path !== targetRoot) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'pending operation target root fingerprint does not match its target locator');
+    }
+  }
   if (pending.kind === 'generation_establish') {
     if (!pending.target_root_identity) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorMalformed, 'ordinary generation establishment pending operation is missing its target root fingerprint');
@@ -2247,6 +2487,12 @@ function validateStoredAlternateRootIntent(
     || Number.isNaN(new Date(intent.expires_at).getTime())) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorMalformed, 'workspace anchor alternate intent has invalid timestamps');
   }
+  validateRootFilesystemIdentity(intent.proposed_root_identity, 'workspace anchor alternate intent root');
+  validateStateAuthorityFilesystemCapability(
+    intent.proposed_root_capability,
+    intent.proposed_root_identity.canonical_path,
+    'workspace anchor alternate intent root',
+  );
   const carriesPreparationBoundaryEvidence = Boolean(
     intent.creation_boundary
     && intent.creation_root
@@ -2273,7 +2519,8 @@ export async function readWorkspaceAuthorityAnchor(
   workspace: WorkspaceIdentity,
 ): Promise<WorkspaceAuthorityAnchor | null> {
   assertWorkspaceIdentity(workspace);
-  const anchorPath = stateAuthorityPaths(workspace).anchor_path;
+  const paths = stateAuthorityPaths(workspace);
+  const anchorPath = paths.anchor_path;
   try {
     await lstat(anchorPath);
   } catch (error) {
@@ -2281,6 +2528,8 @@ export async function readWorkspaceAuthorityAnchor(
     throw error;
   }
   await assertPathHasNoSymlinkComponents(anchorPath, 'workspace authority anchor');
+  await assertSecureAuthorityDirectoryCustody(paths.omx_root, 'workspace authority bootstrap root');
+  await assertSecureAuthorityDirectoryCustody(paths.bootstrap_directory, 'workspace authority bootstrap directory');
 
   const anchor = await readAuthorityJson(anchorPath, AUTHORITY_DIAGNOSTIC_CODES.anchorMalformed) as WorkspaceAuthorityAnchor;
   validateWorkspaceAuthorityAnchor(anchor, workspace);
@@ -2294,7 +2543,8 @@ export async function readWorkspaceAuthorityAnchor(
  */
 function readWorkspaceAuthorityAnchorForChild(workspace: WorkspaceIdentity): WorkspaceAuthorityAnchor {
   assertWorkspaceIdentity(workspace);
-  const anchorPath = stateAuthorityPaths(workspace).anchor_path;
+  const paths = stateAuthorityPaths(workspace);
+  const anchorPath = paths.anchor_path;
   const noFollow = noFollowFileOpenFlags();
   if (noFollow === null) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, 'the runtime does not expose no-follow workspace anchor opens');
@@ -2308,6 +2558,8 @@ function readWorkspaceAuthorityAnchorForChild(workspace: WorkspaceIdentity): Wor
     if (canonicalizeExistingAuthorityPath(anchorPath, 'workspace authority anchor') !== anchorPath) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, 'workspace authority anchor has a symbolic-link component');
     }
+    assertSecureAuthorityDirectoryCustodySync(paths.omx_root, 'workspace authority bootstrap root');
+    assertSecureAuthorityDirectoryCustodySync(paths.bootstrap_directory, 'workspace authority bootstrap directory');
     descriptor = openSync(anchorPath, fsConstants.O_RDONLY | noFollow);
     const held = fstatSync(descriptor);
     if (held.dev !== before.dev || held.ino !== before.ino) {
@@ -2383,6 +2635,12 @@ export function createAlternateRootBootstrapIntent(
     input.proposed_state_root,
     'proposed alternate state root',
   );
+  validateRootFilesystemIdentity(input.proposed_root_identity, 'alternate root intent root');
+  validateStateAuthorityFilesystemCapability(
+    input.proposed_root_capability,
+    proposedStateRoot,
+    'alternate root intent root',
+  );
   if (input.proposed_root_identity.canonical_path !== proposedStateRoot
     || input.proposed_root_capability.canonical_path !== proposedStateRoot) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate root intent root evidence does not match its proposed root');
@@ -2426,6 +2684,12 @@ function createAlternateRootPreparationIntent(input: Omit<CreateAlternateRootInt
   const creationBoundary = canonicalizeExistingAuthorityPath(input.creation_boundary, 'alternate creation boundary');
   const creationRoot = canonicalizeAuthorityPathForCreation(input.creation_root, 'alternate creation root');
   const proposedStateRoot = canonicalizeAuthorityPathForCreation(input.proposed_state_root, 'proposed alternate state root');
+  validateRootFilesystemIdentity(input.creation_boundary_identity, 'alternate root preparation boundary');
+  validateStateAuthorityFilesystemCapability(
+    input.creation_boundary_capability,
+    creationBoundary,
+    'alternate root preparation boundary',
+  );
   if (!isAuthorityPathWithin(creationBoundary, creationRoot)
     || !isAuthorityPathWithin(creationRoot, proposedStateRoot)
     || input.creation_boundary_identity.canonical_path !== creationBoundary
@@ -2473,6 +2737,12 @@ function materializeAlternateRootBootstrapIntent(
     || rootCapability.canonical_path !== intent.proposed_state_root) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentConflict, 'alternate root preparation intent cannot be materialized with a different target root');
   }
+  validateRootFilesystemIdentity(rootIdentity, 'alternate root materialization root');
+  validateStateAuthorityFilesystemCapability(
+    rootCapability,
+    intent.proposed_state_root,
+    'alternate root materialization root',
+  );
   const revision = nextAnchorRevision(anchor, now, fencingToken);
   const intents = [...anchor.alternate_intents];
   intents[index] = {
@@ -2497,9 +2767,15 @@ export function validateAlternateRootBootstrapIntent(
     if (intent.intent_schema_version !== 1 || intent.authority_protocol_version !== 1) {
       return { valid: false, diagnostic: diagnostic(AUTHORITY_DIAGNOSTIC_CODES.intentIssuerMismatch, 'alternate root intent uses an unsupported protocol') };
     }
+    validateRootFilesystemIdentity(intent.proposed_root_identity, 'alternate root intent validation root');
     if (intent.status !== 'prepared') {
       return { valid: false, diagnostic: diagnostic(AUTHORITY_DIAGNOSTIC_CODES.intentReplay, `alternate root intent ${intent.intent_id} is already ${intent.status}`) };
     }
+    validateStateAuthorityFilesystemCapability(
+      intent.proposed_root_capability,
+      intent.proposed_state_root,
+      'alternate root intent validation root',
+    );
     if (new Date(intent.expires_at).getTime() <= now.getTime()) {
       return { valid: false, diagnostic: diagnostic(AUTHORITY_DIAGNOSTIC_CODES.intentExpired, `alternate root intent ${intent.intent_id} has expired`) };
     }
@@ -3829,6 +4105,16 @@ export function validateStateAuthorityGeneration(generation: StateAuthorityGener
   }
   safeIdentifier(generation.authority_id, 'authority ID');
   safeIdentifier(generation.generation_id, 'generation ID');
+  validateRootFilesystemIdentity(generation.root_identity, 'state authority generation root');
+  assertSecureStateRootCustody(generation.root_identity, 'state authority generation root');
+  if (generation.root_identity.canonical_path !== generation.canonical_state_root) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'state authority generation root identity does not match its canonical root');
+  }
+  validateStateAuthorityFilesystemCapability(
+    generation.root_capability,
+    generation.canonical_state_root,
+    'state authority generation root',
+  );
   assertWorkspaceIdentity(generation.workspace_identity);
   if (generation.workspace_identity_digest !== generation.workspace_identity.digest) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch, 'state authority generation workspace digest does not match');
@@ -4058,11 +4344,19 @@ async function hasSurvivingStateAuthorityProtocolEvidence(workspace: WorkspaceId
   }
 }
 
+const UNANCHORED_PRISTINE_RECOVERY_REASON = 'unanchored pristine authority preparation recovered before anchor publication';
+const UNANCHORED_PRE_JOURNAL_RETIREMENT_REASON = 'unanchored pre-journal authority directories retired before journal publication';
+
 interface UnanchoredPristinePreparation {
   state_root: string;
   root_identity: RootFilesystemIdentity;
-  journal_path: string;
-  journal: StateAuthorityOperationJournal;
+  prepared?: {
+    generation_id: string;
+    journal_path: string;
+    journal: StateAuthorityOperationJournal;
+  };
+  pre_journal_generation_id?: string;
+  retired_generation_ids: string[];
 }
 
 function assertUnanchoredPristineJournal(
@@ -4071,31 +4365,71 @@ function assertUnanchoredPristineJournal(
   stateRoot: string,
   generationId: string,
   journalPath: string,
-): void {
+): 'prepared' | 'retired' {
   const createdAt = new Date(journal.created_at);
   const updatedAt = new Date(journal.updated_at);
-  if (journal.kind !== 'generation_establish'
-    || journal.status !== 'prepared'
-    || journal.workspace_identity_digest !== workspace.digest
-    || journal.generation_id !== generationId
-    || journal.authority_id !== generationId
-    || journal.binding_revision !== 0
-    || journal.binding_id !== undefined
-    || journal.expected_anchor_revision !== 1
-    || journal.completed_steps.length !== 0
-    || journal.blocked_reason !== undefined
-    || Number.isNaN(createdAt.getTime())
-    || Number.isNaN(updatedAt.getTime())
-    || journal.created_at !== journal.updated_at
-    || journalPath !== authorityJournalPath(stateRoot, generationId, journal.operation_id)
-    || journal.effects_digest !== journalEffectsDigest({
+  const common = journal.kind === 'generation_establish'
+    && journal.workspace_identity_digest === workspace.digest
+    && journal.generation_id === generationId
+    && journal.authority_id === generationId
+    && journal.binding_revision === 0
+    && journal.binding_id === undefined
+    && journal.expected_anchor_revision === 1
+    && journal.completed_steps.length === 0
+    && !Number.isNaN(createdAt.getTime())
+    && !Number.isNaN(updatedAt.getTime())
+    && journalPath === authorityJournalPath(stateRoot, generationId, journal.operation_id)
+    && journal.effects_digest === journalEffectsDigest({
       workspace: workspace.digest,
       source_generation: 'none',
       target_generation: generationId,
       target_root: stateRoot,
-    })) {
+    });
+  if (!common) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority preparation journal is foreign, malformed, or no longer journal-first');
   }
+  if (journal.status === 'prepared'
+    && journal.blocked_reason === undefined
+    && journal.created_at === journal.updated_at) {
+    return 'prepared';
+  }
+  if (journal.status === 'aborted'
+    && (journal.blocked_reason === UNANCHORED_PRISTINE_RECOVERY_REASON
+      || journal.blocked_reason === UNANCHORED_PRE_JOURNAL_RETIREMENT_REASON)
+    && updatedAt >= createdAt) {
+    return 'retired';
+  }
+  authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority preparation journal has an unsafe recovery state');
+}
+
+function isPreAnchorCoordinationArtifact(name: string): boolean {
+  if ([
+    STATE_AUTHORITY_LOCK,
+    STATE_AUTHORITY_LOCK_TOMBSTONE_FILE,
+    STATE_AUTHORITY_LOCK_ACQUISITION_GUARD,
+    STATE_AUTHORITY_LOCK_ACQUISITION_RECLAIM_CLAIM,
+    STATE_AUTHORITY_LOCK_FENCE_COUNTER_FILE,
+  ].includes(name)) return true;
+  return /^\.\.state-authority\.lock(?:\.acquire(?:\.reclaim)?)?\.retiring-[0-9]+-[0-9]+-[0-9a-f]{64}(?:\.(?:complete|finishing(?:\.recovering)?))?$/.test(name);
+}
+
+async function hasOnlyPreAnchorCoordinationEvidence(workspace: WorkspaceIdentity): Promise<boolean> {
+  const bootstrapDirectory = stateAuthorityPaths(workspace).bootstrap_directory;
+  let entries: Dirent[];
+  try {
+    await assertPathHasNoSymlinkComponents(bootstrapDirectory, 'pre-anchor coordination directory');
+    entries = await readdir(bootstrapDirectory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  if (entries.length === 0) return false;
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile() || !isPreAnchorCoordinationArtifact(entry.name)) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'pre-anchor coordination evidence is foreign or malformed');
+    }
+  }
+  return true;
 }
 
 async function inspectUnanchoredPristinePreparation(
@@ -4124,42 +4458,108 @@ async function inspectUnanchoredPristinePreparation(
   const generationsDirectory = join(authorityDirectory, 'generations');
   await assertPathHasNoSymlinkComponents(generationsDirectory, 'unanchored pristine generation directory');
   const generations = await readdir(generationsDirectory, { withFileTypes: true });
-  if (generations.length !== 1 || generations[0]?.isSymbolicLink() || !generations[0]?.isDirectory()
-    || !SAFE_ID_PATTERN.test(generations[0].name)) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentAmbiguous, 'unanchored pristine authority evidence has no single safe generation');
+  const rootIdentity = await captureRootFilesystemIdentity(canonicalStateRoot);
+  let prepared: UnanchoredPristinePreparation['prepared'];
+  let preJournalGenerationId: string | undefined;
+  const retiredGenerationIds: string[] = [];
+  for (const generation of generations) {
+    if (generation.isSymbolicLink() || !generation.isDirectory() || !SAFE_ID_PATTERN.test(generation.name)) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentAmbiguous, 'unanchored pristine authority evidence has an unsafe generation');
+    }
+    const generationPaths = authorityGenerationPaths(canonicalStateRoot, generation.name);
+    await assertPathHasNoSymlinkComponents(generationPaths.generation_directory, 'unanchored pristine generation directory');
+    const generationEntries = await readdir(generationPaths.generation_directory, { withFileTypes: true });
+    const expectedGenerationDirectories = new Set(['bindings', STATE_AUTHORITY_JOURNAL_DIRECTORY]);
+    if (generationEntries.length !== expectedGenerationDirectories.size
+      || generationEntries.some((entry) => entry.isSymbolicLink() || !entry.isDirectory() || !expectedGenerationDirectories.has(entry.name))) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority generation contains effects before an anchor was published');
+    }
+    await assertPathHasNoSymlinkComponents(generationPaths.binding_directory, 'unanchored pristine binding directory');
+    if ((await readdir(generationPaths.binding_directory, { withFileTypes: true })).length !== 0) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority generation has binding effects before anchor publication');
+    }
+    await assertPathHasNoSymlinkComponents(generationPaths.journal_directory, 'unanchored pristine journal directory');
+    const journals = await readdir(generationPaths.journal_directory, { withFileTypes: true });
+    if (journals.length === 0) {
+      if (preJournalGenerationId || prepared) {
+        authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentAmbiguous, 'unanchored pristine authority evidence has multiple unresolved generations');
+      }
+      preJournalGenerationId = generation.name;
+      continue;
+    }
+    if (journals.length !== 1 || journals[0]?.isSymbolicLink() || !journals[0]?.isFile() || !journals[0].name.endsWith('.json')) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority generation has foreign journal effects before anchor publication');
+    }
+    const journalPath = join(generationPaths.journal_directory, journals[0].name);
+    const journal = await readStateAuthorityJournal(journalPath);
+    const status = assertUnanchoredPristineJournal(journal, workspace, canonicalStateRoot, generation.name, journalPath);
+    if (status === 'prepared') {
+      if (prepared || preJournalGenerationId) {
+        authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentAmbiguous, 'unanchored pristine authority evidence has multiple unresolved generations');
+      }
+      prepared = { generation_id: generation.name, journal_path: journalPath, journal };
+    } else {
+      retiredGenerationIds.push(generation.name);
+    }
   }
-  const generationId = generations[0].name;
-  const generationPaths = authorityGenerationPaths(canonicalStateRoot, generationId);
-  await assertPathHasNoSymlinkComponents(generationPaths.journal_directory, 'unanchored pristine journal directory');
-  const journals = await readdir(generationPaths.journal_directory, { withFileTypes: true });
-  if (journals.length !== 1 || journals[0]?.isSymbolicLink() || !journals[0]?.isFile() || !journals[0].name.endsWith('.json')) {
-    return null;
-  }
-  const journalPath = join(generationPaths.journal_directory, journals[0].name);
-  const journal = await readStateAuthorityJournal(journalPath);
-  if (
-    journal.status !== 'prepared' ||
-    journal.kind !== 'generation_establish'
-  ) {
-    return null;
-  }
-  const generationEntries = await readdir(generationPaths.generation_directory, { withFileTypes: true });
-  const expectedGenerationDirectories = new Set(['bindings', STATE_AUTHORITY_JOURNAL_DIRECTORY]);
-  if (generationEntries.length !== expectedGenerationDirectories.size
-    || generationEntries.some((entry) => entry.isSymbolicLink() || !entry.isDirectory() || !expectedGenerationDirectories.has(entry.name))) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority generation contains effects before an anchor was published');
-  }
-  await assertPathHasNoSymlinkComponents(generationPaths.binding_directory, 'unanchored pristine binding directory');
-  if ((await readdir(generationPaths.binding_directory, { withFileTypes: true })).length !== 0) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority generation has binding effects before anchor publication');
-  }
-  assertUnanchoredPristineJournal(journal, workspace, canonicalStateRoot, generationId, journalPath);
   return {
     state_root: canonicalStateRoot,
-    root_identity: await captureRootFilesystemIdentity(canonicalStateRoot),
-    journal_path: journalPath,
-    journal,
+    root_identity: rootIdentity,
+    ...(prepared ? { prepared } : {}),
+    ...(preJournalGenerationId ? { pre_journal_generation_id: preJournalGenerationId } : {}),
+    retired_generation_ids: retiredGenerationIds.sort(),
   };
+}
+
+function sameUnanchoredPristineInspection(
+  left: UnanchoredPristinePreparation,
+  right: UnanchoredPristinePreparation,
+): boolean {
+  return left.state_root === right.state_root
+    && sameRootFilesystemIdentity(left.root_identity, right.root_identity)
+    && left.prepared?.generation_id === right.prepared?.generation_id
+    && left.prepared?.journal_path === right.prepared?.journal_path
+    && left.prepared?.journal.operation_id === right.prepared?.journal.operation_id
+    && left.pre_journal_generation_id === right.pre_journal_generation_id
+    && left.retired_generation_ids.join(':') === right.retired_generation_ids.join(':');
+}
+
+async function retireUnanchoredPreJournalGeneration(
+  inspected: UnanchoredPristinePreparation,
+  workspace: WorkspaceIdentity,
+  lock: AcquiredStateAuthorityLock,
+  now: Date,
+): Promise<void> {
+  const generationId = inspected.pre_journal_generation_id;
+  if (!generationId) return;
+  const operationId = `pre-anchor-retire-${createHash('sha256').update(generationId, 'utf8').digest('hex').slice(0, 32)}`;
+  const journalPath = authorityJournalPath(inspected.state_root, generationId, operationId);
+  const journal = createStateAuthorityJournal({
+    operation_id: operationId,
+    kind: 'generation_establish',
+    authority_id: generationId,
+    generation_id: generationId,
+    binding_revision: 0,
+    workspace_identity_digest: workspace.digest,
+    expected_anchor_revision: 1,
+    fencing_token: lock.record.fencing_token,
+    effects_digest: journalEffectsDigest({
+      workspace: workspace.digest,
+      source_generation: 'none',
+      target_generation: generationId,
+      target_root: inspected.state_root,
+    }),
+    now,
+  });
+  await writeStateAuthorityJournal(
+    journalPath,
+    transitionStateAuthorityJournal(journal, 'aborted', {
+      blocked_reason: UNANCHORED_PRE_JOURNAL_RETIREMENT_REASON,
+      now,
+    }),
+    inspected.state_root,
+    inspected.root_identity,
+  );
 }
 
 async function recoverUnanchoredPristinePreparation(
@@ -4167,28 +4567,29 @@ async function recoverUnanchoredPristinePreparation(
   now: Date,
 ): Promise<boolean> {
   const inspected = await inspectUnanchoredPristinePreparation(workspace);
-  if (!inspected) return false;
+  const coordinationOnly = !inspected && await hasOnlyPreAnchorCoordinationEvidence(workspace);
+  if (!inspected && !coordinationOnly) return false;
   const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
   try {
     if (await readWorkspaceAuthorityAnchor(workspace)) return false;
+    if (!inspected) return true;
     const current = await inspectUnanchoredPristinePreparation(workspace);
-    if (!current
-      || current.journal_path !== inspected.journal_path
-      || current.journal.operation_id !== inspected.journal.operation_id) {
+    if (!current || !sameUnanchoredPristineInspection(inspected, current)) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority preparation changed during recovery');
     }
-    if (!sameRootFilesystemIdentity(inspected.root_identity, current.root_identity)) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'unanchored pristine authority root was replaced during recovery');
+    if (current.prepared) {
+      await writeStateAuthorityJournal(
+        current.prepared.journal_path,
+        transitionStateAuthorityJournal(current.prepared.journal, 'aborted', {
+          blocked_reason: UNANCHORED_PRISTINE_RECOVERY_REASON,
+          now,
+        }),
+        current.state_root,
+        current.root_identity,
+      );
+    } else if (current.pre_journal_generation_id) {
+      await retireUnanchoredPreJournalGeneration(current, workspace, lock, now);
     }
-    await writeStateAuthorityJournal(
-      current.journal_path,
-      transitionStateAuthorityJournal(current.journal, 'aborted', {
-        blocked_reason: 'unanchored pristine authority preparation recovered before anchor publication',
-        now,
-      }),
-      current.state_root,
-      current.root_identity,
-    );
     return true;
   } finally {
     await releaseWorkspaceAuthorityLock(lock);
@@ -4230,22 +4631,35 @@ function requestedBindingMatchesActive(
   requested: CreateSessionAuthorityBindingInput,
   active: SessionAuthorityBinding,
 ): boolean {
-  const activeIds = new Set([
-    active.canonical_session_id,
-    active.aliases.native_session_id,
-    ...active.aliases.current_session_aliases,
-    ...active.aliases.previous_session_aliases,
-    ...active.aliases.owner_session_aliases,
-  ].filter((value): value is string => typeof value === 'string' && value.trim() !== '').map((value) => value.trim()));
-  const requestedAliases = requested.aliases;
-  const requestedIds = [
-    requested.canonical_session_id,
-    requestedAliases?.native_session_id,
-    ...(requestedAliases?.current_session_aliases ?? []),
-    ...(requestedAliases?.previous_session_aliases ?? []),
-    ...(requestedAliases?.owner_session_aliases ?? []),
-  ].filter((value): value is string => typeof value === 'string' && value.trim() !== '').map((value) => value.trim());
-  return requestedIds.some((value) => activeIds.has(value));
+  const requestedAliases = normalizeAliases(requested.aliases);
+  const requestedNative = requestedAliases.native_session_id;
+  const aliasAlreadyBound = (alias: string): boolean =>
+    alias === active.canonical_session_id
+    || alias === active.aliases.native_session_id
+    || active.aliases.current_session_aliases.includes(alias)
+    || active.aliases.previous_session_aliases.includes(alias)
+    || active.aliases.owner_session_aliases.includes(alias);
+  const requestedAliasesAreAlreadyBound =
+    requestedAliases.current_session_aliases.every(aliasAlreadyBound)
+    && requestedAliases.previous_session_aliases.every(aliasAlreadyBound)
+    && requestedAliases.owner_session_aliases.every(aliasAlreadyBound);
+  const nativeAliasIsUnchanged = !requestedNative || requestedNative === active.aliases.native_session_id;
+  const initialNativeAliasIsSafe = !active.aliases.native_session_id
+    && Boolean(requestedNative)
+    && requestedAliases.current_session_aliases.every((alias) => alias === requestedNative || alias === active.canonical_session_id)
+    && requestedAliases.previous_session_aliases.length === 0
+    && requestedAliases.owner_session_aliases.every((alias) => alias === active.canonical_session_id);
+  if (requested.canonical_session_id === active.canonical_session_id
+    && ((nativeAliasIsUnchanged && requestedAliasesAreAlreadyBound) || initialNativeAliasIsSafe)) {
+    return true;
+  }
+  const ownerContinuity = requestedAliases.owner_session_aliases.some((alias) =>
+    alias === active.canonical_session_id || active.aliases.owner_session_aliases.includes(alias),
+  );
+  const previousNativeContinuity = requestedAliases.previous_session_aliases.some((alias) =>
+    active.aliases.native_session_id === alias,
+  );
+  return ownerContinuity && previousNativeContinuity;
 }
 
 function mergeSessionAliases(
@@ -4402,8 +4816,10 @@ function transportCapabilityMatchesActiveAuthority(
     && metadata.authority_id === active.generation.authority_id
     && metadata.generation_id === active.generation.generation_id
     && metadata.binding_id === active.binding.binding_id
-    && metadata.binding_revision <= active.binding.binding_revision
-    && metadata.lease_launch_id === lease?.launch_id;
+    && metadata.binding_revision === active.binding.binding_revision
+    && metadata.lease_launch_id === lease?.launch_id
+    && metadata.lease_owner_nonce === lease?.owner_nonce
+    && metadata.fencing_token === lease?.fencing_token;
 }
 
 /**
@@ -4431,7 +4847,8 @@ export async function mintStateAuthorityTransportCapability(
     if (context.workspace_identity.digest !== anchor.workspace_identity_digest
       || context.generation.authority_id !== active.generation.authority_id
       || context.generation.generation_id !== active.generation.generation_id
-      || context.session_binding?.binding_id !== active.binding.binding_id) {
+      || context.session_binding?.binding_id !== active.binding.binding_id
+      || context.session_binding?.binding_revision !== active.binding.binding_revision) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'cannot mint transport capability for a stale authority context');
     }
     const metadata: StateAuthorityTransportCapabilityMetadata = {
@@ -4488,7 +4905,7 @@ export async function validateStateAuthorityTransportCapability(
     || context.generation.authority_id !== active.generation.authority_id
     || context.generation.generation_id !== active.generation.generation_id
     || context.session_binding?.binding_id !== active.binding.binding_id
-    || (context.session_binding?.binding_revision ?? -1) < metadata.binding_revision) {
+    || context.session_binding?.binding_revision !== metadata.binding_revision) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'inherited state-authority transport capability does not match the active authority tuple');
   }
   if (new Date(metadata.expires_at).getTime() <= now.getTime()) {
@@ -4532,9 +4949,9 @@ export function stateAuthorityTransportCapabilityForChild(
       if (candidate.metadata.workspace_identity_digest === authority.workspace_identity.digest
         && candidate.metadata.generation_id === authority.generation.generation_id
         && candidate.metadata.binding_id === binding.binding_id
-        && candidate.metadata.binding_revision <= binding.binding_revision
-        && (!cached || candidate.metadata.binding_revision > cached.metadata.binding_revision)) {
+        && candidate.metadata.binding_revision === binding.binding_revision) {
         cached = candidate;
+        break;
       }
     }
     if (cached) stateAuthorityTransportCapabilityCache.set(key, cached);
@@ -4556,11 +4973,13 @@ export function stateAuthorityTransportCapabilityForChild(
       || metadata.authority_id !== authority.generation.authority_id
       || metadata.generation_id !== authority.generation.generation_id
       || metadata.binding_id !== binding.binding_id
-      || metadata.binding_revision > binding.binding_revision
+      || metadata.binding_revision !== binding.binding_revision
       || anchor.active_generation_id !== authority.generation.generation_id
       || anchor.active_lease?.generation_id !== authority.generation.generation_id
       || anchor.active_lease?.binding_id !== binding.binding_id
       || metadata.lease_launch_id !== anchor.active_lease?.launch_id
+      || metadata.lease_owner_nonce !== anchor.active_lease?.owner_nonce
+      || metadata.fencing_token !== anchor.active_lease?.fencing_token
       || metadata.capability_digest !== transportCapabilityDigest(cached.capability)
       || new Date(metadata.expires_at).getTime() <= now.getTime()) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'cached child transport capability no longer matches the active persisted authority metadata');
@@ -4659,11 +5078,13 @@ export async function initializeStateAuthority(
               authority_root: active.generation.canonical_state_root,
               expected_root_identity: active.generation.root_identity,
             });
-            // Alias-only binding revisions preserve a bearer whose binding tuple
-            // remains active; the fenced anchor revision records the update.
+            // Binding revisions rotate lease custody and revoke the prior transport bearer.
+            const rotatedTransportCapability = rotateLocallyHeldTransportCapabilityForBindingRevision(anchor, binding);
             await writeFencedWorkspaceAuthorityAnchor(
               workspace,
-              nextFencedAnchor(anchor, lock, now, {}),
+              nextFencedAnchor(anchor, lock, now, {
+                ...(rotatedTransportCapability ? { transport_capability: rotatedTransportCapability } : {}),
+              }),
               lock,
             );
           }
@@ -4731,6 +5152,7 @@ export async function initializeStateAuthority(
       if (!sameRootFilesystemIdentity(rootIdentity, await captureRootFilesystemIdentity(canonicalStateRoot))) {
         authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'state root was replaced while its authority capability was being established');
       }
+      assertSecureStateRootCustody(rootIdentity, 'state root');
       if (!rootIdentity.strong_identity
         || rootCapability.strong_root_identity !== 'verified'
         || !hasVerifiedAuthorityMutationSafety(rootCapability)) {
@@ -5004,9 +5426,31 @@ export async function resolveStateAuthority(
     }
     throw error;
   }
-  if (!anchor || !anchor.active_generation_id) {
+  if (!anchor) {
+    try {
+      if (await hasSurvivingStateAuthorityProtocolEvidence(workspace)) {
+        return {
+          diagnostics: [...diagnostics, diagnostic(
+            AUTHORITY_DIAGNOSTIC_CODES.resumeEvidenceMissing,
+            'workspace authority anchor is missing despite surviving generation, journal, tombstone, or bootstrap protocol evidence',
+          )],
+          can_mutate: false,
+        };
+      }
+    } catch (error) {
+      if (error instanceof StateAuthorityError) {
+        return { diagnostics: [...diagnostics, diagnostic(error.code, error.message)], can_mutate: false };
+      }
+      throw error;
+    }
     return {
-      diagnostics: [...diagnostics, diagnostic(AUTHORITY_DIAGNOSTIC_CODES.anchorMissing, 'no committed active authority exists for this workspace')],
+      diagnostics: [...diagnostics, diagnostic(AUTHORITY_DIAGNOSTIC_CODES.anchorMissing, 'no committed active authority exists for this pristine workspace')],
+      can_mutate: false,
+    };
+  }
+  if (!anchor.active_generation_id) {
+    return {
+      diagnostics: [...diagnostics, diagnostic(AUTHORITY_DIAGNOSTIC_CODES.authorityMissing, 'persisted workspace authority anchor has no active generation')],
       can_mutate: false,
     };
   }
@@ -5056,12 +5500,19 @@ export async function resolveStateAuthorityForGuard(
   input: ResolveStateAuthorityInput,
 ): Promise<ResolvedStateAuthorityContext> {
   const resolution = await resolveStateAuthority(input);
-  if (!resolution.context || !resolution.can_mutate) {
+  const context = resolution.context;
+  if (!context || !resolution.can_mutate) {
     const failure = resolution.diagnostics.find((entry) => entry.fatal)
       ?? diagnostic(AUTHORITY_DIAGNOSTIC_CODES.authorityMissing, 'no committed state authority is available');
     authorityError(failure.code, failure.message);
   }
-  return resolution.context;
+  if (!isObservedCwdCompatibleWithStateAuthority(context, context.observed_cwd)) {
+    authorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.observedCwdOutsideWorkspace,
+      'observed cwd is not compatible with the committed workspace authority for mutation',
+    );
+  }
+  return context;
 }
 
 export const resolveStateAuthorityForMutation = resolveStateAuthorityForGuard;
@@ -5102,12 +5553,6 @@ export async function readStateAuthorityEvidence(
   );
 }
 
-export async function migrateLegacyStateAuthority(): Promise<never> {
-  authorityError(
-    AUTHORITY_DIAGNOSTIC_CODES.ownerConfirmationRequired,
-    'legacy authority migration requires a separately implemented corroborated migration coordinator',
-  );
-}
 
 async function refreshStateAuthorityContext(
   context: ResolvedStateAuthorityContext,
@@ -5167,6 +5612,7 @@ export async function withStateAuthorityTransaction<T>(
     await refreshStateAuthorityContext(context);
     const { lock } = await acquireCurrentWorkspaceAuthorityLock(context.workspace_identity);
     let callbackFailed = false;
+    let callbackError: unknown;
     try {
       const anchor = await readWorkspaceAuthorityAnchor(context.workspace_identity);
       if (anchor?.pending_operation) {
@@ -5176,12 +5622,19 @@ export async function withStateAuthorityTransaction<T>(
       return await callback(refreshed, lock);
     } catch (error) {
       callbackFailed = true;
+      callbackError = error;
       throw error;
     } finally {
       try {
         await releaseWorkspaceAuthorityLock(lock);
       } catch (releaseError) {
-        if (!callbackFailed) throw releaseError;
+        if (callbackFailed) {
+          throw new AggregateError(
+            [callbackError, releaseError],
+            'state authority transaction callback and lock release both failed',
+          );
+        }
+        throw releaseError;
       }
     }
   });
@@ -5453,6 +5906,109 @@ export async function publishStateAuthorityLaunchTransport<T>(
   });
 }
 
+function rotateLocallyHeldTransportCapabilityForFence(
+  anchor: WorkspaceAuthorityAnchor,
+  lock: AcquiredStateAuthorityLock,
+): StateAuthorityTransportCapabilityMetadata | undefined {
+  const metadata = anchor.transport_capability;
+  if (!metadata || metadata.status !== 'active') return metadata;
+  if (metadata.lease_owner_nonce === lock.record.owner_nonce
+    && metadata.fencing_token === lock.record.fencing_token) return metadata;
+
+  const cached = [...stateAuthorityTransportCapabilityCache.values()].find((candidate) => (
+    candidate.metadata.workspace_identity_digest === metadata.workspace_identity_digest
+    && candidate.metadata.generation_id === metadata.generation_id
+    && candidate.metadata.binding_id === metadata.binding_id
+    && candidate.metadata.capability_digest === metadata.capability_digest
+    && transportCapabilityDigest(candidate.capability) === metadata.capability_digest
+  ));
+  if (!cached || new Date(metadata.expires_at).getTime() <= Date.now()) {
+    return {
+      ...metadata,
+      status: 'revoked',
+      revoked_at: anchor.updated_at,
+    };
+  }
+
+  const capability = randomBytes(32).toString('base64url');
+  const rotated: StateAuthorityTransportCapabilityMetadata = {
+    ...metadata,
+    status: 'active',
+    capability_digest: transportCapabilityDigest(capability),
+    lease_owner_nonce: lock.record.owner_nonce,
+    fencing_token: lock.record.fencing_token,
+    issued_at: anchor.updated_at,
+    revoked_at: undefined,
+  };
+  for (const [key, candidate] of stateAuthorityTransportCapabilityCache.entries()) {
+    if (candidate.metadata.workspace_identity_digest === metadata.workspace_identity_digest
+      && candidate.metadata.generation_id === metadata.generation_id
+      && candidate.metadata.binding_id === metadata.binding_id) {
+      stateAuthorityTransportCapabilityCache.delete(key);
+    }
+  }
+  stateAuthorityTransportCapabilityCache.set(
+    transportCapabilityCacheKey(
+      rotated.workspace_identity_digest,
+      rotated.generation_id,
+      rotated.binding_id,
+      rotated.binding_revision,
+    ),
+    { capability, metadata: rotated },
+  );
+  return rotated;
+}
+
+function rotateLocallyHeldTransportCapabilityForBindingRevision(
+  anchor: WorkspaceAuthorityAnchor,
+  binding: SessionAuthorityBinding,
+): StateAuthorityTransportCapabilityMetadata | undefined {
+  const metadata = anchor.transport_capability;
+  if (!metadata || metadata.binding_revision === binding.binding_revision) return metadata;
+  const cached = [...stateAuthorityTransportCapabilityCache.values()].find((candidate) => (
+    candidate.metadata.workspace_identity_digest === metadata.workspace_identity_digest
+    && candidate.metadata.generation_id === metadata.generation_id
+    && candidate.metadata.binding_id === binding.binding_id
+    && candidate.metadata.binding_revision === metadata.binding_revision
+    && candidate.metadata.capability_digest === metadata.capability_digest
+    && transportCapabilityDigest(candidate.capability) === metadata.capability_digest
+  ));
+  for (const [key, candidate] of stateAuthorityTransportCapabilityCache.entries()) {
+    if (candidate.metadata.workspace_identity_digest === metadata.workspace_identity_digest
+      && candidate.metadata.generation_id === metadata.generation_id
+      && candidate.metadata.binding_id === binding.binding_id) {
+      stateAuthorityTransportCapabilityCache.delete(key);
+    }
+  }
+  if (!cached || metadata.status !== 'active' || new Date(metadata.expires_at).getTime() <= Date.now()) {
+    return {
+      ...metadata,
+      binding_revision: binding.binding_revision,
+      status: 'revoked',
+      revoked_at: anchor.updated_at,
+    };
+  }
+  const capability = randomBytes(32).toString('base64url');
+  const rotated: StateAuthorityTransportCapabilityMetadata = {
+    ...metadata,
+    status: 'active',
+    capability_digest: transportCapabilityDigest(capability),
+    binding_revision: binding.binding_revision,
+    issued_at: anchor.updated_at,
+    revoked_at: undefined,
+  };
+  stateAuthorityTransportCapabilityCache.set(
+    transportCapabilityCacheKey(
+      rotated.workspace_identity_digest,
+      rotated.generation_id,
+      rotated.binding_id,
+      rotated.binding_revision,
+    ),
+    { capability, metadata: rotated },
+  );
+  return rotated;
+}
+
 function sealFencedAnchor(
   anchor: WorkspaceAuthorityAnchor,
   lock: AcquiredStateAuthorityLock,
@@ -5461,10 +6017,10 @@ function sealFencedAnchor(
     || anchor.fencing_token !== lock.record.fencing_token) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'authority anchor does not match the lock revision and fence');
   }
-  const transportCapability = anchor.transport_capability;
+  const sealedTransportCapability = rotateLocallyHeldTransportCapabilityForFence(anchor, lock);
   return {
     ...anchor,
-    ...(transportCapability ? { transport_capability: transportCapability } : {}),
+    ...(sealedTransportCapability ? { transport_capability: sealedTransportCapability } : {}),
     ...(anchor.active_lease ? {
       active_lease: {
         ...anchor.active_lease,
@@ -5916,7 +6472,18 @@ async function recoverPendingAlternateRootRolloverLocked(
           authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate-root rollover preparation boundary was replaced before recovery');
         }
         if (existsSync(intent.proposed_state_root)) {
-          authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate-root rollover target appeared before its preparation intent was materialized');
+          if (pending.target_root_identity) {
+            if (pending.target_root_identity.canonical_path !== intent.proposed_state_root) {
+              authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate-root rollover target custody does not match its preparation intent');
+            }
+            await assertPathHasNoSymlinkComponents(intent.proposed_state_root, 'alternate-root rollover custody recovery root');
+            const actualTarget = await captureRootFilesystemIdentity(intent.proposed_state_root);
+            if (!sameRootFilesystemIdentity(pending.target_root_identity, actualTarget)) {
+              authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate-root rollover custody target was replaced before intent materialization');
+            }
+          }
+        } else if (pending.target_root_identity) {
+          authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate-root rollover custody target disappeared before intent materialization');
         }
       } else if (intent.status === 'prepared' && existsSync(intent.proposed_state_root)) {
         await assertPathHasNoSymlinkComponents(intent.proposed_state_root, 'alternate-root rollover recovery root');
@@ -6023,6 +6590,30 @@ function injectRolloverFault(
   }
 }
 
+async function assertCurrentLeaseAuthorizesAlternateRollover(
+  anchor: WorkspaceAuthorityAnchor,
+  context: ResolvedStateAuthorityContext,
+): Promise<{ generation: StateAuthorityGeneration; authorityPath: string; binding: SessionAuthorityBinding }> {
+  const lease = anchor.active_lease;
+  if (!lease
+    || anchor.active_generation_id !== context.generation.generation_id
+    || lease.generation_id !== context.generation.generation_id
+    || !context.session_binding
+    || lease.binding_id !== context.session_binding.binding_id) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentIssuerMismatch, 'alternate-root rollover is not bound to the current active authority lease');
+  }
+  const active = await readActiveGeneration(anchor);
+  if (active.generation.generation_id !== context.generation.generation_id
+    || active.authorityPath !== context.authority_path
+    || active.generation.canonical_state_root !== context.canonical_state_root
+    || active.binding.binding_id !== lease.binding_id
+    || active.binding.binding_id !== context.session_binding.binding_id
+    || active.binding.lifecycle !== 'active') {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentIssuerMismatch, 'alternate-root rollover context does not prove the current active authority lease');
+  }
+  return active;
+}
+
 export async function rolloverStateAuthorityToAlternateRoot(
   input: RolloverStateAuthorityToAlternateRootInput,
 ): Promise<ResolvedStateAuthorityContext> {
@@ -6098,7 +6689,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
         if (!anchor || anchor.active_generation_id !== input.context.generation.generation_id) {
           authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'alternate authority rollover source is no longer active');
         }
-        const source = await readActiveGeneration(anchor);
+        const source = await assertCurrentLeaseAuthorizesAlternateRollover(anchor, input.context);
         const sourceValidation = await validateStateAuthority(source.generation, { workspace_identity: workspace });
         if (!sourceValidation.valid) {
           const failure = sourceValidation.diagnostics[0];
@@ -6107,7 +6698,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
         await abortUnanchoredPreparedRolloverJournals(anchor, source.generation, now);
         operationId = `alternate-rollover-${randomUUID()}`;
         targetGenerationId = randomUUID();
-        const targetFence = anchor.fencing_token + 4;
+        const targetFence = anchor.fencing_token + 5;
         targetBinding = createSessionAuthorityBinding({
           canonical_session_id: source.binding.canonical_session_id,
           aliases: source.binding.aliases,
@@ -6186,6 +6777,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     if (!anchor || anchor.active_generation_id !== input.context.generation.generation_id) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'alternate authority rollover source changed before alternate-root effects');
     }
+    await assertCurrentLeaseAuthorizesAlternateRollover(anchor, input.context);
     pending = assertAlternateRolloverPending(anchor, operationId);
     const journal = await readPendingRolloverJournal(pending);
     if (journal.status !== 'prepared') {
@@ -6199,6 +6791,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     if (!boundaryIdentity.strong_identity) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, 'alternate creation boundary lacks strong identity for preparation intent custody');
     }
+    const boundaryPrimitive = stateAuthorityFilesystemPrimitiveForPlatform();
     const boundaryCapability: StateAuthorityFilesystemCapability = {
       schema_version: 1,
       platform: process.platform,
@@ -6207,7 +6800,10 @@ export async function rolloverStateAuthorityToAlternateRoot(
       atomic_rename: 'unverified',
       file_sync: 'unverified',
       directory_sync: 'unverified',
-      no_follow_directories: 'unverified',
+      no_follow_directories: boundaryPrimitive.descriptor_relative ? 'unverified' : 'unsupported',
+      ...(boundaryPrimitive.descriptor_relative
+        ? {}
+        : { revalidated_path_mutation: 'unverified' as const }),
       strong_root_identity: 'verified',
       probed_at: nowIso(now),
     };
@@ -6253,6 +6849,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     if (!sameRootFilesystemIdentity(targetRootIdentity, await captureRootFilesystemIdentity(canonicalStateRoot))) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate state root was replaced while its authority capability was being established');
     }
+    assertSecureStateRootCustody(targetRootIdentity, 'alternate state root');
     if (!targetRootIdentity.strong_identity
       || targetRootCapability.strong_root_identity !== 'verified'
       || !hasVerifiedAuthorityMutationSafety(targetRootCapability)) {
@@ -6262,12 +6859,42 @@ export async function rolloverStateAuthorityToAlternateRoot(
     await releaseWorkspaceAuthorityLock(applyLock.lock);
   }
 
+  const custodyLock = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
+  try {
+    const anchor = await readWorkspaceAuthorityAnchor(workspace);
+    if (!anchor || anchor.active_generation_id !== input.context.generation.generation_id) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'alternate authority rollover source changed before target-root custody publication');
+    }
+    await assertCurrentLeaseAuthorizesAlternateRollover(anchor, input.context);
+    pending = assertAlternateRolloverPending(anchor, operationId);
+    const journal = await readPendingRolloverJournal(pending);
+    if (journal.status !== 'applying' || !pending.intent_id) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'alternate-root rollover lost its applying journal or preparation intent before target-root custody publication');
+    }
+    const preparingIntent = anchor.alternate_intents.find((entry) => entry.intent_id === pending.intent_id);
+    if (!preparingIntent || preparingIntent.status !== 'preparing') {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentConflict, 'alternate-root rollover preparation intent is not available for target-root custody publication');
+    }
+    const actualTargetRoot = await captureRootFilesystemIdentity(canonicalStateRoot);
+    if (!sameRootFilesystemIdentity(targetRootIdentity, actualTargetRoot)) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate state root was replaced before its custody could be published');
+    }
+    const custodyAnchor = nextFencedAnchor(anchor, custodyLock.lock, now, {
+      pending_operation: { ...pending, target_root_identity: targetRootIdentity },
+    });
+    await writeFencedWorkspaceAuthorityAnchor(workspace, custodyAnchor, custodyLock.lock);
+    pending = custodyAnchor.pending_operation!;
+  } finally {
+    await releaseWorkspaceAuthorityLock(custodyLock.lock);
+  }
+
   const materializeLock = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
   try {
     const anchor = await readWorkspaceAuthorityAnchor(workspace);
     if (!anchor || anchor.active_generation_id !== input.context.generation.generation_id) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'alternate authority rollover source changed before target authority publication');
     }
+    await assertCurrentLeaseAuthorizesAlternateRollover(anchor, input.context);
     pending = assertAlternateRolloverPending(anchor, operationId);
     const journal = await readPendingRolloverJournal(pending);
     if (journal.status !== 'applying' || !pending.intent_id) {
@@ -6277,8 +6904,12 @@ export async function rolloverStateAuthorityToAlternateRoot(
     if (!preparingIntent || preparingIntent.status !== 'preparing') {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.intentConflict, 'alternate-root rollover preparation intent is not available for target authority publication');
     }
+    if (!pending.target_root_identity) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalMalformed, 'alternate-root rollover target root custody is missing before intent materialization');
+    }
     const actualTargetRoot = await captureRootFilesystemIdentity(canonicalStateRoot);
-    if (!sameRootFilesystemIdentity(actualTargetRoot, targetRootIdentity)) {
+    if (!sameRootFilesystemIdentity(actualTargetRoot, targetRootIdentity)
+      || !sameRootFilesystemIdentity(actualTargetRoot, pending.target_root_identity)) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'alternate state root was replaced before its preparation intent could be materialized');
     }
     const materializedAnchor = sealFencedAnchor({
@@ -6334,6 +6965,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     if (!anchor || anchor.active_generation_id !== input.context.generation.generation_id) {
       authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'alternate authority rollover source changed before commit');
     }
+    await assertCurrentLeaseAuthorizesAlternateRollover(anchor, input.context);
     pending = assertAlternateRolloverPending(anchor, operationId);
     const journal = await readPendingRolloverJournal(pending);
     if (journal.status !== 'applying' || !pending.intent_id || !pending.binding_locator) {
@@ -6395,7 +7027,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
         binding_id: persistedBinding.binding_id,
         acquired_at: nowIso(now),
         owner_nonce: switchLock.lock.record.owner_nonce,
-        fencing_token: consumedAnchor.fencing_token,
+        fencing_token: switchLock.lock.record.fencing_token,
       },
     }, switchLock.lock);
     await writeFencedWorkspaceAuthorityAnchor(workspace, switched, switchLock.lock);

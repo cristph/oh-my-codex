@@ -149,8 +149,18 @@ export function readWorkspaceStatusLines(cwd: string): string[] {
     .filter(Boolean);
 }
 
+function isRepoLocalOmxPath(path: string): boolean {
+  return path === '.omx' || path.startsWith('.omx/');
+}
+
+function isUntrackedRepoLocalOmxRuntimeArtifactStatusLine(line: string): boolean {
+  return line.startsWith('?? ') && isRepoLocalOmxPath(line.slice(3));
+}
+
 export function assertCleanLeaderWorkspaceForWorkerWorktrees(cwd: string): void {
-  const lines = readWorkspaceStatusLines(cwd);
+  const lines = readWorkspaceStatusLines(cwd).filter(
+    (line) => !isUntrackedRepoLocalOmxRuntimeArtifactStatusLine(line),
+  );
   if (lines.length === 0) return;
   const preview = lines.slice(0, 8).join(' | ');
   throw new Error(

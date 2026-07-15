@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import {
   readActiveWorkflowModes,
 } from '../workflow-transition.js';
 import { reconcileWorkflowTransition } from '../workflow-transition-reconcile.js';
+import { captureRootFilesystemIdentity, initializeStateAuthority } from '../authority.js';
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -177,6 +178,22 @@ describe('workflow transition rules', () => {
         const sessionDir = join(stateDir, 'sessions', 'sess-current');
         const rootRalphPath = join(stateDir, 'ralph-state.json');
         await mkdir(sessionDir, { recursive: true });
+        await Promise.all([
+          chmod(join(wd, '.omx'), 0o700),
+          chmod(stateDir, 0o700),
+          chmod(sessionDir, 0o700),
+        ]);
+        const authority = await initializeStateAuthority({
+          startup_cwd: wd,
+          observed_cwd: wd,
+          launch_id: 'workflow-reconcile-stale-root',
+          session_binding: { canonical_session_id: 'sess-current' },
+        });
+        await Promise.all([
+          chmod(join(wd, '.omx'), 0o700),
+          chmod(stateDir, 0o700),
+          chmod(join(stateDir, 'authority'), 0o700),
+        ]);
         await writeFile(
           rootRalphPath,
           JSON.stringify({ active: true, mode: 'ralph', current_phase: 'executing' }, null, 2),
@@ -187,6 +204,7 @@ describe('workflow transition rules', () => {
           action: 'start',
           sessionId: 'sess-current',
           source: 'test',
+          expectedRootIdentity: authority.generation.root_identity,
         });
 
         assert.equal(transition.decision.allowed, true);
@@ -210,6 +228,22 @@ describe('workflow transition rules', () => {
         const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
         const staleRalplanPath = join(sessionDir, 'ralplan-state.json');
         await mkdir(sessionDir, { recursive: true });
+        await Promise.all([
+          chmod(join(wd, '.omx'), 0o700),
+          chmod(join(wd, '.omx', 'state'), 0o700),
+          chmod(sessionDir, 0o700),
+        ]);
+        const authority = await initializeStateAuthority({
+          startup_cwd: wd,
+          observed_cwd: wd,
+          launch_id: 'workflow-reconcile-detail-only',
+          session_binding: { canonical_session_id: sessionId },
+        });
+        await Promise.all([
+          chmod(join(wd, '.omx'), 0o700),
+          chmod(join(wd, '.omx', 'state'), 0o700),
+          chmod(join(wd, '.omx', 'state', 'authority'), 0o700),
+        ]);
         await writeFile(
           staleRalplanPath,
           JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'review' }, null, 2),
@@ -220,6 +254,7 @@ describe('workflow transition rules', () => {
           action: 'start',
           sessionId,
           source: 'test',
+          expectedRootIdentity: authority.generation.root_identity,
         });
 
         assert.equal(transition.decision.allowed, true);
@@ -242,6 +277,9 @@ describe('workflow transition rules', () => {
       const sessionId = 'sess-transition-base-dir';
       const sessionDir = join(baseStateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
+      await chmod(baseStateDir, 0o700);
+      await chmod(join(baseStateDir, 'sessions'), 0o700);
+      await chmod(sessionDir, 0o700);
       await writeFile(
         join(sessionDir, 'deep-interview-state.json'),
         JSON.stringify({
@@ -282,11 +320,26 @@ describe('workflow transition rules', () => {
         'utf-8',
       );
 
+      await assert.rejects(
+        reconcileWorkflowTransition(wd, 'ralplan', {
+          action: 'start',
+          sessionId,
+          source: 'test',
+          baseStateDir,
+        }),
+        /requires the persisted active state-root identity/,
+      );
+      assert.equal(
+        (JSON.parse(await readFile(join(sessionDir, 'deep-interview-state.json'), 'utf-8')) as { active?: unknown }).active,
+        true,
+      );
+      const expectedRootIdentity = await captureRootFilesystemIdentity(baseStateDir);
       const transition = await reconcileWorkflowTransition(wd, 'ralplan', {
         action: 'start',
         sessionId,
         source: 'test',
         baseStateDir,
+        expectedRootIdentity,
       });
 
       const boxedModePath = join(sessionDir, 'deep-interview-state.json');

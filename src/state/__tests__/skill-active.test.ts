@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,11 +11,27 @@ import {
   syncCanonicalSkillStateForMode,
   writeSkillActiveStateCopies,
 } from '../skill-active.js';
+import { captureRootFilesystemIdentity, initializeStateAuthority, type RootFilesystemIdentity } from '../authority.js';
 
-async function withTempRepo(prefix: string, run: (cwd: string) => Promise<void>): Promise<void> {
+async function withTempRepo(
+  prefix: string,
+  run: (cwd: string, expectedRootIdentity: RootFilesystemIdentity) => Promise<void>,
+): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), prefix));
   try {
-    await run(cwd);
+    await mkdir(join(cwd, '.omx', 'state', 'authority'), { recursive: true });
+    await Promise.all([
+      chmod(join(cwd, '.omx'), 0o700),
+      chmod(join(cwd, '.omx', 'state'), 0o700),
+      chmod(join(cwd, '.omx', 'state', 'authority'), 0o700),
+    ]);
+    const authority = await initializeStateAuthority({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      launch_id: `${prefix}-${Date.now()}`,
+      session_binding: { canonical_session_id: 'fixture-session' },
+    });
+    await run(cwd, authority.generation.root_identity);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -46,21 +62,21 @@ async function withStateRootEnv<T>(env: Partial<Record<'OMX_ROOT' | 'OMX_STATE_R
 
 describe('skill-active state helpers', () => {
   it('prefers session-scoped canonical state over root state', async () => {
-    await withTempRepo('omx-skill-active-session-', async (cwd) => {
+    await withTempRepo('omx-skill-active-session-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: true,
         skill: 'ralph',
         phase: 'executing',
         active_skills: [{ skill: 'ralph', phase: 'executing', active: true }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
       await writeSkillActiveStateCopies(cwd, {
         active: true,
         skill: 'team',
         phase: 'running',
         session_id: 'sess-1',
         active_skills: [{ skill: 'team', phase: 'running', active: true, session_id: 'sess-1' }],
-      }, 'sess-1');
+      }, 'sess-1', undefined, expectedRootIdentity);
 
       const state = await readVisibleSkillActiveState(cwd, 'sess-1');
       assert.ok(state);
@@ -74,13 +90,47 @@ describe('skill-active state helpers', () => {
     });
   });
 
-  it('uses OMX_TEAM_STATE_ROOT for default canonical sync without creating cwd .omx', async () => {
+  it('does not recapture a replacement canonical root when an expected authority identity is supplied', async () => {
+    await withTempRepo('omx-skill-active-root-identity-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const rootPath = join(stateRoot, 'skill-active-state.json');
+      await mkdir(stateRoot, { recursive: true });
+      const expectedRootIdentity = await captureRootFilesystemIdentity(stateRoot);
+      await rm(stateRoot, { recursive: true, force: true });
+      await Promise.all(Array.from({ length: 16 }, (_, index) => mkdir(join(cwd, `.identity-keeper-${index}`))));
+      await mkdir(stateRoot, { recursive: true });
+      await writeFile(rootPath, JSON.stringify({ active: true, skill: 'replacement' }));
+
+      await assert.rejects(
+        writeSkillActiveStateCopies(
+          cwd,
+          { active: true, skill: 'ralph', phase: 'executing' },
+          undefined,
+          undefined,
+          expectedRootIdentity,
+        ),
+        /persisted active state-root identity/,
+      );
+      assert.equal(
+        (JSON.parse(await readFile(rootPath, 'utf-8')) as { skill?: string }).skill,
+        'replacement',
+      );
+    });
+  });
+
+  it('does not let OMX_TEAM_STATE_ROOT rebind committed canonical sync state', async () => {
     await withTempRepo('omx-skill-active-team-root-', async (root) => {
       const cwd = join(root, 'workspace');
       const teamStateRoot = join(root, 'team-state');
       await mkdir(cwd, { recursive: true });
 
       await withStateRootEnv({ OMX_TEAM_STATE_ROOT: teamStateRoot }, async () => {
+        const authority = await initializeStateAuthority({
+          startup_cwd: cwd,
+          observed_cwd: cwd,
+          launch_id: 'skill-active-team-root',
+          session_binding: { canonical_session_id: 'sess-team' },
+        });
         await syncCanonicalSkillStateForMode({
           cwd,
           mode: 'ralph',
@@ -88,23 +138,24 @@ describe('skill-active state helpers', () => {
           currentPhase: 'executing',
           sessionId: 'sess-team',
           nowIso: '2026-07-05T00:00:00.000Z',
+          expectedRootIdentity: authority.generation.root_identity,
         });
       });
 
       const sessionState = JSON.parse(
-        await readFile(join(teamStateRoot, 'sessions', 'sess-team', 'skill-active-state.json'), 'utf-8'),
+        await readFile(join(cwd, '.omx', 'state', 'sessions', 'sess-team', 'skill-active-state.json'), 'utf-8'),
       ) as { active?: boolean; skill?: string; active_skills?: Array<{ skill: string; session_id?: string }> };
       assert.equal(sessionState.active, true);
       assert.equal(sessionState.skill, 'ralph');
       assert.deepEqual(sessionState.active_skills?.map(({ skill, session_id }) => ({ skill, session_id })), [
         { skill: 'ralph', session_id: 'sess-team' },
       ]);
-      assert.equal(existsSync(join(cwd, '.omx')), false);
+      assert.equal(existsSync(join(teamStateRoot, 'sessions', 'sess-team', 'skill-active-state.json')), false);
     });
   });
 
   it('keeps stale root entries from other sessions out of current session state', async () => {
-    await withTempRepo('omx-skill-active-filter-', async (cwd) => {
+    await withTempRepo('omx-skill-active-filter-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: true,
@@ -112,7 +163,7 @@ describe('skill-active state helpers', () => {
         phase: 'intent-first',
         session_id: 'old-session',
         active_skills: [{ skill: 'deep-interview', phase: 'intent-first', active: true, session_id: 'old-session' }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
 
       await syncCanonicalSkillStateForMode({
         cwd,
@@ -121,6 +172,7 @@ describe('skill-active state helpers', () => {
         currentPhase: 'executing',
         sessionId: 'new-session',
         nowIso: '2026-04-08T00:00:00.000Z',
+        expectedRootIdentity,
       });
 
       const sessionState = await readVisibleSkillActiveState(cwd, 'new-session');
@@ -147,14 +199,14 @@ describe('skill-active state helpers', () => {
   });
 
   it('keeps root-scoped team state isolated when session-scoped ralph is activated', async () => {
-    await withTempRepo('omx-skill-active-team-ralph-', async (cwd) => {
+    await withTempRepo('omx-skill-active-team-ralph-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: true,
         skill: 'team',
         phase: 'running',
         active_skills: [{ skill: 'team', phase: 'running', active: true }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
 
       await syncCanonicalSkillStateForMode({
         cwd,
@@ -163,6 +215,7 @@ describe('skill-active state helpers', () => {
         currentPhase: 'executing',
         sessionId: 'sess-overlap',
         nowIso: '2026-04-09T00:00:00.000Z',
+        expectedRootIdentity,
       });
 
       const rootState = JSON.parse(
@@ -191,7 +244,7 @@ describe('skill-active state helpers', () => {
   });
 
   it('does not carry stale Ralph initialization fields from another session into current session state', async () => {
-    await withTempRepo('omx-skill-active-stale-init-', async (cwd) => {
+    await withTempRepo('omx-skill-active-stale-init-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: true,
@@ -203,7 +256,7 @@ describe('skill-active state helpers', () => {
         task_slug: 'old-ralph-task',
         context_snapshot_path: '.omx/context/old.md',
         active_skills: [{ skill: 'ralph', phase: 'verifying', active: true, session_id: 'old-session' }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
 
       await syncCanonicalSkillStateForMode({
         cwd,
@@ -212,6 +265,7 @@ describe('skill-active state helpers', () => {
         currentPhase: 'executing',
         sessionId: 'new-session',
         nowIso: '2026-05-03T00:00:00.000Z',
+        expectedRootIdentity,
       });
 
       const sessionState = await readVisibleSkillActiveState(cwd, 'new-session') as Record<string, unknown> | null;
@@ -310,7 +364,7 @@ describe('skill-active state helpers', () => {
   });
 
   it('clears stale terminal markers when a workflow is reactivated', async () => {
-    await withTempRepo('omx-skill-active-reactivate-terminal-', async (cwd) => {
+    await withTempRepo('omx-skill-active-reactivate-terminal-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: false,
@@ -322,7 +376,7 @@ describe('skill-active state helpers', () => {
         lifecycle_outcome: 'complete',
         session_id: 'sess-reactivate',
         active_skills: [{ skill: 'autopilot', phase: 'complete', active: true, session_id: 'sess-reactivate' }],
-      }, 'sess-reactivate');
+      }, 'sess-reactivate', undefined, expectedRootIdentity);
 
       await syncCanonicalSkillStateForMode({
         cwd,
@@ -330,6 +384,7 @@ describe('skill-active state helpers', () => {
         active: true,
         sessionId: 'sess-reactivate',
         nowIso: '2026-06-09T00:01:00.000Z',
+        expectedRootIdentity,
       });
 
       const sessionState = await readVisibleSkillActiveState(cwd, 'sess-reactivate');
@@ -374,14 +429,14 @@ describe('skill-active state helpers', () => {
   });
 
   it('clears only the matching terminal session entry and preserves unrelated active skills', async () => {
-    await withTempRepo('omx-skill-active-terminal-clear-', async (cwd) => {
+    await withTempRepo('omx-skill-active-terminal-clear-', async (cwd, expectedRootIdentity) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
       await writeSkillActiveStateCopies(cwd, {
         active: true,
         skill: 'custom-skill',
         phase: 'running',
         active_skills: [{ skill: 'custom-skill', phase: 'running', active: true }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
       await syncCanonicalSkillStateForMode({
         cwd,
         mode: 'ralplan',
@@ -389,6 +444,7 @@ describe('skill-active state helpers', () => {
         currentPhase: 'planning',
         sessionId: 'sess-terminal',
         nowIso: '2026-05-01T00:00:00.000Z',
+        expectedRootIdentity,
       });
 
       await syncCanonicalSkillStateForMode({
@@ -398,6 +454,7 @@ describe('skill-active state helpers', () => {
         currentPhase: 'complete',
         sessionId: 'sess-terminal',
         nowIso: '2026-05-01T00:01:00.000Z',
+        expectedRootIdentity,
       });
 
       const sessionState = await readVisibleSkillActiveState(cwd, 'sess-terminal');
@@ -420,7 +477,7 @@ describe('skill-active state helpers', () => {
     });
   });
   it('rejects symlinked canonical files and session entries without external writes', async () => {
-    await withTempRepo('omx-skill-active-symlink-', async (cwd) => {
+    await withTempRepo('omx-skill-active-symlink-', async (cwd, expectedRootIdentity) => {
       const stateDir = join(cwd, '.omx', 'state');
       const rootPath = join(stateDir, 'skill-active-state.json');
       const sessionsDir = join(stateDir, 'sessions');
@@ -432,13 +489,13 @@ describe('skill-active state helpers', () => {
         active: true,
         skill: 'team',
         active_skills: [{ skill: 'team', active: true }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
       await writeFile(outsideFile, 'outside canonical skill state must remain unchanged\n');
       await rm(rootPath);
       await symlink(outsideFile, rootPath, 'file');
 
       await assert.rejects(
-        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true }),
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, expectedRootIdentity }),
         /symbolic link/,
       );
       assert.equal(await readFile(outsideFile, 'utf-8'), 'outside canonical skill state must remain unchanged\n');
@@ -448,18 +505,18 @@ describe('skill-active state helpers', () => {
         active: true,
         skill: 'team',
         active_skills: [{ skill: 'team', active: true }],
-      });
+      }, undefined, undefined, expectedRootIdentity);
       await mkdir(outsideDir, { recursive: true });
       await mkdir(sessionsDir, { recursive: true });
       await symlink(outsideDir, sessionDir, process.platform === 'win32' ? 'junction' : 'dir');
       const rootBeforeAllSessions = await readFile(rootPath, 'utf-8');
 
       await assert.rejects(
-        syncCanonicalSkillStateForMode({ cwd, mode: 'team', active: false, allSessions: true }),
+        syncCanonicalSkillStateForMode({ cwd, mode: 'team', active: false, allSessions: true, expectedRootIdentity }),
         /symbolic link/,
       );
       await assert.rejects(
-        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId }),
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId, expectedRootIdentity }),
         /symbolic link/,
       );
       assert.equal(await readFile(rootPath, 'utf-8'), rootBeforeAllSessions);
@@ -469,7 +526,7 @@ describe('skill-active state helpers', () => {
       await rm(sessionsDir, { recursive: true });
       await symlink(outsideDir, sessionsDir, process.platform === 'win32' ? 'junction' : 'dir');
       await assert.rejects(
-        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId }),
+        syncCanonicalSkillStateForMode({ cwd, mode: 'ralph', active: true, sessionId, expectedRootIdentity }),
         /symbolic link/,
       );
       assert.equal(existsSync(join(outsideDir, 'skill-active-state.json')), false);

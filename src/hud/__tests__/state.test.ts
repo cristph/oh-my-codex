@@ -25,9 +25,9 @@ import {
   initializeStateAuthority,
   rolloverStateAuthorityToAlternateRoot,
   mintStateAuthorityTransportCapability,
-  stateAuthorityTransportCapabilityForChild,
   type ResolvedStateAuthorityContext,
 } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 function gitRunnerFromMap(map: Record<string, string | Error>) {
   return (_cwd: string, args: string[]) => {
@@ -103,19 +103,7 @@ const TEST_AUTHORITY_ISSUER = {
 };
 
 function authorityTransport(authority: ResolvedStateAuthorityContext): NodeJS.ProcessEnv {
-  const root = dirname(authority.generation.canonical_omx_root);
-  return {
-    OMX_STARTUP_CWD: authority.workspace_identity.canonical_path,
-    OMX_ROOT: root,
-    OMX_STATE_ROOT: root,
-    OMX_TEAM_STATE_ROOT: authority.canonical_state_root,
-    OMX_STATE_AUTHORITY_PATH: authority.authority_path,
-    OMX_STATE_AUTHORITY_ID: authority.generation.authority_id,
-    OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
-    OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: authority.workspace_identity.digest,
-    OMX_STATE_AUTHORITY_CAPABILITY: stateAuthorityTransportCapabilityForChild(authority),
-    OMX_SESSION_ID: authority.session_binding?.canonical_session_id,
-  };
+  return buildStateAuthorityTransportEnv(authority, {});
 }
 
 async function createAlternateAuthority(
@@ -123,14 +111,12 @@ async function createAlternateAuthority(
   alternateStateRoot: string,
   launchId: string,
 ): Promise<{
-  initial: ResolvedStateAuthorityContext;
   active: ResolvedStateAuthorityContext;
   initialTransport: NodeJS.ProcessEnv;
   activeTransport: NodeJS.ProcessEnv;
 }> {
   const initial = await initializeStateAuthority({
     startup_cwd: workspace,
-    observed_cwd: workspace,
     launch_id: `${launchId}-source`,
     session_binding: { canonical_session_id: `${launchId}-session` },
   });
@@ -146,7 +132,7 @@ async function createAlternateAuthority(
     issuer: TEST_AUTHORITY_ISSUER,
   });
   await mintStateAuthorityTransportCapability(active);
-  return { initial, active, initialTransport, activeTransport: authorityTransport(active) };
+  return { active, initialTransport, activeTransport: authorityTransport(active) };
 }
 
 describe('readGitBranch', () => {
@@ -795,6 +781,19 @@ describe('additional HUD mode state readers', () => {
       }
     });
   });
+
+  it('rejects unsafe legacy session IDs before building session paths', async () => {
+    await withTempRepo('omx-hud-unsafe-legacy-session-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      await mkdir(join(rootStateDir, 'escaped'), { recursive: true });
+      await writeFile(join(rootStateDir, 'escaped', 'hud-state.json'), JSON.stringify({ last_turn_at: 'escaped', turn_count: 99 }));
+
+      const scope = await resolveHudAuthorityReadScope(cwd, undefined, { OMX_SESSION_ID: '../escaped' });
+
+      assert.equal(scope.sessionId, undefined);
+      assert.equal(await readHudNotifyState(cwd, scope), null);
+    });
+  });
 });
 
 describe('readAllState canonical skill precedence', () => {
@@ -819,6 +818,28 @@ describe('readAllState canonical skill precedence', () => {
       }));
 
       const state = await readAllState(cwd);
+      assert.equal(state.ralph, null);
+    });
+  });
+
+  it('does not revive detail state when a validated authority lacks canonical skill state', async () => {
+    await withTempRepo('omx-hud-validated-no-skill-state-', async (cwd) => {
+      const authority = await initializeStateAuthority({
+        startup_cwd: cwd,
+        launch_id: 'hud-no-skill-state',
+        session_binding: { canonical_session_id: 'sess-no-skill-state' },
+      });
+      const sessionDir = join(authority.canonical_state_root, 'sessions', 'sess-no-skill-state');
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(sessionDir, 'ralph-state.json'), JSON.stringify({
+        active: true,
+        iteration: 3,
+        current_phase: 'executing',
+      }));
+
+      const state = await readAllState(cwd, undefined, authority);
+
+      assert.equal(state.authority?.status, 'validated');
       assert.equal(state.ralph, null);
     });
   });
@@ -885,6 +906,33 @@ describe('readAllState canonical skill precedence', () => {
 
       const state = await readAllState(cwd);
       assert.deepEqual(state.team, { active: true, team_name: 'alpha', current_phase: 'team-exec' });
+    });
+  });
+
+  it('does not use an unsafe team name to read canonical phase state', async () => {
+    await withTempRepo('omx-hud-unsafe-team-phase-', async (cwd) => {
+      const rootStateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-unsafe-team';
+      const sessionDir = join(rootStateDir, 'sessions', sessionId);
+      await mkdir(join(rootStateDir, 'escape'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'team',
+        phase: 'running',
+        session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'running', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({
+        active: true,
+        team_name: '../escape',
+      }));
+      await writeFile(join(rootStateDir, 'escape', 'phase.json'), JSON.stringify({ current_phase: 'escaped' }));
+
+      const state = await readAllState(cwd);
+
+      assert.deepEqual(state.team, { active: true, team_name: '../escape', current_phase: 'running' });
     });
   });
 
@@ -1797,7 +1845,7 @@ describe('HUD inherited state authority transport', { concurrency: false }, () =
         assert.equal(siblingScope.context, undefined);
         assert.deepEqual(siblingScope.diagnostics, [{
           code: 'authority_observed_cwd_outside_workspace',
-          message: 'unable to resolve inherited state authority: inherited state-authority transport cannot be used from an unrelated workspace cwd',
+          message: 'unable to resolve inherited state authority: observed cwd is not compatible with the committed workspace authority for mutation',
           fatal: true,
         }]);
 
@@ -1828,7 +1876,43 @@ describe('HUD inherited state authority transport', { concurrency: false }, () =
     });
   });
 
-  it('fails closed for stale, forged, and conflicting root-alias transport', async () => {
+  it('keeps malformed committed authority invalid instead of using legacy HUD scope', async () => {
+    await withTempRepo('omx-hud-malformed-authority-', async (cwd) => {
+      await initializeStateAuthority({
+        startup_cwd: cwd,
+        launch_id: 'hud-malformed-authority',
+        session_binding: { canonical_session_id: 'sess-malformed-authority' },
+      });
+      await writeFile(join(cwd, '.omx', 'bootstrap', 'state-authority-anchor.json'), '{}');
+
+      const scope = await resolveHudAuthorityReadScope(cwd, undefined, {});
+
+      assert.equal(scope.stateRoot, null);
+      assert.equal(scope.diagnostics[0]?.code, 'authority_anchor_malformed');
+    });
+  });
+
+  it('keeps Git branch data separate from invalid authority diagnostics', async () => {
+    await withTempRepo('omx-hud-git-authority-', async (cwd) => {
+      initGitRepo(cwd);
+      const authority = await initializeStateAuthority({
+        startup_cwd: cwd,
+        launch_id: 'hud-git-authority',
+        session_binding: { canonical_session_id: 'sess-git-authority' },
+      });
+
+      const state = await readAllState(cwd, undefined, {
+        ...authority,
+        canonical_state_root: join(cwd, 'invalid-state-root'),
+      });
+
+      assert.equal(state.gitBranch, 'origin-repo/safe-branch');
+      assert.equal(state.authority?.status, 'invalid');
+      assert.equal(state.authority?.diagnostics[0]?.code, 'authority_generation_malformed');
+    });
+  });
+
+  it('gives stale generation transport precedence over forged and conflicting root-alias transport', async () => {
     await withTempRepo('omx-hud-transport-denial-', async (workspace) => {
       const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), 'omx-hud-transport-denial-runtime-')));
       try {
@@ -1840,11 +1924,17 @@ describe('HUD inherited state authority transport', { concurrency: false }, () =
         const stale = await resolveHudAuthorityReadScope(
           workspace,
           undefined,
-          initialTransport,
+          {
+            ...initialTransport,
+            OMX_TEAM_STATE_ROOT: join(runtimeRoot, 'foreign-state'),
+          },
         );
         assert.equal(stale.stateRoot, null);
-        assert.ok(stale.diagnostics.length > 0);
-        assert.match(stale.diagnostics[0]?.message ?? '', /transport does not match/i);
+        assert.deepEqual(stale.diagnostics, [{
+          code: 'authority_anchor_revision_conflict',
+          message: 'unable to resolve inherited state authority: inherited state-authority transport does not match the active anchor, generation, binding, fence, and filesystem-validated authority context',
+          fatal: true,
+        }]);
 
         const forged = await resolveHudAuthorityReadScope(
           workspace,

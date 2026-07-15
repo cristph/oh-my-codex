@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { renameSync, writeFileSync } from 'fs';
+import { existsSync, renameSync, writeFileSync } from 'fs';
+
 
 import {
+  chmod,
   mkdtemp,
   mkdir,
   readFile,
@@ -14,14 +16,17 @@ import {
   writeFile,
 } from 'fs/promises';
 import { tmpdir } from 'os';
-import { basename, join, resolve } from 'path';
+import { basename, dirname, join, resolve } from 'path';
+
 import {
   resolveCanonicalTeamStateRoot,
+  resolveValidatedTeamAuthority,
   resolveWorkerNotifyTeamStateRoot,
   resolveWorkerNotifyTeamStateRootPath,
   resolveWorkerTeamStateRoot,
   resolveWorkerTeamStateRootPath,
 } from '../state-root.js';
+
 import {
   initializeStateAuthority,
   mintStateAuthorityTransportCapability,
@@ -30,6 +35,8 @@ import {
 } from '../../state/authority.js';
 
 import { resolveTeamStateDirForWorker } from '../../scripts/notify-hook/team-worker.js';
+import { initTeamState } from '../state.js';
+
 
 describe('state-root', () => {
   it('resolveCanonicalTeamStateRoot resolves to leader .omx/state', () => {
@@ -113,6 +120,119 @@ describe('state-root', () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+
+  it('applies the same complete tuple and OMX_SESSION_ID policy to synchronous and async authority resolution', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-team-root-shared-policy-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'team-root-shared-policy',
+        session_binding: {
+          canonical_session_id: 'team-root-shared-policy-session',
+        },
+      });
+      const complete = {
+        ...await authenticatedTransport(authority),
+        OMX_SESSION_ID: 'team-root-shared-policy-session',
+      };
+
+      assert.equal(
+        resolveCanonicalTeamStateRoot(workspace, complete),
+        authority.canonical_state_root,
+      );
+      const asyncAuthority = await resolveValidatedTeamAuthority(
+        workspace,
+        complete,
+      );
+      assert.equal(
+        asyncAuthority?.canonical_state_root,
+        authority.canonical_state_root,
+      );
+
+      const missingCapability: NodeJS.ProcessEnv = { ...complete };
+      delete missingCapability.OMX_STATE_AUTHORITY_CAPABILITY;
+      await assert.rejects(
+        () => resolveValidatedTeamAuthority(workspace, missingCapability),
+        (error: unknown) =>
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'authority_generation_missing',
+      );
+
+      const conflictingSession = {
+        ...complete,
+        OMX_SESSION_ID: 'conflicting-team-session',
+      };
+      assert.throws(
+        () => resolveCanonicalTeamStateRoot(workspace, conflictingSession),
+        (error: unknown) =>
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'authority_session_binding_conflict',
+      );
+      await assert.rejects(
+        () => resolveValidatedTeamAuthority(workspace, conflictingSession),
+        (error: unknown) =>
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'authority_session_binding_conflict',
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects pending authority operations consistently before synchronous or async worker resolution', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-team-root-pending-operation-'));
+    try {
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'team-root-pending-operation',
+        session_binding: {
+          canonical_session_id: 'team-root-pending-operation-session',
+        },
+      });
+      const transport = await authenticatedTransport(authority);
+      const anchorPath = stateAuthorityPaths(
+        resolveWorkspaceIdentity(workspace),
+      ).anchor_path;
+      const anchor = JSON.parse(await readFile(anchorPath, 'utf8')) as {
+        anchor_revision: number;
+        fencing_token: number;
+        pending_operation?: unknown;
+      };
+      anchor.pending_operation = {
+        operation_id: 'pending-team-root-operation',
+        generation_id: authority.generation.generation_id,
+        generation_locator: authority.authority_path,
+        journal_locator: join(authority.canonical_state_root, 'authority', 'journals', 'pending-team-root-operation.json'),
+        expected_anchor_revision: anchor.anchor_revision,
+        owner_nonce: 'pending-team-root-owner',
+        fencing_token: anchor.fencing_token,
+        kind: 'generation_terminalize',
+        created_at: new Date().toISOString(),
+      };
+      await writeFile(anchorPath, JSON.stringify(anchor), 'utf8');
+
+      const isPendingOperationError = (error: unknown) =>
+        error instanceof Error &&
+        'code' in error &&
+        error.code === 'authority_anchor_revision_conflict';
+      assert.throws(
+        () => resolveCanonicalTeamStateRoot(workspace, transport),
+        isPendingOperationError,
+      );
+      await assert.rejects(
+        () => resolveValidatedTeamAuthority(workspace, transport),
+        isPendingOperationError,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
 
   it('rejects copied full authority transport from an unrelated team workspace', async () => {
     const source = await mkdtemp(join(tmpdir(), 'omx-team-root-source-'));
@@ -444,7 +564,12 @@ describe('state-root', () => {
     stateRoot: string,
     teamName: string,
     filename: 'config.json' | 'manifest.v2.json',
-    workers: Array<{ name: string }>,
+    workers: Array<{
+      name: string;
+      index?: number;
+      role?: string;
+      assigned_tasks?: string[];
+    }>,
     extra: Record<string, unknown> = {},
   ) {
     const teamDir = join(stateRoot, 'team', teamName);
@@ -487,9 +612,17 @@ describe('state-root', () => {
         2,
       ),
     );
+    await writeTeamMetadata(stateRoot, teamName, 'manifest.v2.json', [
+      {
+        name: workerName,
+        index: 1,
+        role: 'executor',
+        assigned_tasks: ['1'],
+      },
+    ]);
   }
 
-  it('resolves worker root from OMX_TEAM_STATE_ROOT only when identity validates', async () => {
+  it('denies ambient aliases for mutation-capable workers while retaining validated read-only lookup', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-state-root-env-'));
     const stateRoot = join(root, 'state');
     const worktree = join(root, 'worktree');
@@ -501,21 +634,23 @@ describe('state-root', () => {
         worktree,
         { teamName: 'team-a', workerName: 'worker-1' },
         {
-        OMX_TEAM_STATE_ROOT: stateRoot,
+          OMX_TEAM_STATE_ROOT: stateRoot,
+          OMX_ROOT: root,
+          OMX_STATE_ROOT: root,
         },
+      ),
+      null,
+    );
+    assert.equal(
+      await resolveWorkerNotifyTeamStateRootPath(
+        worktree,
+        { teamName: 'team-a', workerName: 'worker-1' },
+        { OMX_TEAM_STATE_ROOT: stateRoot },
       ),
       stateRoot,
     );
-
-    const rejected = await resolveWorkerTeamStateRootPath(
-      worktree,
-      { teamName: 'team-a', workerName: 'worker-2' },
-      {
-      OMX_TEAM_STATE_ROOT: stateRoot,
-      },
-    );
-    assert.equal(rejected, null);
   });
+
 
   it('denies raw-root-only workers once their leader has a committed authority', async () => {
     const root = await mkdtemp(
@@ -615,7 +750,7 @@ describe('state-root', () => {
     }
   });
 
-  it('resolves from leader cwd state root when worker identity validates', async () => {
+  it('resolves from a leader cwd only through the read-only notify adapter when worker identity validates', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-state-root-leader-'));
     const leader = join(root, 'leader');
     const worktree = join(root, 'worker');
@@ -623,19 +758,18 @@ describe('state-root', () => {
     await mkdir(worktree, { recursive: true });
     await writeIdentity(stateRoot, 'team-a', 'worker-1', worktree);
 
-    const resolved = await resolveWorkerTeamStateRoot(
+    const resolved = await resolveWorkerNotifyTeamStateRoot(
       worktree,
       { teamName: 'team-a', workerName: 'worker-1' },
-      {
-      OMX_TEAM_LEADER_CWD: leader,
-      },
+      { OMX_TEAM_LEADER_CWD: leader },
     );
     assert.equal(resolved.ok, true);
     assert.equal(resolved.stateRoot, stateRoot);
     assert.equal(resolved.source, 'leader_cwd');
   });
 
-  it('allows cwd .omx/state only when identity exists and worktree path matches cwd', async () => {
+
+  it('denies cwd state roots to mutation-capable workers without authenticated transport', async () => {
     const worktree = await mkdtemp(join(tmpdir(), 'omx-state-root-cwd-'));
     const stateRoot = join(worktree, '.omx', 'state');
     await writeIdentity(stateRoot, 'team-a', 'worker-1', worktree);
@@ -645,10 +779,10 @@ describe('state-root', () => {
       { teamName: 'team-a', workerName: 'worker-1' },
       {},
     );
-    assert.equal(resolved.ok, true);
-    assert.equal(resolved.stateRoot, stateRoot);
-    assert.equal(resolved.source, 'cwd');
+    assert.equal(resolved.ok, false);
+    assert.equal(resolved.reason, 'authority_generation_missing');
   });
+
 
   it('resolves non-git worker notify root from identity metadata without probing local cwd state', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-state-root-notify-'));
@@ -839,8 +973,9 @@ describe('state-root', () => {
       { teamName: 'team-a', workerName: 'worker-1' },
       {},
     );
-    assert.equal(postToolUseResolved, stateRoot);
+    assert.equal(postToolUseResolved, null);
   });
+
 
   it('notify-hook worker state resolution reuses the non-git resolver', async () => {
     const previousStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -891,15 +1026,115 @@ describe('state-root', () => {
     );
 
     await writeIdentity(stateRoot, 'team-a', 'worker-1', otherWorktree);
-    const mismatch = await resolveWorkerTeamStateRoot(
+    const mismatch = await resolveWorkerNotifyTeamStateRoot(
       worktree,
       { teamName: 'team-a', workerName: 'worker-1' },
       {
-      OMX_TEAM_STATE_ROOT: stateRoot,
+        OMX_TEAM_STATE_ROOT: stateRoot,
       },
     );
     assert.equal(mismatch.ok, false);
     assert.equal(mismatch.reason, 'identity_worktree_mismatch');
+
+  });
+
+  it('rejects malformed or empty worker identities and mismatched authority roots', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-team-root-strict-identity-'));
+    const worktree = join(workspace, 'worker');
+    const identityPath = join(
+      workspace,
+      '.omx',
+      'state',
+      'team',
+      'team-a',
+      'workers',
+      'worker-1',
+      'identity.json',
+    );
+    try {
+      await mkdir(worktree, { recursive: true });
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'team-root-strict-identity',
+        session_binding: {
+          canonical_session_id: 'team-root-strict-identity-session',
+        },
+      });
+      const transport = await authenticatedTransport(authority);
+      await mkdir(dirname(identityPath), { recursive: true });
+
+      for (const identity of [
+        {},
+        {
+          name: 'worker-1',
+          index: 1,
+          role: 'executor',
+          assigned_tasks: [],
+          worktree_path: '',
+          team_state_root: authority.canonical_state_root,
+        },
+      ]) {
+        await writeFile(identityPath, JSON.stringify(identity), 'utf8');
+        const resolved = await resolveWorkerTeamStateRoot(
+          worktree,
+          { teamName: 'team-a', workerName: 'worker-1' },
+          transport,
+        );
+        assert.equal(resolved.ok, false);
+        assert.equal(resolved.reason, 'missing_or_invalid_identity');
+      }
+
+      await writeIdentity(
+        authority.canonical_state_root,
+        'team-a',
+        'worker-1',
+        worktree,
+        join(workspace, 'foreign-state'),
+      );
+      const rootMismatch = await resolveWorkerTeamStateRoot(
+        worktree,
+        { teamName: 'team-a', workerName: 'worker-1' },
+        transport,
+      );
+      assert.equal(rootMismatch.ok, false);
+      assert.equal(rootMismatch.reason, 'authority_team_metadata_conflict');
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('denies initialization through a symlinked team descendant', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-team-state-symlinked-team-'));
+    const outside = await mkdtemp(join(tmpdir(), 'omx-team-state-symlinked-outside-'));
+    try {
+      const teamRoot = join(workspace, '.omx', 'state', 'team');
+      await mkdir(dirname(teamRoot), { recursive: true, mode: 0o700 });
+      await chmod(join(workspace, '.omx'), 0o700);
+      await chmod(join(workspace, '.omx', 'state'), 0o700);
+      const authority = await initializeStateAuthority({
+        startup_cwd: workspace,
+        observed_cwd: workspace,
+        launch_id: 'team-state-symlinked-team',
+        session_binding: {
+          canonical_session_id: 'team-state-symlinked-team-session',
+        },
+      });
+      const transport = await authenticatedTransport(authority);
+
+      await symlink(outside, teamRoot, process.platform === 'win32' ? 'junction' : 'dir');
+
+      await assert.rejects(
+        () => initTeamState('team-a', 'must remain local', 'executor', 1, workspace, 20, transport),
+        /symbolic-link component/,
+      );
+      assert.equal(existsSync(join(outside, 'team-a')), false);
+    } finally {
+      await Promise.all([
+        rm(workspace, { recursive: true, force: true }),
+        rm(outside, { recursive: true, force: true }),
+      ]);
+    }
   });
   it('uses a validated authority root for nested workers and rejects conflicting or replaced roots', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-state-root-authority-'));

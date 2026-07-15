@@ -20,6 +20,19 @@ export interface TmuxPaneSnapshot {
 
 export const OMX_TMUX_HUD_LEADER_PANE_ENV = 'OMX_TMUX_HUD_LEADER_PANE';
 const OMX_TMUX_HUD_OWNER_ENV = 'OMX_TMUX_HUD_OWNER';
+const OMX_STATE_AUTHORITY_CAPABILITY_ENV = 'OMX_STATE_AUTHORITY_CAPABILITY';
+const TMUX_CLIENT_AUTHORITY_ENV = [
+  'OMX_CODEX_LAUNCH_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+] as const;
 export const TMUX_PANE_FIELD_SEPARATOR = '\x1f';
 export const TMUX_PANE_FIELD_SEPARATOR_OCTAL_ESCAPE = '\\037';
 
@@ -54,10 +67,17 @@ export interface RegisterHudResizeHookOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+function tmuxClientEnvWithoutAuthority(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const clientEnv = { ...env };
+  for (const key of TMUX_CLIENT_AUTHORITY_ENV) delete clientEnv[key];
+  return clientEnv;
+}
+
 function defaultExecTmuxSync(args: string[]): string {
   try {
     return execFileSync(resolveTmuxBinaryForPlatform() || 'tmux', args, {
       encoding: 'utf-8',
+      env: tmuxClientEnvWithoutAuthority(),
       ...(process.platform === 'win32' ? { windowsHide: true } : {}),
     });
   } catch (error) {
@@ -612,15 +632,21 @@ export function createHudWatchPane(
     fullWidth?: boolean;
     targetPaneId?: string;
     envKeys?: readonly string[];
+    env?: NodeJS.ProcessEnv;
   } = {},
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): string | null {
   const heightLines = Number.isFinite(options.heightLines) && (options.heightLines ?? 0) > 0
     ? Math.floor(options.heightLines ?? HUD_TMUX_HEIGHT_LINES)
     : HUD_TMUX_HEIGHT_LINES;
-  const envKeys = [...new Set(
-    (options.envKeys ?? []).filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)),
-  )];
+  const env = options.env ?? process.env;
+  const envAssignments = [...new Set(
+    (options.envKeys ?? []).filter((key) => (
+      /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
+      && !TMUX_CLIENT_AUTHORITY_ENV.includes(key as typeof TMUX_CLIENT_AUTHORITY_ENV[number])
+      && typeof env[key] === 'string'
+    )),
+  )].map((key) => `${key}=${env[key]}`);
   const args = [
     'split-window',
     '-v',
@@ -631,7 +657,7 @@ export function createHudWatchPane(
     ...(options.targetPaneId ? ['-t', options.targetPaneId] : []),
     '-c',
     cwd,
-    ...envKeys.flatMap((key) => ['-e', key]),
+    ...envAssignments.flatMap((assignment) => ['-e', assignment]),
     '-P',
     '-F',
     '#{pane_id}',

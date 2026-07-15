@@ -126,6 +126,7 @@ export interface ReconcileHudForPromptSubmitResult {
     | 'recreated'
     | 'replaced_duplicates'
     | 'skipped_concurrent'
+    | 'skipped_custody_conflict'
     | 'failed';
   paneId: string | null;
   desiredHeight: number | null;
@@ -160,6 +161,8 @@ export interface ReconcileHudForPromptSubmitDeps {
   readCurrentWindowSize?: (currentPaneId?: string) => { width: number | null; height: number | null };
   nowMs?: () => number;
   isProcessLive?: (pid: number) => boolean | null;
+  ensureHudReconcileLockParent?: (lockParent: string) => Promise<boolean>;
+  renameHudReconcileLock?: (fromPath: string, toPath: string) => Promise<void>;
 }
 
 function ensureHudResizeHook(
@@ -240,6 +243,11 @@ interface HudReconcileLock {
   token: string;
 }
 
+type HudLockAcquisition =
+  | { kind: 'acquired'; lock: HudReconcileLock }
+  | { kind: 'contended' }
+  | { kind: 'custody_conflict' };
+
 interface HudReconcileLockOwner {
   token?: unknown;
   pid?: unknown;
@@ -288,9 +296,18 @@ async function tryCreateHudReconcileLock(lockPath: string, nowMs: number): Promi
   }
 }
 
-async function restoreMovedLock(fromPath: string, toPath: string): Promise<void> {
-  const restored = await rename(fromPath, toPath).then(() => true).catch(() => false);
-  if (!restored) await rm(fromPath, { recursive: true, force: true }).catch(() => {});
+async function restoreMovedLock(
+  fromPath: string,
+  toPath: string,
+  renameHudReconcileLock: (fromPath: string, toPath: string) => Promise<void> = rename,
+): Promise<boolean> {
+  try {
+    await renameHudReconcileLock(fromPath, toPath);
+    return true;
+  } catch {
+    // Keep the moved lock as evidence of the unresolved custody conflict.
+    return false;
+  }
 }
 
 async function acquireHudReconcileLock(
@@ -298,31 +315,32 @@ async function acquireHudReconcileLock(
   nowMs: number,
   staleMs: number,
   isProcessLive: (pid: number) => boolean | null,
-): Promise<HudReconcileLock | null> {
+  renameHudReconcileLock: (fromPath: string, toPath: string) => Promise<void> = rename,
+): Promise<HudLockAcquisition> {
   const created = await tryCreateHudReconcileLock(lockPath, nowMs);
-  if (created) return created;
+  if (created) return { kind: 'acquired', lock: created };
 
   const observedOwner = await readHudReconcileLockOwner(lockPath);
   const lockStat = await stat(lockPath).catch(() => null);
-  if (!lockStat) return null;
+  if (!lockStat) return { kind: 'contended' };
 
   const ownerPid = typeof observedOwner?.pid === 'number' && Number.isInteger(observedOwner.pid) && observedOwner.pid > 0
     ? observedOwner.pid
     : null;
   const ownerAcquiredMs = parseIsoMs(observedOwner?.acquired_at);
   const lockAgeMs = ownerAcquiredMs === null ? nowMs - lockStat.mtimeMs : nowMs - ownerAcquiredMs;
-  if (lockAgeMs <= staleMs) return null;
+  if (lockAgeMs <= staleMs) return { kind: 'contended' };
 
   if (ownerPid !== null) {
     const liveness = isProcessLive(ownerPid);
-    if (liveness !== false) return null;
+    if (liveness !== false) return { kind: 'contended' };
   }
 
   const reapPath = `${lockPath}.stale.${process.pid}.${nowMs}.${randomUUID()}`;
   try {
-    await rename(lockPath, reapPath);
+    await renameHudReconcileLock(lockPath, reapPath);
   } catch {
-    return null;
+    return { kind: 'contended' };
   }
 
   const reapedOwner = await readHudReconcileLockOwner(reapPath);
@@ -336,29 +354,43 @@ async function acquireHudReconcileLock(
     && reapedAgeMs > staleMs;
 
   if (!reapedObservedLock) {
-    await restoreMovedLock(reapPath, lockPath);
-    return null;
+    return (await restoreMovedLock(reapPath, lockPath, renameHudReconcileLock))
+      ? { kind: 'contended' }
+      : { kind: 'custody_conflict' };
   }
 
-  await rm(reapPath, { recursive: true, force: true }).catch(() => {});
-  return tryCreateHudReconcileLock(lockPath, nowMs);
+  try {
+    await rm(reapPath, { recursive: true, force: true });
+  } catch {
+    return { kind: 'custody_conflict' };
+  }
+  const reacquired = await tryCreateHudReconcileLock(lockPath, nowMs);
+  return reacquired
+    ? { kind: 'acquired', lock: reacquired }
+    : { kind: 'contended' };
 }
 
-async function releaseHudReconcileLock(lock: HudReconcileLock): Promise<void> {
+async function releaseHudReconcileLock(
+  lock: HudReconcileLock,
+  renameHudReconcileLock: (fromPath: string, toPath: string) => Promise<void> = rename,
+): Promise<void> {
   const releasePath = `${lock.path}.release.${process.pid}.${Date.now()}.${lock.token}`;
   try {
-    await rename(lock.path, releasePath);
-  } catch {
-    return;
+    await renameHudReconcileLock(lock.path, releasePath);
+  } catch (error) {
+    throw new Error('hud reconcile lock release custody conflict', { cause: error });
   }
 
   const releaseOwner = await readHudReconcileLockOwner(releasePath);
   if (releaseOwner?.token === lock.token) {
-    await rm(releasePath, { recursive: true, force: true }).catch(() => {});
+    await rm(releasePath, { recursive: true, force: true });
     return;
   }
 
-  await restoreMovedLock(releasePath, lock.path);
+  if (!await restoreMovedLock(releasePath, lock.path, renameHudReconcileLock)) {
+    throw new Error('hud reconcile lock release custody conflict');
+  }
+  throw new Error('hud reconcile lock ownership changed before release');
 }
 
 
@@ -396,7 +428,8 @@ export async function reconcileHudForPromptSubmit(
     };
   }
   const authorityScope = await resolveHudAuthorityReadScope(cwd, deps.authorityContext, env);
-  if (!authorityScope.stateRoot) {
+  // Legacy HUD scopes support read-only diagnostics only; tmux mutation requires a committed authority context.
+  if (!authorityScope.stateRoot || !authorityScope.context) {
     return {
       status: 'skipped_authority_invalid',
       paneId: null,
@@ -414,18 +447,27 @@ export async function reconcileHudForPromptSubmit(
 
   const lockPath = join(authorityScope.stateRoot, 'hud-reconcile.lock');
 
-  const lockDirReady = await mkdir(dirname(lockPath), { recursive: true }).then(() => true).catch(() => false);
-  const lock = lockDirReady
-    ? await acquireHudReconcileLock(
-      lockPath,
-      deps.nowMs?.() ?? Date.now(),
-      HUD_RECONCILE_LOCK_STALE_MS,
-      deps.isProcessLive ?? defaultIsProcessLive,
-    )
-    : null;
-  if (lockDirReady && !lock) {
+  const lockParent = dirname(lockPath);
+  const lockDirReady = await (deps.ensureHudReconcileLockParent?.(lockParent)
+    ?? mkdir(lockParent, { recursive: true }).then(() => true).catch(() => false));
+  if (!lockDirReady) {
     return {
-      status: 'skipped_concurrent',
+      status: 'failed',
+      paneId: null,
+      desiredHeight: null,
+      duplicateCount: 0,
+    };
+  }
+  const lock = await acquireHudReconcileLock(
+    lockPath,
+    deps.nowMs?.() ?? Date.now(),
+    HUD_RECONCILE_LOCK_STALE_MS,
+    deps.isProcessLive ?? defaultIsProcessLive,
+    deps.renameHudReconcileLock,
+  );
+  if (lock.kind !== 'acquired') {
+    return {
+      status: lock.kind === 'custody_conflict' ? 'skipped_custody_conflict' : 'skipped_concurrent',
       paneId: null,
       desiredHeight: null,
       duplicateCount: 0,
@@ -435,20 +477,14 @@ export async function reconcileHudForPromptSubmit(
   try {
 
   const currentPaneId = env.TMUX_PANE?.trim();
-  const authorityAliases = authorityScope.context?.session_binding?.aliases;
-  const resolvedSessionId = authorityScope.context
-    ? authorityScope.sessionId
-    : deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
+  const authorityAliases = authorityScope.context.session_binding?.aliases;
+  const resolvedSessionId = authorityScope.sessionId;
   const equivalentSessionIds = [
     resolvedSessionId,
-    ...(authorityAliases
-      ? [
-        authorityAliases.native_session_id,
-        ...authorityAliases.current_session_aliases,
-        ...authorityAliases.previous_session_aliases,
-        ...authorityAliases.owner_session_aliases,
-      ]
-      : [env.OMX_SESSION_ID?.trim(), ...(deps.sessionIds ?? [])]),
+    authorityAliases?.native_session_id,
+    ...(authorityAliases?.current_session_aliases ?? []),
+    ...(authorityAliases?.previous_session_aliases ?? []),
+    ...(authorityAliases?.owner_session_aliases ?? []),
   ]
     .map((sessionId) => sessionId?.trim() ?? '')
     .filter((sessionId, index, sessionIds) => sessionId !== '' && sessionIds.indexOf(sessionId) === index);
@@ -503,17 +539,24 @@ export async function reconcileHudForPromptSubmit(
     : null;
   const desiredHeight = hudState ? getHudRenderMaxLines(hudState) : HUD_TMUX_HEIGHT_LINES;
   const preset = hudConfig?.preset;
-  const legacyOmxRoot = authorityScope.context ? undefined : env.OMX_ROOT?.trim() || undefined;
-  const legacyRootEnv = authorityScope.context
-    ? { rootSource: 'cwd-default' as const }
-    : env.OMX_TEAM_STATE_ROOT?.trim()
-      ? { omxTeamStateRoot: env.OMX_TEAM_STATE_ROOT.trim(), rootSource: 'team-env' as const }
-      : legacyOmxRoot
-        ? { rootSource: 'omx-root-env' as const }
-        : env.OMX_STATE_ROOT?.trim()
-          ? { omxStateRoot: env.OMX_STATE_ROOT.trim(), rootSource: 'omx-state-root-env' as const }
-          : { rootSource: 'cwd-default' as const };
-  const hudCmd = buildHudWatchCommand(omxBin, preset, resolvedSessionId, legacyOmxRoot, currentPaneId, legacyRootEnv);
+  // Compatibility aliases are diagnostics only. Resolve their values from the
+  // validated scope before creating the pane because the HUD runs from
+  // workspaceRoot, which may differ from the leader pane cwd.
+  const legacyRootEnv = env.OMX_TEAM_STATE_ROOT?.trim()
+    ? { omxTeamStateRoot: authorityScope.stateRoot, rootSource: 'team-env' as const }
+    : env.OMX_ROOT?.trim()
+      ? { omxRoot: authorityScope.workspaceRoot, rootSource: 'omx-root-env' as const }
+      : env.OMX_STATE_ROOT?.trim()
+        ? { omxStateRoot: authorityScope.workspaceRoot, rootSource: 'omx-state-root-env' as const }
+        : { rootSource: 'cwd-default' as const };
+  const hudCmd = buildHudWatchCommand(
+    omxBin,
+    preset,
+    resolvedSessionId,
+    legacyRootEnv.rootSource === 'omx-root-env' ? legacyRootEnv.omxRoot : undefined,
+    currentPaneId,
+    legacyRootEnv,
+  );
   const leaderPane = currentPaneId
     ? panes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane))
     : undefined;
@@ -643,6 +686,6 @@ export async function reconcileHudForPromptSubmit(
     duplicateCount: postCreate.duplicatePaneIds.length,
   };
   } finally {
-    if (lock) await releaseHudReconcileLock(lock);
+    await releaseHudReconcileLock(lock.lock, deps.renameHudReconcileLock);
   }
 }

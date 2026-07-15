@@ -35,7 +35,9 @@ async function ensureTestStateServerAuthority(
         throw error;
       }
     }
-    if (existsSync(join(canonicalWorkingDirectory, '.omx', 'state', 'authority'))) return;
+    if (existsSync(join(canonicalWorkingDirectory, '.omx', 'state', 'authority'))) {
+      throw new Error('state-server test fixture contains authority protocol artifacts without a committed authenticated anchor');
+    }
 
     const stateRoot = join(canonicalWorkingDirectory, '.omx', 'state');
     const stagedStateRoot = join(

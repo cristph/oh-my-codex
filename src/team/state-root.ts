@@ -21,7 +21,8 @@ import {
   isObservedCwdCompatibleWithStateAuthority,
   validateSessionAuthorityBinding,
   resolveStateAuthority,
-  validateStateAuthority,
+  resolveStateAuthorityForGuard,
+  validateStateAuthorityTransportCapability,
   validateStateAuthorityGeneration,
   validateWorkspaceAuthorityAnchor,
   type ResolvedStateAuthorityContext,
@@ -29,7 +30,27 @@ import {
   type StateAuthorityGeneration,
   type WorkspaceAuthorityAnchor,
 } from '../state/authority.js';
-import { resolveAuthenticatedTransportAuthority } from '../hooks/session.js';
+
+export const TEAM_STATE_AUTHORITY_TUPLE_ENV_KEYS = [
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+export const TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  ...TEAM_STATE_AUTHORITY_TUPLE_ENV_KEYS,
+] as const;
+
+
+export const TEAM_AMBIENT_STATE_ROOT_ALIAS_ENV_KEYS = [
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+] as const;
+
 
 function authorityTransportValues(env: NodeJS.ProcessEnv): {
   authorityPath: string;
@@ -51,14 +72,13 @@ function authorityTransportValues(env: NodeJS.ProcessEnv): {
     generationId,
     workspaceDigest,
     capability,
-    present: Boolean(
-      authorityPath ||
-        authorityId ||
-        generationId ||
-        workspaceDigest ||
-        capability,
-    ),
+    present: TEAM_STATE_AUTHORITY_TUPLE_ENV_KEYS.some((key) => {
+      const value = env[key];
+      return typeof value === 'string' && value.trim() !== '';
+    }),
   };
+
+
 }
 
 function deriveWorkspaceFromAuthorityLocator(locator: string): string | null {
@@ -93,6 +113,8 @@ interface SynchronousAuthorityPathSnapshot {
     dev: number;
     ino: number;
     mode: number;
+    uid: number;
+    gid: number;
   }>;
 }
 
@@ -107,16 +129,22 @@ function synchronousPathIdentity(details: {
   dev: number;
   ino: number;
   mode: number;
-}): { dev: number; ino: number; mode: number } {
-  return { dev: details.dev, ino: details.ino, mode: details.mode };
+  uid: number;
+  gid: number;
+}): { dev: number; ino: number; mode: number; uid: number; gid: number } {
+  return { dev: details.dev, ino: details.ino, mode: details.mode, uid: details.uid, gid: details.gid };
 }
 
 function sameSynchronousPathIdentity(
-  left: { dev: number; ino: number; mode: number },
-  right: { dev: number; ino: number; mode: number },
+  left: { dev: number; ino: number; mode: number; uid: number; gid: number },
+  right: { dev: number; ino: number; mode: number; uid: number; gid: number },
 ): boolean {
   return (
-    left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.gid === right.gid
   );
 }
 
@@ -259,17 +287,14 @@ function readAuthorityJsonSync(
     };
   } catch (error) {
     if (error instanceof StateAuthorityError) throw error;
-    failSynchronousAuthorityTransport(
+    return failSynchronousAuthorityTransport(
       code,
       `cannot read authority transport file: ${snapshot.path}`,
     );
   } finally {
     if (typeof fd === 'number') closeSync(fd);
   }
-  return failSynchronousAuthorityTransport(
-    code,
-    `cannot complete authority transport read: ${snapshot.path}`,
-  );
+
 }
 
 function assertSynchronousAuthorityJsonReadCurrent(
@@ -318,6 +343,8 @@ function hasCurrentRootFilesystemIdentity(
       generation.root_identity.device === actual.dev.toString() &&
       generation.root_identity.inode === actual.ino.toString() &&
       generation.root_identity.mode === actual.mode.toString() &&
+      generation.root_identity.uid === actual.uid.toString() &&
+      generation.root_identity.gid === actual.gid.toString() &&
       generation.root_identity.birthtime_ns === birthtimeNs
     );
   } catch {
@@ -395,6 +422,21 @@ function validateSynchronousTransportCapability(
   }
 }
 
+function bindingMatchesAuthoritySession(
+  binding: SessionAuthorityBinding,
+  sessionId: string | undefined,
+): boolean {
+  if (!sessionId) return true;
+  return [
+    binding.canonical_session_id,
+    binding.aliases.native_session_id,
+    ...binding.aliases.current_session_aliases,
+    ...binding.aliases.previous_session_aliases,
+    ...binding.aliases.owner_session_aliases,
+  ].some((candidate) => candidate === sessionId);
+}
+
+
 function assertObservedCwdCompatible(
   workspaceIdentity: StateAuthorityGeneration['workspace_identity'],
   observedCwd: string,
@@ -447,6 +489,13 @@ function resolveSynchronousTransportStateRoot(
   );
   const anchor = anchorRead.parsed as unknown as WorkspaceAuthorityAnchor;
   validateWorkspaceAuthorityAnchor(anchor, workspace);
+  if (anchor.pending_operation) {
+    failSynchronousAuthorityTransport(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      'inherited state-authority transport cannot be used while the active anchor has a pending operation',
+    );
+  }
+
   if (
     workspace.digest !== transport.workspaceDigest ||
     anchor.active_generation_id !== transport.generationId ||
@@ -514,6 +563,13 @@ function resolveSynchronousTransportStateRoot(
       'inherited state-authority transport does not match the active binding and fence',
     );
   }
+  if (!bindingMatchesAuthoritySession(binding, authoritySessionCandidate(env))) {
+    failSynchronousAuthorityTransport(
+      AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+      'inherited state-authority transport session does not match the active binding',
+    );
+  }
+
   validateSynchronousTransportCapability(
     transport.capability,
     anchor,
@@ -548,35 +604,41 @@ function resolveSynchronousTransportStateRoot(
   return generation.canonical_state_root;
 }
 
+function describeAuthorityRootConflict(
+  expectedRoot: string,
+  candidateRoot: string,
+  source: string,
+): string {
+  return `${source} conflicts with the persisted session authority: candidate roots ${resolve(expectedRoot)} and ${resolve(candidateRoot)}. Restart the session from the intended workspace or rebind the session authority before retrying.`;
+}
+
 function assertNoAmbientAuthorityAliasConflict(
   cwd: string,
   env: NodeJS.ProcessEnv,
   stateRoot: string,
 ): void {
   const expected = resolve(stateRoot);
-  for (const [name, value] of [
-    ['OMX_TEAM_STATE_ROOT', env.OMX_TEAM_STATE_ROOT?.trim() ?? ''],
-    ['OMX_ROOT', env.OMX_ROOT?.trim() ?? ''],
-    ['OMX_STATE_ROOT', env.OMX_STATE_ROOT?.trim() ?? ''],
-  ] as const) {
+  for (const [name, value] of TEAM_AMBIENT_STATE_ROOT_ALIAS_ENV_KEYS.map((name) => [
+    name,
+    env[name]?.trim() ?? '',
+  ] as const)) {
     if (!value) continue;
     const candidate =
       name === 'OMX_TEAM_STATE_ROOT'
-      ? resolve(cwd, value)
-      : join(resolve(cwd, value), '.omx', 'state');
+        ? resolve(cwd, value)
+        : join(resolve(cwd, value), '.omx', 'state');
     if (resolve(candidate) !== expected) {
-    failSynchronousAuthorityTransport(
+      failSynchronousAuthorityTransport(
         AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
-        `${name} conflicts with the inherited state authority`,
-    );
-  }
+        describeAuthorityRootConflict(expected, candidate, name),
+      );
+    }
   }
 }
 
 /**
- * Resolves the canonical team state root synchronously. Locator evidence is
- * authenticated against the active anchor before it can select a source or
- * alternate root; otherwise resolution fails closed rather than using cwd.
+ * Resolves the canonical Team root for read-only legacy discovery. Mutations
+ * must call resolveCanonicalTeamMutationStateRoot instead.
  */
 export function resolveCanonicalTeamStateRoot(
   leaderCwd: string,
@@ -591,6 +653,91 @@ export function resolveCanonicalTeamStateRoot(
     return transportedStateRoot;
   }
   return join(resolve(leaderCwd), '.omx', 'state');
+}
+
+/**
+ * Resolves the only root permitted for Team mutation. Cwd and public root
+ * aliases remain diagnostic-only when a persisted authority is absent.
+ */
+export function resolveCanonicalTeamMutationStateRoot(
+  observedCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const transportedStateRoot = resolveSynchronousTransportStateRoot(
+    observedCwd,
+    env,
+  );
+  if (!transportedStateRoot) {
+    const cwdCandidate = join(resolve(observedCwd), '.omx', 'state');
+    const ambientCandidate = explicitStateRootCandidates(observedCwd, env)[0];
+    failSynchronousAuthorityTransport(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      ambientCandidate
+        ? describeAuthorityRootConflict(
+          cwdCandidate,
+          ambientCandidate,
+          'ambient state-root alias',
+        )
+        : `Team mutation requires a persisted session authority; cwd candidate root is ${cwdCandidate}. Restart the session from the intended workspace or rebind the session authority before retrying.`,
+    );
+  }
+  assertNoAmbientAuthorityAliasConflict(observedCwd, env, transportedStateRoot);
+  return transportedStateRoot;
+}
+
+/**
+ * Resolves a complete inherited authority tuple for async Team paths. The
+ * synchronous root resolver performs the shared tuple, anchor, capability,
+ * filesystem, and OMX_SESSION_ID checks before this context is returned.
+ */
+export async function resolveValidatedTeamAuthority(
+  observedCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ResolvedStateAuthorityContext | null> {
+  const transport = authorityTransportValues(env);
+  if (!transport.present) return null;
+
+  const canonicalStateRoot = resolveSynchronousTransportStateRoot(
+    observedCwd,
+    env,
+  );
+  if (!canonicalStateRoot) {
+    failSynchronousAuthorityTransport(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+      'inherited state-authority transport did not resolve a canonical state root',
+    );
+  }
+  const startupCwd =
+    env.OMX_STARTUP_CWD?.trim() ||
+    deriveWorkspaceFromAuthorityLocator(transport.authorityPath);
+  if (!startupCwd) {
+    failSynchronousAuthorityTransport(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      'inherited state-authority locator does not identify a workspace root',
+    );
+  }
+
+  const context = await resolveStateAuthorityForGuard({
+    startup_cwd: startupCwd,
+    observed_cwd: observedCwd,
+    session_id: authoritySessionCandidate(env),
+  });
+  if (
+    resolve(context.canonical_state_root) !== resolve(canonicalStateRoot) ||
+    resolve(context.authority_path) !== resolve(transport.authorityPath) ||
+    context.generation.authority_id !== transport.authorityId ||
+    context.generation.generation_id !== transport.generationId ||
+    context.workspace_identity.digest !== transport.workspaceDigest ||
+    !context.session_binding ||
+    context.session_binding.lifecycle !== 'active'
+  ) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      'inherited state-authority transport changed while its Team context was being resolved',
+    );
+  }
+  await validateStateAuthorityTransportCapability(context, transport.capability);
+  return context;
 }
 
 export interface TeamWorkerIdentityRef {
@@ -611,6 +758,9 @@ interface WorkerTeamStateRootResolveOptions {
    * available for legacy worker sessions without committed authority evidence.
    */
   allowCwdFallback: boolean;
+  /** Require a complete inherited authority tuple before returning a mutation-capable root. */
+  requireAuthenticatedTransport?: boolean;
+
 }
 
 export interface WorkerTeamStateRootResolution {
@@ -623,6 +773,76 @@ export interface WorkerTeamStateRootResolution {
 }
 
 type JsonRecord = Record<string, unknown>;
+
+interface StrictWorkerIdentity {
+  index: number;
+  role: string;
+  assignedTasks: string[];
+  workingPath: string;
+  teamStateRoot: string;
+}
+
+interface WorkerStateRootValidationOptions {
+  allowIdentityStateRootIndirection?: boolean;
+}
+
+function parseStrictWorkerIdentity(
+  identity: JsonRecord,
+  worker: TeamWorkerIdentityRef,
+): StrictWorkerIdentity | null {
+  const name = metadataStateRoot(identity.name);
+  const workingPath = metadataStateRoot(identity.worktree_path)
+    ?? metadataStateRoot(identity.working_dir);
+  const teamStateRoot = metadataStateRoot(identity.team_state_root);
+  const workerIndex = identity.index;
+  const role = metadataStateRoot(identity.role);
+  const assignedTasks = identity.assigned_tasks;
+  if (
+    !name ||
+    !workingPath ||
+    !teamStateRoot ||
+    typeof workerIndex !== 'number' ||
+    !Number.isSafeInteger(workerIndex) ||
+    workerIndex < 1 ||
+    !role ||
+    !Array.isArray(assignedTasks) ||
+    !assignedTasks.every((taskId) => typeof taskId === 'string')
+  ) {
+    return null;
+  }
+  if (name !== worker.workerName) return null;
+  return {
+    index: workerIndex,
+    role,
+    assignedTasks,
+    workingPath,
+    teamStateRoot,
+  };
+}
+
+function identityMatchesManifest(
+  identity: StrictWorkerIdentity,
+  manifest: JsonRecord,
+  worker: TeamWorkerIdentityRef,
+): boolean {
+  const workers = manifest.workers;
+  if (!Array.isArray(workers)) return false;
+  const manifestWorker = workers.find((candidate) =>
+    candidate
+    && typeof candidate === 'object'
+    && !Array.isArray(candidate)
+    && (candidate as JsonRecord).name === worker.workerName,
+  ) as JsonRecord | undefined;
+  if (!manifestWorker) return false;
+  return (
+    manifestWorker.index === identity.index
+    && metadataStateRoot(manifestWorker.role) === identity.role
+    && Array.isArray(manifestWorker.assigned_tasks)
+    && manifestWorker.assigned_tasks.every((taskId) => typeof taskId === 'string')
+    && JSON.stringify(manifestWorker.assigned_tasks) === JSON.stringify(identity.assignedTasks)
+  );
+}
+
 
 async function readJsonIfExists(path: string): Promise<JsonRecord | null> {
   try {
@@ -662,27 +882,28 @@ function pathIsSameOrInside(candidate: string, parent: string): boolean {
 
 async function cwdMatchesIdentityWorktree(
   cwd: string,
-  identity: JsonRecord,
-): Promise<{ matches: boolean; worktreePath?: string }> {
-  const worktreePath = metadataStateRoot(identity.worktree_path);
-  if (!worktreePath) return { matches: true };
-
+  worktreePath: string,
+): Promise<{ matches: boolean; worktreePath: string }> {
   const [normalizedCwd, normalizedWorktree] = await Promise.all([
     normalizePath(cwd),
     normalizePath(worktreePath),
   ]);
 
-  return pathIsSameOrInside(normalizedCwd, normalizedWorktree)
-    ? { matches: true, worktreePath: normalizedWorktree }
-    : { matches: false, worktreePath: normalizedWorktree };
+  return {
+    matches: pathIsSameOrInside(normalizedCwd, normalizedWorktree),
+    worktreePath: normalizedWorktree,
+  };
 }
+
 
 async function validateWorkerStateRoot(
   stateRoot: string,
   cwd: string,
   worker: TeamWorkerIdentityRef,
   authority?: ResolvedStateAuthorityContext,
+  options: WorkerStateRootValidationOptions = {},
 ): Promise<WorkerTeamStateRootResolution> {
+
   const resolvedStateRoot = resolve(cwd, stateRoot);
   if (authority) {
     const [normalizedCandidate, normalizedAuthorityRoot] = await Promise.all([
@@ -717,38 +938,69 @@ async function validateWorkerStateRoot(
     };
   }
 
-  const identityName = metadataStateRoot(identity.name);
-  if (identityName && identityName !== worker.workerName) {
+  const strictIdentity = parseStrictWorkerIdentity(identity, worker);
+  if (!strictIdentity) {
     return {
       ok: false,
       stateRoot: null,
       source: null,
-      reason: 'identity_worker_mismatch',
+      reason: 'missing_or_invalid_identity',
       identityPath,
     };
   }
 
-  if (authority) {
-    const metadataRoot = metadataStateRoot(identity.team_state_root);
-    if (metadataRoot) {
-      const [normalizedMetadataRoot, normalizedAuthorityRoot] =
-        await Promise.all([
-        normalizePath(resolve(cwd, metadataRoot)),
-        normalizePath(authority.canonical_state_root),
-      ]);
-      if (normalizedMetadataRoot !== normalizedAuthorityRoot) {
-        return {
-          ok: false,
-          stateRoot: null,
-          source: null,
-          reason: 'authority_team_metadata_conflict',
-          identityPath,
-        };
-      }
-    }
+  const manifestPath = join(
+    resolvedStateRoot,
+    'team',
+    worker.teamName,
+    'manifest.v2.json',
+  );
+  const manifest = await readJsonIfExists(manifestPath);
+  if (!manifest || !identityMatchesManifest(strictIdentity, manifest, worker)) {
+    return {
+      ok: false,
+      stateRoot: null,
+      source: null,
+      reason: 'identity_manifest_mismatch',
+      identityPath,
+    };
   }
 
-  const worktreeMatch = await cwdMatchesIdentityWorktree(cwd, identity);
+  const normalizedIdentityRoot = await normalizePath(
+    resolve(cwd, strictIdentity.teamStateRoot),
+  );
+  if (authority) {
+    const normalizedAuthorityRoot = await normalizePath(
+      authority.canonical_state_root,
+    );
+    if (normalizedIdentityRoot !== normalizedAuthorityRoot) {
+      return {
+        ok: false,
+        stateRoot: null,
+        source: null,
+        reason: 'authority_team_metadata_conflict',
+        identityPath,
+      };
+    }
+  }
+  if (
+    !options.allowIdentityStateRootIndirection &&
+    normalizedIdentityRoot !== await normalizePath(resolvedStateRoot)
+  ) {
+    return {
+      ok: false,
+      stateRoot: null,
+      source: null,
+      reason: 'identity_state_root_mismatch',
+      identityPath,
+    };
+  }
+
+  const worktreeMatch = await cwdMatchesIdentityWorktree(
+    cwd,
+    strictIdentity.workingPath,
+  );
+
   if (!worktreeMatch.matches) {
     return {
       ok: false,
@@ -775,13 +1027,16 @@ async function validateWithSource(
   cwd: string,
   worker: TeamWorkerIdentityRef,
   authority?: ResolvedStateAuthorityContext,
+  options?: WorkerStateRootValidationOptions,
 ): Promise<WorkerTeamStateRootResolution> {
   const validated = await validateWorkerStateRoot(
     stateRoot,
     cwd,
     worker,
     authority,
+    options,
   );
+
   return validated.ok ? { ...validated, source } : validated;
 }
 
@@ -795,7 +1050,10 @@ async function readMetadataRootFromValidatedCandidate(
     candidateStateRoot,
     cwd,
     worker,
+    undefined,
+    { allowIdentityStateRootIndirection: true },
   );
+
   if (!validated.ok) return null;
 
   const metadataPath =
@@ -920,18 +1178,15 @@ async function resolveAuthoritativeWorkerContext(
   let context: ResolvedStateAuthorityContext | undefined;
   if (locatorPresent) {
     try {
-      const transported = await resolveAuthenticatedTransportAuthority(
-        cwd,
-        env,
-      );
+      const transported = await resolveValidatedTeamAuthority(cwd, env);
       if (!transported) return { reason: 'authority_generation_missing' };
       context = transported;
     } catch (error) {
       return {
         reason:
           error instanceof StateAuthorityError
-          ? error.code
-          : 'authority_generation_malformed',
+            ? error.code
+            : 'authority_generation_malformed',
       };
     }
   }
@@ -945,22 +1200,6 @@ async function resolveAuthoritativeWorkerContext(
       return { reason: AUTHORITY_DIAGNOSTIC_CODES.authorityMissing };
     return {};
   }
-
-  const validation = await validateStateAuthority(context.generation, {
-    workspace_identity: context.workspace_identity,
-    session_id: authoritySessionCandidate(env),
-  });
-  if (!validation.valid)
-    return {
-      reason:
-        validation.diagnostics[0]?.code ?? 'authority_generation_malformed',
-    };
-  if (
-    context.canonical_state_root !== context.generation.canonical_state_root ||
-    !context.session_binding ||
-    context.session_binding.lifecycle !== 'active'
-  )
-    return { reason: 'authority_generation_malformed' };
   return { context };
 }
 
@@ -982,6 +1221,18 @@ async function resolveWorkerTeamStateRootWithOptions(
   env: NodeJS.ProcessEnv,
   options: WorkerTeamStateRootResolveOptions,
 ): Promise<WorkerTeamStateRootResolution> {
+  if (
+    options.requireAuthenticatedTransport &&
+    !inheritedAuthorityLocatorPresent(env)
+  ) {
+    return {
+      ok: false,
+      stateRoot: null,
+      source: null,
+      reason: AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+    };
+  }
+
   const authority = await resolveAuthoritativeWorkerContext(cwd, env);
   if (authority.context) {
     if (await explicitRootConflictsWithAuthority(cwd, env, authority.context)) {
@@ -1083,10 +1334,9 @@ async function resolveWorkerTeamStateRootWithOptions(
 }
 
 /**
- * Resolve the canonical team state root for an OMX team worker PostToolUse/git hook.
- *
- * Inherited authenticated authority transport selects the root and disables all
- * worker-cwd fallback. Legacy sessions retain the validated local fallback.
+ * Resolve the canonical team state root for a mutation-capable OMX team worker
+ * PostToolUse/git hook. A complete inherited authority transport is required;
+ * ambient root aliases, leader hints, and cwd are diagnostic evidence only.
  */
 export async function resolveWorkerTeamStateRoot(
   cwd: string,
@@ -1094,14 +1344,15 @@ export async function resolveWorkerTeamStateRoot(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<WorkerTeamStateRootResolution> {
   return resolveWorkerTeamStateRootWithOptions(cwd, worker, env, {
-    allowCwdFallback: !inheritedAuthorityLocatorPresent(env),
+    allowCwdFallback: false,
+    requireAuthenticatedTransport: true,
   });
 }
 
 /**
- * Resolve the team state root for non-git worker notify hooks. Inherited
- * authority selects the root; otherwise this remains a strict no-cwd-fallback
- * resolver for legacy notify invocations.
+ * Resolve a root for a read-only non-git worker notify adapter. Inherited
+ * authority selects the root; legacy metadata lookup is intentionally retained
+ * here only and must not be treated as mutation authority.
  */
 export async function resolveWorkerNotifyTeamStateRoot(
   cwd: string,
@@ -1183,6 +1434,8 @@ export async function resolveWorkerNotifyTeamStateRoot(
     'leader_cwd',
     cwd,
     worker,
+    undefined,
+    { allowIdentityStateRootIndirection: true },
   );
   if (!direct.ok) return direct;
   const metadataRoot = await readMetadataRootFromValidatedCandidate(
@@ -1191,6 +1444,7 @@ export async function resolveWorkerNotifyTeamStateRoot(
     cwd,
     worker,
   );
+  if (metadataRoot && resolve(cwd, metadataRoot) === direct.stateRoot) return direct;
   if (metadataRoot) {
     const resolved = await validateWithSource(
       resolve(cwd, metadataRoot),

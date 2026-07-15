@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { existsSync, readdirSync, readFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join } from 'path';
 import { TEAM_NAME_SAFE_PATTERN } from './contracts.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
@@ -124,26 +124,7 @@ function candidateFromDir(root: string, teamName: string): TeamLookupCandidate |
 }
 
 function teamLookupRoots(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
-  if (
-    env.OMX_STATE_AUTHORITY_PATH?.trim()
-    || env.OMX_STATE_AUTHORITY_ID?.trim()
-    || env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim()
-    || env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim()
-  ) {
-    return [join(resolveCanonicalTeamStateRoot(cwd, env), 'team')];
-  }
-  const roots: string[] = [];
-  const addStateRoot = (stateRoot: string): void => {
-    const trimmed = stateRoot.trim();
-    if (!trimmed) return;
-    const root = join(resolve(cwd, trimmed), 'team');
-    if (!roots.includes(root)) roots.push(root);
-  };
-
-  const explicit = typeof env.OMX_TEAM_STATE_ROOT === 'string' ? env.OMX_TEAM_STATE_ROOT : '';
-  addStateRoot(explicit);
-  addStateRoot(join(resolve(cwd), '.omx', 'state'));
-  return roots;
+  return [join(resolveCanonicalTeamStateRoot(cwd, env), 'team')];
 }
 
 export function listTeamLookupCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env): TeamLookupCandidate[] {

@@ -81,6 +81,19 @@ describe('canonical Git layout identity', () => {
     }
   });
 
+  it('rejects empty linked-worktree commondir metadata', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'omx-git-layout-empty-commondir-'));
+    const gitDir = join(directory, 'git-dir');
+    try {
+      await mkdir(gitDir, { recursive: true });
+      await writeFile(join(directory, '.git'), `gitdir: ${gitDir}\n`, 'utf-8');
+      await writeFile(join(gitDir, 'commondir'), '\n', 'utf-8');
+      assert.throws(() => findCanonicalGitLayout(directory), /empty Git metadata file|cannot read Git metadata file/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('uses the canonical startup cwd for a non-Git workspace', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'omx-git-layout-non-git-'));
     try {

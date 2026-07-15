@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, realpath, rm, writeFile, readFile, mkdir, readdir } from 'fs/promises';
-import { delimiter, join } from 'path';
+import { delimiter, join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import {
@@ -11,7 +12,7 @@ import {
   saveTeamConfig,
 } from '../state.js';
 import {
-  startTeam,
+  startTeam as rawStartTeam,
   shutdownTeam,
   resolveWorkerLaunchArgsFromEnv,
   type TeamRuntime,
@@ -24,6 +25,47 @@ import {
   mintStateAuthorityTransportCapability,
 } from '../../state/authority.js';
 import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+function testAuthoritySessionId(cwd: string): string {
+  return `team-start-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 24)}`;
+}
+
+async function startTeam(
+  ...args: Parameters<typeof rawStartTeam>
+): ReturnType<typeof rawStartTeam> {
+  const cwd = args[5];
+  const canonicalSessionId = testAuthoritySessionId(cwd);
+  const requestedSessionId = process.env.OMX_SESSION_ID?.trim() || canonicalSessionId;
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${canonicalSessionId}-launch`,
+    session_binding: {
+      canonical_session_id: canonicalSessionId,
+      ...(requestedSessionId === canonicalSessionId
+        ? {}
+        : { aliases: { current_session_aliases: [requestedSessionId] } }),
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const transport = buildStateAuthorityTransportEnv(authority, {
+    OMX_SESSION_ID: requestedSessionId,
+  });
+  const previous = new Map(
+    Object.keys(transport).map((key) => [key, process.env[key]]),
+  );
+
+  Object.assign(process.env, transport);
+  try {
+    return await rawStartTeam(...args);
+  } finally {
+    for (const [key, value] of previous) {
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  }
+}
 
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
@@ -680,6 +722,7 @@ switch (args[0] || '') {
         'OMX_TEAM_WORKER_LAUNCH_MODE',
         'OMX_TEAM_SKIP_READY_WAIT',
         'OMX_TEAM_WORKER_CLI',
+        'OMX_SESSION_ID',
         providerEnvKey,
         `OMX_TEST_EXPECTED_${providerEnvKey}`,
         ...authorityEnvKeys,
@@ -875,9 +918,12 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
           ]),
         ),
       );
+      process.env.OMX_SESSION_ID =
+        'worker-runtime-preexisting-tmux-authority-session';
 
+      // Bypass the fixture wrapper to exercise the manually assembled transport.
       runtime = await withoutTeamWorkerEnv(() =>
-        startTeam(
+        rawStartTeam(
           'pre-existing-tmux-authority',
           'propagate authority to an existing tmux leader worker',
           'executor',
@@ -945,29 +991,24 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
         'runtime',
         'worker-1-startup.sh',
       );
-      const startupScript = existsSync(startupScriptPath)
-        ? await readFile(startupScriptPath, 'utf8')
-        : '';
+      assert.equal(existsSync(startupScriptPath), true, 'expected the managed worker startup script');
+      const startupScript = await readFile(startupScriptPath, 'utf8');
       const persistedWorkerFiles = await readRegularFilesRecursively(teamRoot);
       for (const value of persistedWorkerFiles) {
         assert.equal(value.includes(minted.capability), false);
         assert.equal(value.includes(providerValue), false);
       }
-      if (startupScript) {
-        for (const key of [
-          'OMX_STARTUP_CWD',
-          'OMX_STATE_AUTHORITY_PATH',
-          'OMX_STATE_AUTHORITY_ID',
-          'OMX_STATE_AUTHORITY_GENERATION_ID',
-          'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
-          'OMX_STATE_AUTHORITY_CAPABILITY',
-          providerEnvKey,
-        ]) {
-          assert.doesNotMatch(startupScript, new RegExp(key));
-        }
+      for (const key of [
+        'OMX_STARTUP_CWD',
+        'OMX_STATE_AUTHORITY_PATH',
+        'OMX_STATE_AUTHORITY_ID',
+        'OMX_STATE_AUTHORITY_GENERATION_ID',
+        'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+        'OMX_STATE_AUTHORITY_CAPABILITY',
+        providerEnvKey,
+      ]) {
+        assert.doesNotMatch(startupScript, new RegExp(key));
       }
-      assert.doesNotMatch(startupScript, /OMX_STATE_AUTHORITY_CAPABILITY/);
-      assert.doesNotMatch(startupScript, new RegExp(providerEnvKey));
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
 

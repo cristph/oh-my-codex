@@ -292,7 +292,7 @@ interface HotswapAuthorityPin {
   bindingId: string;
   bindingRevision: number;
   canonicalSessionId: string;
-  leaseLaunchId: string;
+
 }
 
 async function pinHotswapAuthority(
@@ -331,7 +331,7 @@ async function pinHotswapAuthority(
     bindingId: authority.session_binding.binding_id,
     bindingRevision: authority.session_binding.binding_revision,
     canonicalSessionId: authority.session_binding.canonical_session_id,
-    leaseLaunchId: lease.launch_id,
+
   });
 }
 
@@ -379,7 +379,8 @@ async function resolveCurrentHotswapAuthority(
     session_id: pin.canonicalSessionId,
   });
   if (!resolution.context || !resolution.can_mutate) {
-    throw new Error(
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
       "OMX auth hotswap cannot refresh the committed state authority after pre-launch; refusing credential mutation, cleanup, and Codex spawn.",
     );
   }
@@ -393,10 +394,10 @@ async function resolveCurrentHotswapAuthority(
     anchor.active_generation_id !== pin.generationId ||
     !lease ||
     lease.generation_id !== pin.generationId ||
-    lease.binding_id !== pin.bindingId ||
-    lease.launch_id !== pin.leaseLaunchId
+    lease.binding_id !== pin.bindingId
   ) {
-    throw new Error(
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
       "OMX auth hotswap authority changed outside the original immutable authority context; refusing credential mutation, cleanup, and Codex spawn.",
     );
   }
@@ -404,29 +405,25 @@ async function resolveCurrentHotswapAuthority(
 }
 
 async function buildValidatedHotswapTransportEnv(
-  pin: Readonly<HotswapAuthorityPin>,
-  cwd: string,
+  authority: Readonly<ResolvedStateAuthorityContext>,
   env: NodeJS.ProcessEnv,
-): Promise<{
-  authority: Readonly<ResolvedStateAuthorityContext>;
-  env: NodeJS.ProcessEnv;
-}> {
-  const authority = await resolveCurrentHotswapAuthority(pin, cwd);
-  const capability = stateAuthorityTransportCapabilityForChild(authority);
+  capability = stateAuthorityTransportCapabilityForChild(authority),
+): Promise<NodeJS.ProcessEnv> {
   await validateStateAuthorityTransportCapability(authority, capability);
-  return { authority, env: buildStateAuthorityTransportEnv(authority, env) };
+  return buildStateAuthorityTransportEnv(authority, env);
 }
 
 async function withPinnedHotswapAuthorityTransaction<T>(
-  authority: Readonly<ResolvedStateAuthorityContext>,
+  _authority: Readonly<ResolvedStateAuthorityContext>,
   pin: Readonly<HotswapAuthorityPin>,
   cwd: string,
   callback: (authority: Readonly<ResolvedStateAuthorityContext>) => Promise<T>,
 ): Promise<T> {
-  return await withStateAuthorityTransaction(authority, async () => {
-    const current = await resolveCurrentHotswapAuthority(pin, cwd);
-    return await callback(current);
-  });
+  const current = await resolveCurrentHotswapAuthority(pin, cwd);
+  return await withStateAuthorityTransaction(current, async () =>
+    await callback(await resolveCurrentHotswapAuthority(pin, cwd)),
+  );
+
 }
 
 async function resolveCommittedHotswapAuthority(
@@ -451,12 +448,18 @@ async function resolveCommittedHotswapAuthority(
   return authority;
 }
 
-async function ensureInitialHotswapTransportCapability(
+interface InitialHotswapTransportCapability {
+  capability: string;
+  action: "reused" | "rotated";
+}
+
+async function getOrRotateInitialHotswapTransportCapability(
   authority: Readonly<ResolvedStateAuthorityContext>,
-): Promise<void> {
+): Promise<InitialHotswapTransportCapability> {
   try {
     const capability = stateAuthorityTransportCapabilityForChild(authority);
     await validateStateAuthorityTransportCapability(authority, capability);
+    return { capability, action: "reused" };
   } catch (error) {
     if (
       !(error instanceof StateAuthorityError) ||
@@ -464,9 +467,28 @@ async function ensureInitialHotswapTransportCapability(
     ) {
       throw error;
     }
-    await mintStateAuthorityTransportCapability(authority);
+    const minted = await mintStateAuthorityTransportCapability(authority);
+    await validateStateAuthorityTransportCapability(authority, minted.capability);
+    return { capability: minted.capability, action: "rotated" };
   }
 }
+
+function redactedHotswapCleanupFailure(
+  stage: "post-launch" | "runtime-home",
+  error: unknown,
+): Error {
+  return new Error(
+    `OMX auth hotswap ${stage} cleanup failed: ${redactAuthSecrets(error)}`,
+  );
+}
+
+function isHotswapAuthorityPinViolation(error: unknown): boolean {
+  return (
+    error instanceof StateAuthorityError &&
+    error.code === AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict
+  );
+}
+
 
 export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
   const cwd = options.cwd ?? process.cwd();
@@ -476,10 +498,23 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
   );
   assertHotswapAuthority(authority);
   const authorityPin = await pinHotswapAuthority(authority);
-  await ensureInitialHotswapTransportCapability(authority);
+  const initialTransport =
+    await getOrRotateInitialHotswapTransportCapability(authority);
+  if (initialTransport.action === "rotated") {
+    process.stderr.write(
+      "[omx auth] state-authority transport capability expired; rotating before launch.\n",
+    );
+  }
   const env = options.env ?? process.env;
-  const { env: preLaunchAuthorityEnv } =
-    await buildValidatedHotswapTransportEnv(authorityPin, cwd, env);
+  const preLaunchAuthority = await resolveCurrentHotswapAuthority(
+    authorityPin,
+    cwd,
+  );
+  const preLaunchAuthorityEnv = await buildValidatedHotswapTransportEnv(
+    preLaunchAuthority,
+    env,
+    initialTransport.capability,
+  );
   const home = options.home ?? homedir();
   const lifecycle = options.lifecycle;
   const rawArgs = stripHotswapArg(options.argv);
@@ -504,18 +539,17 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
   }
 
   let prepared: PreparedHotswapCodexHome | undefined;
-  let cleanupArmed = false;
-  let preparationCompleted = false;
-  let preLaunchCompleted = false;
+  let preLaunchStarted = false;
   try {
-    cleanupArmed = true;
     const preparedCodexHome = await withPinnedHotswapAuthorityTransaction(
       authority,
       authorityPin,
       cwd,
-      async () => {
-        const { env: preparedAuthorityEnv } =
-          await buildValidatedHotswapTransportEnv(authorityPin, cwd, env);
+      async (preparedAuthority) => {
+        const preparedAuthorityEnv = await buildValidatedHotswapTransportEnv(
+          preparedAuthority,
+          env,
+        );
         return await lifecycle.prepareCodexHomeForLaunch(
           cwd,
           sessionId,
@@ -524,7 +558,6 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
       },
     );
     prepared = preparedCodexHome;
-    preparationCompleted = true;
 
     const childCodexHome =
       preparedCodexHome.codexHomeOverride ||
@@ -547,6 +580,7 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
       authorityPin,
       cwd,
     );
+
     await lifecycle.preLaunch(
       cwd,
       sessionId,
@@ -556,7 +590,8 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
       false,
       preLaunchAuthority,
     );
-    preLaunchCompleted = true;
+    preLaunchStarted = true;
+    await resolveCurrentHotswapAuthority(authorityPin, cwd);
     await withPinnedHotswapAuthorityTransaction(
       authority,
       authorityPin,
@@ -571,10 +606,9 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
         authority,
         authorityPin,
         cwd,
-        async () => {
-          const { env: authorityEnv } = await buildValidatedHotswapTransportEnv(
-            authorityPin,
-            cwd,
+        async (attemptAuthority) => {
+          const authorityEnv = await buildValidatedHotswapTransportEnv(
+            attemptAuthority,
             env,
           );
           const childEnv: NodeJS.ProcessEnv = {
@@ -681,45 +715,75 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
     process.stderr.write(`[omx auth] ${redactAuthSecrets(err)}\n`);
     return 1;
   } finally {
-    if (preparationCompleted && preLaunchCompleted && prepared) {
+    const cleanupFailures: Error[] = [];
+    if (preLaunchStarted && prepared) {
+      let postLaunchAuthority: Readonly<ResolvedStateAuthorityContext> | undefined;
       try {
-        const postLaunchAuthority = await resolveCurrentHotswapAuthority(
-          authorityPin,
-          cwd,
-        );
-        await lifecycle.postLaunch(
-          cwd,
-          sessionId,
-          prepared.codexHomeOverride,
-          true,
-          prepared.projectLocalCodexHomeForCleanup,
-          postLaunchAuthority,
-        );
+        postLaunchAuthority = await resolveCurrentHotswapAuthority(authorityPin, cwd);
       } catch (err) {
-        process.stderr.write(
-          `[omx auth] postLaunch warning: ${redactAuthSecrets(err)}\n`,
-        );
+        if (!isHotswapAuthorityPinViolation(err)) {
+          const failure = redactedHotswapCleanupFailure("post-launch", err);
+          cleanupFailures.push(failure);
+          process.stderr.write(`[omx auth] ${failure.message}\n`);
+        }
+      }
+      if (postLaunchAuthority) {
+        try {
+          await lifecycle.postLaunch(
+            cwd,
+            sessionId,
+            prepared.codexHomeOverride,
+            true,
+            prepared.projectLocalCodexHomeForCleanup,
+            postLaunchAuthority,
+          );
+          await resolveCurrentHotswapAuthority(authorityPin, cwd);
+        } catch (err) {
+          const failure = redactedHotswapCleanupFailure("post-launch", err);
+          cleanupFailures.push(failure);
+          process.stderr.write(`[omx auth] ${failure.message}\n`);
+        }
       }
     }
-    if (cleanupArmed) {
-      try {
-        await withPinnedHotswapAuthorityTransaction(
-          authority,
-          authorityPin,
-          cwd,
-          async (cleanupAuthority) => {
-            await lifecycle.cleanupRuntimeCodexHome(
-              prepared?.runtimeCodexHomeForCleanup,
-              prepared?.projectLocalCodexHomeForCleanup,
-              cleanupAuthority,
-            );
-          },
-        );
-      } catch (err) {
-        process.stderr.write(
-          `[omx auth] cleanup warning: ${redactAuthSecrets(err)}\n`,
-        );
+    let cleanupAuthority: Readonly<ResolvedStateAuthorityContext> | undefined;
+    try {
+      cleanupAuthority = await resolveCurrentHotswapAuthority(authorityPin, cwd);
+    } catch (err) {
+      if (!isHotswapAuthorityPinViolation(err)) {
+        const failure = redactedHotswapCleanupFailure("runtime-home", err);
+        cleanupFailures.push(failure);
+        process.stderr.write(`[omx auth] ${failure.message}\n`);
       }
+    }
+    if (cleanupAuthority) {
+      try {
+        await withStateAuthorityTransaction(cleanupAuthority, async () => {
+          const currentCleanupAuthority = await resolveCurrentHotswapAuthority(
+            authorityPin,
+            cwd,
+          );
+          await lifecycle.cleanupRuntimeCodexHome(
+            prepared?.runtimeCodexHomeForCleanup,
+            prepared?.projectLocalCodexHomeForCleanup,
+            currentCleanupAuthority,
+          );
+        });
+      } catch (err) {
+        if (!isHotswapAuthorityPinViolation(err)) {
+          const failure = redactedHotswapCleanupFailure("runtime-home", err);
+          cleanupFailures.push(failure);
+          process.stderr.write(`[omx auth] ${failure.message}\n`);
+        }
+      }
+    }
+    if (cleanupFailures.length === 1) {
+      throw cleanupFailures[0];
+    }
+    if (cleanupFailures.length > 1) {
+      throw new AggregateError(
+        cleanupFailures,
+        "OMX auth hotswap cleanup failed",
+      );
     }
   }
 }

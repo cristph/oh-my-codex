@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { constants, existsSync } from 'node:fs';
-import { lstat, mkdir, open, readdir, unlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
 
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
@@ -26,15 +26,18 @@ import {
   fsyncAuthorityDirectory,
   isTrustedAuthorityPlatformRootAlias,
   resolveWorkspaceIdentity,
+  resolveStateAuthorityForGuard,
   readStateAuthorityEvidence,
   readWorkspaceAuthorityAnchor,
   sameRootFilesystemIdentity,
+  stateAuthorityFilesystemPrimitiveForPlatform,
   validateStateAuthority,
   validateStateAuthorityGeneration,
   withStateAuthorityTransaction,
   type AcquiredStateAuthorityLock,
   type ResolvedStateAuthorityContext,
   type StateAuthorityGeneration,
+  type RootFilesystemIdentity,
 } from './authority.js';
 import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
@@ -192,77 +195,212 @@ async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promis
   }
 }
 
-async function writeAtomicFile(baseStateDir: string, path: string, data: string): Promise<void> {
-  const rootIdentity = await captureRootFilesystemIdentity(baseStateDir);
+async function assertExpectedStateRootIdentity(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  label: string,
+): Promise<void> {
+  const actualRootIdentity = await captureRootFilesystemIdentity(baseStateDir);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      `${label} does not match the persisted active state-root identity`,
+    );
+  }
+}
+
+async function writeAtomicFile(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  path: string,
+  data: string,
+): Promise<void> {
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state write root');
+  await awaitStateOperationTestBarrier('before_state_write');
   await atomicWriteAuthorityFile(path, data, {
     authority_root: baseStateDir,
-    expected_root_identity: rootIdentity,
+    expected_root_identity: expectedRootIdentity,
   });
+}
+
+type OpenedStateClearDirectory = {
+  handle?: Awaited<ReturnType<typeof open>>;
+  operationPath: string;
+  path: string;
+  identity: StateReadDirectoryIdentity;
+};
+
+async function closeStateClearResources(
+  targetHandle: Awaited<ReturnType<typeof open>> | undefined,
+  directory: OpenedStateClearDirectory | undefined,
+): Promise<void> {
+  const cleanupFailures: unknown[] = [];
+  try {
+    await targetHandle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  try {
+    await directory?.handle?.close();
+  } catch (cleanupError) {
+    cleanupFailures.push(cleanupError);
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'state clear cleanup was incomplete');
+  }
+}
+
+async function descriptorRelativeStateClearDirectoryPath(
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<string | null> {
+  const held = await handle.stat();
+  for (const candidate of [`/proc/self/fd/${handle.fd}`, `/dev/fd/${handle.fd}`]) {
+    try {
+      const details = await stat(candidate);
+      if (details.isDirectory() && sameStateReadFileIdentity(details, held)) return candidate;
+    } catch {
+      // Try the next Linux descriptor namespace.
+    }
+  }
+  return null;
+}
+
+async function openStateClearDirectory(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  directory: string,
+  label: string,
+): Promise<OpenedStateClearDirectory> {
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+  const identity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+  const primitive = stateAuthorityFilesystemPrimitiveForPlatform();
+  if (process.platform !== 'linux') {
+    return { operationPath: directory, path: directory, identity };
+  }
+  if (!primitive.descriptor_relative || primitive.directory_open_flags === null || primitive.file_open_flags === null) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'the Linux runtime does not expose descriptor-relative no-follow state deletion',
+    );
+  }
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(directory, primitive.directory_open_flags);
+    const held = await handle.stat();
+    const current = await lstat(directory);
+    const expectedDirectory = resolve(directory) === resolve(baseStateDir)
+      ? identity.stateRoot
+      : identity.sessionDir;
+    if (
+      !expectedDirectory
+      || current.isSymbolicLink()
+      || !current.isDirectory()
+      || !sameStateReadFileIdentity(expectedDirectory, held)
+      || !sameStateReadFileIdentity(current, held)
+    ) {
+      stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory changed while opening for deletion: ${directory}`);
+    }
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+    const operationPath = await descriptorRelativeStateClearDirectoryPath(handle);
+    if (!operationPath) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+        'the Linux runtime cannot address an opened state deletion directory descriptor',
+      );
+    }
+    return { handle, operationPath, path: directory, identity };
+  } catch (error) {
+    try {
+      await handle?.close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'state clear directory setup failed and cleanup was incomplete');
+    }
+    throw error;
+  }
 }
 
 async function unlinkDurably(
   baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
   path: string,
   label = 'state clear target',
 ): Promise<boolean> {
   const target = resolve(path);
   const directory = dirname(target);
-  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  const primitive = stateAuthorityFilesystemPrimitiveForPlatform();
+  if (process.platform === 'linux' && (!primitive.descriptor_relative || primitive.file_open_flags === null)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'the Linux runtime does not expose descriptor-relative no-follow state deletion',
+    );
+  }
+  let targetHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let openedDirectory: OpenedStateClearDirectory | undefined;
   try {
-    const directoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
-    const beforeOpen = await lstat(target);
+    openedDirectory = await openStateClearDirectory(baseStateDir, expectedRootIdentity, directory, label);
+    const operationTarget = join(openedDirectory.operationPath, basename(target));
+    const beforeOpen = await lstat(operationTarget);
     assertRegularStateReadFile(beforeOpen, target, label);
+    const noFollow = primitive.file_open_flags ?? 0;
     try {
-      handle = await open(target, constants.O_RDONLY | noFollow);
+      targetHandle = await open(operationTarget, constants.O_RDONLY | noFollow);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
         stateReadError(AUTHORITY_DIAGNOSTIC_CODES.rootSymlink, `${label} must not be a symbolic link: ${target}`);
       }
       throw error;
     }
-    const opened = await handle.stat();
-    const afterOpen = await lstat(target);
+    const opened = await targetHandle.stat();
+    const afterOpen = await lstat(operationTarget);
     if (afterOpen.isSymbolicLink() || !afterOpen.isFile()
       || !sameStateReadFileIdentity(beforeOpen, opened)
       || !sameStateReadFileIdentity(opened, afterOpen)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} changed while opening for deletion: ${target}`);
     }
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
     const afterOpenDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
-    if (!sameStateReadDirectoryIdentity(directoryIdentity, afterOpenDirectoryIdentity)) {
+    if (!sameStateReadDirectoryIdentity(openedDirectory.identity, afterOpenDirectoryIdentity)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while opening for deletion: ${target}`);
     }
     await awaitStateOperationTestBarrier('before_state_unlink');
-    const atUnlinkBoundary = await lstat(target);
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+    const atUnlinkBoundary = await lstat(operationTarget);
     if (atUnlinkBoundary.isSymbolicLink() || !atUnlinkBoundary.isFile()
       || !sameStateReadFileIdentity(opened, atUnlinkBoundary)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced before deletion: ${target}`);
     }
     const atUnlinkDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
-    if (!sameStateReadDirectoryIdentity(directoryIdentity, atUnlinkDirectoryIdentity)) {
+    if (!sameStateReadDirectoryIdentity(openedDirectory.identity, atUnlinkDirectoryIdentity)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced before deletion: ${target}`);
     }
     if (process.platform === 'win32') {
-      await handle.close();
-      handle = undefined;
-      const afterClose = await lstat(target);
+      await targetHandle.close();
+      targetHandle = undefined;
+      await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+      const afterClose = await lstat(operationTarget);
       if (afterClose.isSymbolicLink() || !afterClose.isFile()
         || !sameStateReadFileIdentity(opened, afterClose)) {
         stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced before deletion: ${target}`);
       }
       const afterCloseDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
-      if (!sameStateReadDirectoryIdentity(directoryIdentity, afterCloseDirectoryIdentity)) {
+      if (!sameStateReadDirectoryIdentity(openedDirectory.identity, afterCloseDirectoryIdentity)) {
         stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced before deletion: ${target}`);
       }
     }
-    await unlink(target);
-    await fsyncAuthorityDirectory(directory);
+    await unlink(operationTarget);
+    if (process.platform === 'linux') {
+      await openedDirectory.handle?.sync();
+    } else {
+      await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+      await fsyncAuthorityDirectory(directory);
+    }
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw error;
   } finally {
-    await handle?.close().catch(() => undefined);
+    await closeStateClearResources(targetHandle, openedDirectory);
   }
 }
 
@@ -321,30 +459,29 @@ type StateOperationTestBarrierPoint =
   | 'before_mutation_transaction'
   | 'before_state_evidence_read'
   | 'before_state_evidence_append'
-  | 'before_state_unlink';
+  | 'before_state_read'
+  | 'before_state_unlink'
+  | 'before_state_write';
+
+export interface StateOperationTestHooks {
+  faultInjectionPoint?: StateOperationFaultInjectionPoint;
+  barrier?: (point: StateOperationTestBarrierPoint) => void | Promise<void>;
+}
+
+let stateOperationTestHooks: StateOperationTestHooks = {};
+
+export function setStateOperationTestHooksForTests(hooks: StateOperationTestHooks = {}): void {
+  stateOperationTestHooks = hooks;
+}
 
 function injectStateOperationFault(point: StateOperationFaultInjectionPoint): void {
-  if (process.env.OMX_STATE_OPERATION_FAULT_INJECTION === point) {
+  if (stateOperationTestHooks.faultInjectionPoint === point) {
     throw new Error(`injected state operation crash at ${point}`);
   }
 }
 
-/** Test-only cross-process synchronization seam; it is never persisted or user-facing. */
 async function awaitStateOperationTestBarrier(point: StateOperationTestBarrierPoint): Promise<void> {
-  const directory = process.env.OMX_STATE_OPERATION_TEST_BARRIER_DIR;
-  const configuredPoint = process.env.OMX_STATE_OPERATION_TEST_BARRIER_POINT ?? 'before_mutation_transaction';
-  if (!directory || configuredPoint !== point) return;
-
-  const reachedPath = join(directory, `${point}.reached`);
-  const releasePath = join(directory, `${point}.release`);
-  await writeFile(reachedPath, '', { flag: 'w' });
-  const deadline = Date.now() + 5_000;
-  while (!existsSync(releasePath)) {
-    if (Date.now() >= deadline) {
-      throw new Error(`timed out waiting at state operation test barrier: ${point}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await stateOperationTestHooks.barrier?.(point);
 }
 
 function createRecoveryArguments(
@@ -538,13 +675,13 @@ async function readLocallyRootedHistoricalGeneration(
   }
 }
 
-async function isLocallyProvenHistoricalDurableStateOperationEvidence(
+async function resolveLocallyProvenDurableStateOperationGeneration(
   evidence: DurableStateOperationEvidence,
   authority: ResolvedStateAuthorityContext,
-): Promise<boolean> {
+): Promise<StateAuthorityGeneration> {
   if (evidence.authority_id === authority.generation.authority_id
     && evidence.generation_id === authority.generation.generation_id) {
-    return true;
+    return authority.generation;
   }
 
   const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
@@ -600,7 +737,7 @@ async function isLocallyProvenHistoricalDurableStateOperationEvidence(
     }
     if (historical.authority_id === evidence.authority_id
       && historical.generation_id === evidence.generation_id) {
-      return false;
+      return historical;
     }
 
     descendant = historical;
@@ -612,7 +749,7 @@ async function isLocallyProvenHistoricalDurableStateOperationEvidence(
 
 function parseDurableStateOperation(
   evidence: DurableStateOperationEvidence,
-  authority: ResolvedStateAuthorityContext,
+  evidenceGeneration: StateAuthorityGeneration,
   lock: AcquiredStateAuthorityLock,
 ): ParsedDurableStateOperationEvidence | null {
   const event = evidence.event!;
@@ -642,10 +779,10 @@ function parseDurableStateOperation(
   if (
     typeof event.fencing_token !== 'number'
     || !Number.isSafeInteger(event.fencing_token)
-    || event.fencing_token < authority.generation.creation_fence
+    || event.fencing_token < evidenceGeneration.creation_fence
     || event.fencing_token > lock.record.fencing_token
   ) {
-    malformedDurableStateOperationEvidence('state operation evidence has a fence outside the current authority generation');
+    malformedDurableStateOperationEvidence('state operation evidence has a fence outside its referenced authority generation');
   }
   if (
     typeof event.anchor_revision !== 'number'
@@ -678,7 +815,7 @@ async function repairTornDurableStateOperationEvidence(
     'authority',
     STATE_AUTHORITY_TOMBSTONE_FILE,
   );
-  await writeAtomicFile(authority.generation.canonical_state_root, evidencePath, completeContent);
+  await writeAtomicFile(authority.generation.canonical_state_root, authority.generation.root_identity, evidencePath, completeContent);
   await fsyncAuthorityDirectory(dirname(evidencePath));
 }
 
@@ -711,8 +848,8 @@ async function readPreparedDurableStateOperations(
       malformedDurableStateOperationEvidence('state operation evidence contains invalid JSON');
     }
     const durableEvidence = validateDurableStateOperationEvidence(evidence);
-    if (!await isLocallyProvenHistoricalDurableStateOperationEvidence(durableEvidence, authority)) continue;
-    const parsed = parseDurableStateOperation(durableEvidence, authority, lock);
+    const evidenceGeneration = await resolveLocallyProvenDurableStateOperationGeneration(durableEvidence, authority);
+    const parsed = parseDurableStateOperation(durableEvidence, evidenceGeneration, lock);
     if (!parsed) continue;
     if (parsed.stage === 'prepared') {
       prepared.set(parsed.operation.operation_id, parsed.operation);
@@ -845,20 +982,35 @@ async function assertStateDirectoryIfPresent(path: string, label: string): Promi
   }
 }
 
-async function ensureStateChildDirectory(parent: string, child: string, label: string): Promise<string> {
+async function ensureStateChildDirectory(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  parent: string,
+  child: string,
+  label: string,
+): Promise<string> {
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, `${label} root`);
   await assertStateDirectory(parent, `${label} parent`);
   const path = join(parent, child);
   try {
-    await mkdir(path);
+    await mkdir(path, { mode: 0o700 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, `${label} root`);
   await assertStateDirectory(parent, `${label} parent`);
   await assertStateDirectory(path, label);
   return path;
 }
 
-async function assertSessionStateDirectoryForRead(baseStateDir: string, sessionId?: string): Promise<void> {
+async function assertSessionStateDirectoryForRead(
+  baseStateDir: string,
+  sessionId?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state session read root');
+  }
   if (!sessionId) return;
   if (!await assertStateDirectoryIfPresent(baseStateDir, 'state root')) return;
   const sessionsDir = join(baseStateDir, 'sessions');
@@ -868,6 +1020,9 @@ async function assertSessionStateDirectoryForRead(baseStateDir: string, sessionI
   if (!await assertStateDirectoryIfPresent(sessionDir, 'state session directory')) return;
   await assertStateDirectory(sessionsDir, 'state sessions directory');
   await assertStateDirectory(sessionDir, 'state session directory');
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state session read root');
+  }
 }
 
 function isPathWithinStateRoot(root: string, candidate: string): boolean {
@@ -908,7 +1063,15 @@ async function assertStatePathHasNoSymlinkComponents(path: string, label: string
 }
 
 
-async function assertStateReadDirectory(baseStateDir: string, directory: string, label: string): Promise<void> {
+async function assertStateReadDirectory(
+  baseStateDir: string,
+  directory: string,
+  label: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+  }
   const stateRoot = resolve(baseStateDir);
   const stateDirectory = resolve(directory);
   if (!isPathWithinStateRoot(stateRoot, stateDirectory)) {
@@ -921,27 +1084,35 @@ async function assertStateReadDirectory(baseStateDir: string, directory: string,
   await assertStatePathHasNoSymlinkComponents(stateRoot, label);
   await assertStateDirectory(stateRoot, 'state root');
 
-  if (stateDirectory === stateRoot) return;
+  if (stateDirectory !== stateRoot) {
+    const segments = relative(stateRoot, stateDirectory).split(/[\\/]+/);
+    if (segments.length !== 2 || segments[0] !== 'sessions' || !/^[A-Za-z0-9_-]{1,64}$/.test(segments[1])) {
+      stateReadError(
+        AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+        `${label} is outside the active authority session schema: ${stateDirectory}`,
+      );
+    }
 
-  const segments = relative(stateRoot, stateDirectory).split(/[\\/]+/);
-  if (segments.length !== 2 || segments[0] !== 'sessions' || !/^[A-Za-z0-9_-]{1,64}$/.test(segments[1])) {
-    stateReadError(
-      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
-      `${label} is outside the active authority session schema: ${stateDirectory}`,
-    );
+    const sessionsDir = join(stateRoot, 'sessions');
+    await assertStateDirectory(sessionsDir, 'state sessions directory');
+    await assertStateDirectory(stateDirectory, 'state session directory');
+    await assertStateDirectory(sessionsDir, 'state sessions directory');
+    await assertStatePathHasNoSymlinkComponents(stateRoot, label);
+    await assertStateDirectory(stateRoot, 'state root');
   }
-
-  const sessionsDir = join(stateRoot, 'sessions');
-  await assertStateDirectory(sessionsDir, 'state sessions directory');
-  await assertStateDirectory(stateDirectory, 'state session directory');
-  await assertStateDirectory(sessionsDir, 'state sessions directory');
-  await assertStatePathHasNoSymlinkComponents(stateRoot, label);
-  await assertStateDirectory(stateRoot, 'state root');
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, label);
+  }
 }
 
-async function assertStateReadDirectoryIfPresent(baseStateDir: string, directory: string, label: string): Promise<boolean> {
+async function assertStateReadDirectoryIfPresent(
+  baseStateDir: string,
+  directory: string,
+  label: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<boolean> {
   try {
-    await assertStateReadDirectory(baseStateDir, directory, label);
+    await assertStateReadDirectory(baseStateDir, directory, label, expectedRootIdentity);
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
@@ -979,8 +1150,9 @@ async function captureStateReadDirectoryIdentity(
   baseStateDir: string,
   directory: string,
   label: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<StateReadDirectoryIdentity> {
-  await assertStateReadDirectory(baseStateDir, directory, label);
+  await assertStateReadDirectory(baseStateDir, directory, label, expectedRootIdentity);
   const stateRoot = resolve(baseStateDir);
   const stateDirectory = resolve(directory);
   const identity: StateReadDirectoryIdentity = { stateRoot: await lstat(stateRoot) };
@@ -1002,11 +1174,15 @@ function sameStateReadDirectoryIdentity(
 }
 
 
-async function readRegularStateFile(baseStateDir: string, path: string, label: string): Promise<string> {
+async function readRegularStateFile(
+  baseStateDir: string,
+  path: string,
+  label: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<string> {
   const target = resolve(path);
   const directory = dirname(target);
-  const directoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
-
+  const directoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label, expectedRootIdentity);
 
   const beforeOpen = await lstat(target);
   assertRegularStateReadFile(beforeOpen, target, label);
@@ -1033,11 +1209,10 @@ async function readRegularStateFile(baseStateDir: string, path: string, label: s
     if (!sameStateReadFileIdentity(opened, afterOpen)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced while opening: ${target}`);
     }
-    const afterOpenDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    const afterOpenDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label, expectedRootIdentity);
     if (!sameStateReadDirectoryIdentity(directoryIdentity, afterOpenDirectoryIdentity)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while opening: ${target}`);
     }
-
 
     const content = await handle.readFile({ encoding: 'utf8' }) as string;
     const afterRead = await lstat(target);
@@ -1045,7 +1220,7 @@ async function readRegularStateFile(baseStateDir: string, path: string, label: s
     if (!sameStateReadFileIdentity(opened, afterRead)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} was replaced while reading: ${target}`);
     }
-    const afterReadDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label);
+    const afterReadDirectoryIdentity = await captureStateReadDirectoryIdentity(baseStateDir, directory, label, expectedRootIdentity);
     if (!sameStateReadDirectoryIdentity(directoryIdentity, afterReadDirectoryIdentity)) {
       stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `${label} directory was replaced while reading: ${target}`);
     }
@@ -1055,36 +1230,61 @@ async function readRegularStateFile(baseStateDir: string, path: string, label: s
   }
 }
 
-async function readRegularStateFileIfPresent(baseStateDir: string, path: string, label: string): Promise<string | null> {
+async function readRegularStateFileIfPresent(
+  baseStateDir: string,
+  path: string,
+  label: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<string | null> {
   try {
-    return await readRegularStateFile(baseStateDir, path, label);
+    return await readRegularStateFile(baseStateDir, path, label, expectedRootIdentity);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
 }
 
-async function readSafeSkillActiveState(baseStateDir: string, path: string): Promise<SkillActiveStateLike | null> {
-  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state');
-  if (content === null) return null;
+function parseCanonicalStateRecord(content: string, path: string, label: string): Record<string, unknown> {
+  let value: unknown;
   try {
-    return JSON.parse(content) as SkillActiveStateLike;
+    value = JSON.parse(content);
   } catch {
-    return null;
+    stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, `${label} contains malformed JSON: ${path}`);
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, `${label} must be a JSON object: ${path}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+async function readSafeSkillActiveState(
+  baseStateDir: string,
+  path: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<SkillActiveStateLike | null> {
+  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state', expectedRootIdentity);
+  if (content === null) return null;
+  return parseCanonicalStateRecord(content, path, 'canonical skill state') as SkillActiveStateLike;
 }
 
 async function readVisibleSafeSkillActiveState(
   baseStateDir: string,
   sessionId?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<SkillActiveStateLike | null> {
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(baseStateDir, sessionId);
   return sessionPath
-    ? readSafeSkillActiveState(baseStateDir, sessionPath)
-    : readSafeSkillActiveState(baseStateDir, rootPath);
+    ? readSafeSkillActiveState(baseStateDir, sessionPath, expectedRootIdentity)
+    : readSafeSkillActiveState(baseStateDir, rootPath, expectedRootIdentity);
 }
 
-async function listStateSessionDirectories(baseStateDir: string): Promise<string[]> {
+async function listStateSessionDirectories(
+  baseStateDir: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<string[]> {
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state session inventory root');
+  }
   await assertStatePathHasNoSymlinkComponents(baseStateDir, 'state root');
   await assertStateDirectory(baseStateDir, 'state root');
   const sessionsDir = join(baseStateDir, 'sessions');
@@ -1102,13 +1302,18 @@ async function listStateSessionDirectories(baseStateDir: string): Promise<string
     await assertStateDirectory(sessionDir, 'state session directory');
     directories.push(sessionDir);
   }
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state session inventory root');
+  }
   return directories;
 }
 
 async function finalizeCanonicalSkillStateDurability(
   baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
   options: { sessionId?: string; allSessions?: boolean; sessionIds?: readonly string[] } = {},
 ): Promise<void> {
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state durability root');
   const directories = new Set<string>([baseStateDir]);
   if (options.sessionId) {
     const sessionsDir = join(baseStateDir, 'sessions');
@@ -1133,7 +1338,7 @@ async function finalizeCanonicalSkillStateDurability(
         directories.add(sessionDir);
       }
     } else {
-      for (const sessionDir of await listStateSessionDirectories(baseStateDir)) {
+      for (const sessionDir of await listStateSessionDirectories(baseStateDir, expectedRootIdentity)) {
         directories.add(sessionDir);
       }
     }
@@ -1141,24 +1346,23 @@ async function finalizeCanonicalSkillStateDurability(
 
   for (const directory of directories) {
     const path = join(directory, SKILL_ACTIVE_STATE_FILE);
-    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state');
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'canonical skill state', expectedRootIdentity);
     if (content !== null) {
-      JSON.parse(content);
-      await writeAtomicFile(baseStateDir, path, content);
-
+      parseCanonicalStateRecord(content, path, 'canonical skill state');
+      await writeAtomicFile(baseStateDir, expectedRootIdentity, path, content);
     }
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state durability root');
     await fsyncAuthorityDirectory(directory);
   }
-
 }
 
 async function writeClearedSessionScopedModeState(
   baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
   path: string,
   mode: string,
   sessionId: string,
 ): Promise<void> {
-
   const nowIso = new Date().toISOString();
   const clearedState = withModeRuntimeContext({}, {
     mode,
@@ -1168,11 +1372,14 @@ async function writeClearedSessionScopedModeState(
     completed_at: nowIso,
     session_id: sessionId,
   });
-  await writeAtomicFile(baseStateDir, path, JSON.stringify(clearedState, null, 2));
-
+  await writeAtomicFile(baseStateDir, expectedRootIdentity, path, JSON.stringify(clearedState, null, 2));
 }
 
-async function clearSessionNativeStopState(baseStateDir: string, sessionId: string): Promise<string[]> {
+async function clearSessionNativeStopState(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  sessionId: string,
+): Promise<string[]> {
   const paths = [
     join(baseStateDir, 'native-stop-state.json'),
     join(baseStateDir, 'sessions', sessionId, 'native-stop-state.json'),
@@ -1183,7 +1390,7 @@ async function clearSessionNativeStopState(baseStateDir: string, sessionId: stri
     sessions: Record<string, unknown>;
   }>;
   for (const path of paths) {
-    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'native Stop state');
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'native Stop state', expectedRootIdentity);
     if (content === null) continue;
     let value: unknown;
     try {
@@ -1210,7 +1417,7 @@ async function clearSessionNativeStopState(baseStateDir: string, sessionId: stri
     if (!Object.prototype.hasOwnProperty.call(entry.sessions, sessionId)) continue;
     delete entry.sessions[sessionId];
     entry.state.sessions = entry.sessions;
-    await writeAtomicFile(baseStateDir, entry.path, JSON.stringify(entry.state, null, 2));
+    await writeAtomicFile(baseStateDir, expectedRootIdentity, entry.path, JSON.stringify(entry.state, null, 2));
     changed.push(entry.path);
   }
   return changed;
@@ -1236,21 +1443,37 @@ function modeStatePath(baseStateDir: string, mode: string, sessionId?: string): 
 
 async function initializeStateEnvironment(
   baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
   workspaceRoot: string,
   effectiveSessionId?: string,
   authoritativeOmxRoot?: string,
 ): Promise<void> {
-  await mkdir(baseStateDir, { recursive: true });
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state environment root');
   await assertStateDirectory(baseStateDir, 'state root');
   await fsyncAuthorityDirectory(baseStateDir);
   if (effectiveSessionId) {
-    const sessionsDir = await ensureStateChildDirectory(baseStateDir, 'sessions', 'state sessions directory');
+    const sessionsDir = await ensureStateChildDirectory(
+      baseStateDir,
+      expectedRootIdentity,
+      baseStateDir,
+      'sessions',
+      'state sessions directory',
+    );
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state environment root');
     await fsyncAuthorityDirectory(baseStateDir);
-    await ensureStateChildDirectory(sessionsDir, effectiveSessionId, 'state session directory');
+    await ensureStateChildDirectory(
+      baseStateDir,
+      expectedRootIdentity,
+      sessionsDir,
+      effectiveSessionId,
+      'state session directory',
+    );
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state environment root');
     await fsyncAuthorityDirectory(sessionsDir);
   }
   const { ensureTmuxHookInitialized } = await import('../cli/tmux-hook.js');
   await ensureTmuxHookInitialized(workspaceRoot, authoritativeOmxRoot);
+  await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'state environment root');
 }
 
 function uniqueStatePaths(paths: Array<string | undefined>): string[] {
@@ -1426,19 +1649,15 @@ function validatePreparedClearTargetInventory(
 
 async function clearPersistedAllSessionSkillStateTargets(
   baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
   skillStatePaths: string[],
   mode: string,
 ): Promise<void> {
   const now = new Date().toISOString();
   for (const path of skillStatePaths) {
-    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'prepared canonical skill state');
+    const content = await readRegularStateFileIfPresent(baseStateDir, path, 'prepared canonical skill state', expectedRootIdentity);
     if (content === null) continue;
-    let state: SkillActiveStateLike;
-    try {
-      state = JSON.parse(content) as SkillActiveStateLike;
-    } catch {
-      throw new Error(`prepared canonical skill state is malformed: ${path}`);
-    }
+    const state = parseCanonicalStateRecord(content, path, 'prepared canonical skill state') as SkillActiveStateLike;
     const entries = listActiveSkills(state).filter((entry) => entry.skill !== mode);
     const primary = entries.find((entry) => entry.skill === stringValue(state.skill).trim()) ?? entries[0];
     const next: SkillActiveStateLike = {
@@ -1446,11 +1665,11 @@ async function clearPersistedAllSessionSkillStateTargets(
       active: entries.length > 0,
       skill: primary?.skill ?? (stringValue(state.skill).trim() || mode),
       phase: primary?.phase ?? (stringValue(state.phase).trim() || undefined),
-
       updated_at: now,
       active_skills: entries,
     };
-    await writeAtomicFile(baseStateDir, path, JSON.stringify(next, null, 2));
+    await writeAtomicFile(baseStateDir, expectedRootIdentity, path, JSON.stringify(next, null, 2));
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'prepared canonical skill-state root');
     await fsyncAuthorityDirectory(dirname(path));
   }
 }
@@ -1740,21 +1959,49 @@ function collectCompletedRalplanSessionEntries(
   return [...entries.values()];
 }
 
-async function writeAtomicJson(baseStateDir: string, path: string, value: unknown): Promise<void> {
+async function writeAtomicJson(
+  baseStateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+  path: string,
+  value: unknown,
+): Promise<void> {
   const serialized = JSON.stringify(value, null, 2);
   JSON.parse(serialized);
-  await writeAtomicFile(baseStateDir, path, serialized);
+  await writeAtomicFile(baseStateDir, expectedRootIdentity, path, serialized);
+}
+
+async function resolvePersistedStateRootIdentity(
+  cwd: string,
+  baseStateDir: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<RootFilesystemIdentity> {
+  if (expectedRootIdentity) {
+    await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'ralplan completion root');
+    return expectedRootIdentity;
+  }
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+  });
+  if (resolve(authority.canonical_state_root) !== resolve(baseStateDir)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+      'ralplan completion does not use the committed active authority state root',
+    );
+  }
+  await assertExpectedStateRootIdentity(baseStateDir, authority.generation.root_identity, 'ralplan completion root');
+  return authority.generation.root_identity;
 }
 
 
-async function readJsonRecordIfExists(baseStateDir: string, path: string): Promise<Record<string, unknown> | null> {
-  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'workflow state');
+async function readJsonRecordIfExists(
+  baseStateDir: string,
+  path: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<Record<string, unknown> | null> {
+  const content = await readRegularStateFileIfPresent(baseStateDir, path, 'workflow state', expectedRootIdentity);
   if (content === null) return null;
-  try {
-    return objectRecord(JSON.parse(content) as unknown);
-  } catch {
-    return null;
-  }
+  return parseCanonicalStateRecord(content, path, 'workflow state');
 }
 
 
@@ -1769,13 +2016,19 @@ export async function completeRalplanSession(options: {
   state: Record<string, unknown>;
   explicitSessionId?: string;
   requireNativeSubagents?: boolean;
+  expectedRootIdentity?: RootFilesystemIdentity;
 }): Promise<boolean> {
   if (!isCompleteRalplanTerminalState(options.state)) return false;
-  const sessionId = optionalSessionId(options.explicitSessionId);
+  const sessionId = options.explicitSessionId === undefined ? undefined : validateSessionId(options.explicitSessionId);
   const validationError = validateRalplanTerminalConsensus(options.cwd, options.state, sessionId, {
     requireNativeSubagents: options.requireNativeSubagents === true,
   });
   if (validationError) throw new Error(validationError);
+  const expectedRootIdentity = await resolvePersistedStateRootIdentity(
+    options.cwd,
+    options.baseStateDir,
+    options.expectedRootIdentity,
+  );
 
   const completedSessionId = sessionId ?? optionalSessionId(options.state.session_id);
   const rootScopeCompletion = !sessionId;
@@ -1783,25 +2036,25 @@ export async function completeRalplanSession(options: {
   const nowIso = new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
   const rootStatePath = modeStatePath(options.baseStateDir, 'ralplan');
-  const existingRootState = await readJsonRecordIfExists(options.baseStateDir, rootStatePath);
+  const existingRootState = await readJsonRecordIfExists(options.baseStateDir, rootStatePath, expectedRootIdentity);
 
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
 
   if (shouldWriteRootState) {
-    await writeAtomicJson(options.baseStateDir, rootStatePath, rootState);
+    await writeAtomicJson(options.baseStateDir, expectedRootIdentity, rootStatePath, rootState);
 
   }
   if (sessionId) {
     await writeAtomicJson(
       options.baseStateDir,
-
+      expectedRootIdentity,
       modeStatePath(options.baseStateDir, 'ralplan', sessionId),
       buildRalplanTerminalState(options.state, sessionId, nowIso),
     );
   }
 
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
-  const rootSkillState = await readSafeSkillActiveState(options.baseStateDir, rootPath);
+  const rootSkillState = await readSafeSkillActiveState(options.baseStateDir, rootPath, expectedRootIdentity);
 
   const rootEntries = filterCompletedRalplanRootEntries(
     listActiveSkills(rootSkillState ?? {}),
@@ -1809,19 +2062,20 @@ export async function completeRalplanSession(options: {
     rootScopeCompletion,
   );
   if (rootEntries.length > 0 || (shouldWriteRootState && rootSkillState !== null)) {
-    await writeAtomicJson(options.baseStateDir, rootPath, buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso));
+    await writeAtomicJson(options.baseStateDir, expectedRootIdentity, rootPath, buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso));
 
   } else if (rootSkillState !== null && !isTerminalSkillActiveTombstone(rootSkillState)) {
-    await unlinkDurably(options.baseStateDir, rootPath, 'ralplan canonical skill state');
+    await unlinkDurably(options.baseStateDir, expectedRootIdentity, rootPath, 'ralplan canonical skill state');
 
   }
   if (sessionPath && sessionId) {
-    const sessionSkillState = await readSafeSkillActiveState(options.baseStateDir, sessionPath);
+    const sessionSkillState = await readSafeSkillActiveState(options.baseStateDir, sessionPath, expectedRootIdentity);
 
     const sessionEntries = collectCompletedRalplanSessionEntries(sessionSkillState, rootSkillState, sessionId);
     if (sessionEntries.length > 0 || sessionSkillState !== null) {
       await writeAtomicJson(
         options.baseStateDir,
+        expectedRootIdentity,
         sessionPath,
         sessionEntries.length > 0
           ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
@@ -1841,16 +2095,17 @@ export async function listStateStatuses(
   mode?: string,
   options: { authoritativeActiveDecision?: boolean } = {},
 ): Promise<Record<string, unknown>> {
-  const stateDirs = options.authoritativeActiveDecision
+  const expectedRootIdentity = scope.authority?.generation.root_identity;
+  const stateDirs = options.authoritativeActiveDecision || scope.authority
     ? scope.authoritativeActiveDirs
     : scope.compatibilityReadDirs;
   const statuses: Record<string, unknown> = {};
   const seenModes = new Set<string>();
 
   for (const stateDir of stateDirs) {
-    if (!await assertStateReadDirectoryIfPresent(scope.baseStateDir, stateDir, 'state status directory')) continue;
+    if (!await assertStateReadDirectoryIfPresent(scope.baseStateDir, stateDir, 'state status directory', expectedRootIdentity)) continue;
     const files = await readdir(stateDir);
-    await assertStateReadDirectory(scope.baseStateDir, stateDir, 'state status directory');
+    await assertStateReadDirectory(scope.baseStateDir, stateDir, 'state status directory', expectedRootIdentity);
     for (const file of files) {
       if (!file.endsWith('-state.json')) continue;
       const currentMode = file.replace('-state.json', '');
@@ -1858,7 +2113,7 @@ export async function listStateStatuses(
       if (mode && currentMode !== mode) continue;
       if (seenModes.has(currentMode)) continue;
       const path = join(stateDir, file);
-      const content = await readRegularStateFileIfPresent(scope.baseStateDir, path, 'state status file');
+      const content = await readRegularStateFileIfPresent(scope.baseStateDir, path, 'state status file', expectedRootIdentity);
       if (content === null) {
         throw new StateAuthorityError(
           AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
@@ -1867,19 +2122,22 @@ export async function listStateStatuses(
       }
       seenModes.add(currentMode);
       try {
-        const data = JSON.parse(content);
+        const data = scope.authority
+          ? parseCanonicalStateRecord(content, path, 'authoritative state status file')
+          : JSON.parse(content) as Record<string, unknown>;
         statuses[currentMode] = {
           active: data.active,
           phase: data.current_phase,
           path,
           data,
         };
-      } catch {
+      } catch (error) {
+        if (scope.authority) throw error;
         statuses[currentMode] = { error: 'malformed state file' };
       }
     }
   }
-  if (!mode || mode === 'autopilot') {
+  if (!scope.authority && (!mode || mode === 'autopilot')) {
     const existingAutopilot = statuses.autopilot as { active?: unknown } | undefined;
     if (existingAutopilot?.active !== true) {
       const currentAutopilotPath = join(scope.baseStateDir, 'current-autopilot.json');
@@ -1911,8 +2169,8 @@ export async function listStateStatuses(
 
 
 
-  if (!mode || mode === 'ultragoal') {
-    const workspaceRoot = scope.authority?.workspace_identity.canonical_path ?? scope.cwd;
+  if (!scope.authority && (!mode || mode === 'ultragoal')) {
+    const workspaceRoot = scope.cwd;
     const ultragoal = await readUltragoalState(workspaceRoot).catch(() => null);
     const existingUltragoal = statuses.ultragoal as { active?: unknown } | undefined;
     if (
@@ -1938,7 +2196,7 @@ export async function listStateStatuses(
 export async function listActiveStateModes(scope: OperationRuntimeScope): Promise<string[]> {
   const sessionId = scope.sessionId;
   const statuses = await listStateStatuses(scope, undefined, { authoritativeActiveDecision: true });
-  const canonicalState = await readVisibleSafeSkillActiveState(scope.baseStateDir, sessionId);
+  const canonicalState = await readVisibleSafeSkillActiveState(scope.baseStateDir, sessionId, scope.authority?.generation.root_identity);
 
   const canonicalActiveModes = new Set(
     listActiveSkills(canonicalState ?? {})
@@ -1963,10 +2221,11 @@ export async function listActiveStateModes(scope: OperationRuntimeScope): Promis
 
 async function readCanonicalActiveWorkflowModes(
   baseStateDir: string,
-  sessionId?: string,
+  sessionId: string | undefined,
+  expectedRootIdentity: RootFilesystemIdentity,
 ): Promise<TrackedWorkflowMode[]> {
-  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  const canonicalState = await readVisibleSafeSkillActiveState(baseStateDir, sessionId);
+  const normalizedSessionId = sessionId ?? '';
+  const canonicalState = await readVisibleSafeSkillActiveState(baseStateDir, sessionId, expectedRootIdentity);
 
   const activeModes = listActiveSkills(canonicalState ?? {})
     .filter((entry) => {
@@ -1988,28 +2247,21 @@ async function readSessionDetailTransitionModes(
   baseStateDir: string,
   sessionId: string | undefined,
   requestedMode: TrackedWorkflowMode,
+  expectedRootIdentity: RootFilesystemIdentity,
 ): Promise<TrackedWorkflowMode[] | undefined> {
   if (!sessionId || requestedMode !== 'ralplan') return undefined;
   const autopilotPath = modeStatePath(baseStateDir, 'autopilot', sessionId);
-  const autopilotContent = await readRegularStateFileIfPresent(baseStateDir, autopilotPath, 'workflow transition state');
+  const autopilotContent = await readRegularStateFileIfPresent(baseStateDir, autopilotPath, 'workflow transition state', expectedRootIdentity);
   if (autopilotContent !== null) {
-    try {
-      const state = JSON.parse(autopilotContent) as Record<string, unknown>;
-      if (isActiveDetailWorkflowState(state)) return ['autopilot'];
-    } catch {
-      return undefined;
-    }
+    const state = parseCanonicalStateRecord(autopilotContent, autopilotPath, 'workflow transition state');
+    if (isActiveDetailWorkflowState(state)) return ['autopilot'];
   }
 
   const deepInterviewPath = modeStatePath(baseStateDir, 'deep-interview', sessionId);
-  const deepInterviewContent = await readRegularStateFileIfPresent(baseStateDir, deepInterviewPath, 'workflow transition state');
+  const deepInterviewContent = await readRegularStateFileIfPresent(baseStateDir, deepInterviewPath, 'workflow transition state', expectedRootIdentity);
   if (deepInterviewContent === null) return undefined;
-  try {
-    const state = JSON.parse(deepInterviewContent) as Record<string, unknown>;
-    return isActiveDetailWorkflowState(state) ? ['deep-interview'] : undefined;
-  } catch {
-    return undefined;
-  }
+  const state = parseCanonicalStateRecord(deepInterviewContent, deepInterviewPath, 'workflow transition state');
+  return isActiveDetailWorkflowState(state) ? ['deep-interview'] : undefined;
 }
 
 export async function executeStateOperation(
@@ -2073,7 +2325,12 @@ async function executeStateOperationInternal(
     if (needsStandaloneRecovery) {
       await recoverPreparedDurableStateOperations(scope.authority!);
     }
-    await assertSessionStateDirectoryForRead(scope.baseStateDir, scope.sessionId);
+    await awaitStateOperationTestBarrier('before_state_read');
+    await assertSessionStateDirectoryForRead(
+      scope.baseStateDir,
+      scope.sessionId,
+      scope.authority?.generation.root_identity,
+    );
   } catch (error) {
     return {
       payload: { error: (error as Error).message },
@@ -2090,9 +2347,15 @@ async function executeStateOperationInternal(
     switch (name) {
       case 'state_read': {
         const mode = validateStrictReadableMode(rawArgs.mode);
-        const paths = scope.compatibilityReadDirs.map((dir) => join(dir, `${mode}-state.json`));
+        const stateDirs = scope.authority ? scope.authoritativeActiveDirs : scope.compatibilityReadDirs;
+        const paths = stateDirs.map((dir) => join(dir, `${mode}-state.json`));
         for (const path of paths) {
-          const content = await readRegularStateFileIfPresent(scope.baseStateDir, path, 'state read file');
+          const content = await readRegularStateFileIfPresent(
+            scope.baseStateDir,
+            path,
+            'state read file',
+            scope.authority?.generation.root_identity,
+          );
           if (content === null) continue;
           return { payload: JSON.parse(content) };
         }
@@ -2105,8 +2368,10 @@ async function executeStateOperationInternal(
         if (!authority) throw new Error('state_write requires a committed state authority');
         const effectiveSessionId = scope.sessionId;
         const baseStateDir = scope.baseStateDir;
+        const expectedRootIdentity = authority.generation.root_identity;
         await initializeStateEnvironment(
           baseStateDir,
+          expectedRootIdentity,
           authority.workspace_identity.canonical_path,
           effectiveSessionId,
           authority.generation.canonical_omx_root,
@@ -2128,17 +2393,21 @@ async function executeStateOperationInternal(
         const lock = transactionLock;
         if (!lock) throw new Error('state_write requires a fenced authority transaction lock');
         const skillStatePaths = getSkillActiveStatePathsForStateDir(baseStateDir, effectiveSessionId);
+        const canonicalSkillStatePaths = uniqueStatePaths([skillStatePaths.rootPath, skillStatePaths.sessionPath]);
+        const preflightContent = await readRegularStateFileIfPresent(
+          baseStateDir,
+          path,
+          'state write preflight',
+          expectedRootIdentity,
+        );
+        const preflightExisting = preflightContent === null
+          ? {}
+          : parseCanonicalStateRecord(preflightContent, path, 'state write preflight');
+        for (const skillStatePath of canonicalSkillStatePaths) {
+          await readSafeSkillActiveState(baseStateDir, skillStatePath, expectedRootIdentity);
+        }
         let plannedTransition: PlannedWorkflowTransition | undefined;
         if (!options.recoveryOperation && isTrackedWorkflowMode(mode)) {
-          let preflightExisting: Record<string, unknown> = {};
-          const preflightContent = await readRegularStateFileIfPresent(baseStateDir, path, 'state write transition preflight');
-          if (preflightContent !== null) {
-            try {
-              preflightExisting = JSON.parse(preflightContent) as Record<string, unknown>;
-            } catch {
-              // The authoritative mutation path retains the existing parse-fallback behavior.
-            }
-          }
           const preflightState = {
             ...preflightExisting,
             ...fields,
@@ -2146,12 +2415,21 @@ async function executeStateOperationInternal(
           } as Record<string, unknown>;
           normalizeCurrentPhaseAliasForWrite(preflightState, fields, customState);
           if (preflightState.active === true) {
-            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(
+              baseStateDir,
+              effectiveSessionId,
+              expectedRootIdentity,
+            );
             const transitionCurrentModes = mode === 'ralplan'
               ? (
                 activeCanonicalModes.length > 0
                   ? activeCanonicalModes
-                  : await readSessionDetailTransitionModes(baseStateDir, effectiveSessionId, mode)
+                  : await readSessionDetailTransitionModes(
+                    baseStateDir,
+                    effectiveSessionId,
+                    mode,
+                    expectedRootIdentity,
+                  )
               )
               : undefined;
             plannedTransition = await planWorkflowTransition(cwd, mode, {
@@ -2189,15 +2467,15 @@ async function executeStateOperationInternal(
         }
         await withDurableStateOperation(authority, lock, operation, async (markEffectsStarted) => {
         await withStateWriteLock(path, async () => {
-          let existing: Record<string, unknown> = {};
-          const existingContent = await readRegularStateFileIfPresent(baseStateDir, path, 'state write existing file');
-          if (existingContent !== null) {
-            try {
-              existing = JSON.parse(existingContent);
-            } catch (error) {
-              process.stderr.write(`[state] Failed to parse state file: ${error}\n`);
-            }
-          }
+          const existingContent = await readRegularStateFileIfPresent(
+            baseStateDir,
+            path,
+            'state write existing file',
+            expectedRootIdentity,
+          );
+          const existing = existingContent === null
+            ? {}
+            : parseCanonicalStateRecord(existingContent, path, 'state write existing file');
 
 
           const mergedRaw = {
@@ -2381,12 +2659,12 @@ async function executeStateOperationInternal(
               if (options.recoveryOperation) markEffectsStarted();
 
               if (!transitionPlan) {
-                const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+                const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId, expectedRootIdentity);
                 const transitionCurrentModes = mode === 'ralplan'
                   ? (
                     activeCanonicalModes.length > 0
                       ? activeCanonicalModes
-                      : await readSessionDetailTransitionModes(baseStateDir, effectiveSessionId, mode)
+                      : await readSessionDetailTransitionModes(baseStateDir, effectiveSessionId, mode, expectedRootIdentity)
                   )
                   : undefined;
                 transitionPlan = await planWorkflowTransition(cwd, mode, {
@@ -2407,7 +2685,10 @@ async function executeStateOperationInternal(
               if (transitionPlan.autoCompletedModes.length > 0) {
                 markEffectsStarted();
               }
-              const transition = await applyPlannedWorkflowTransition(cwd, transitionPlan, { action: 'write' });
+              const transition = await applyPlannedWorkflowTransition(cwd, transitionPlan, {
+                action: 'write',
+                expectedRootIdentity,
+              });
               transitionMessage ??= transition.transitionMessage;
             } catch (error) {
               validationError = (error as Error).message;
@@ -2417,26 +2698,34 @@ async function executeStateOperationInternal(
           markEffectsStarted();
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
-          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
-          await writeAtomicFile(baseStateDir, path, JSON.stringify(merged, null, 2));
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId, expectedRootIdentity);
+          await writeAtomicFile(baseStateDir, expectedRootIdentity, path, JSON.stringify(merged, null, 2));
 
         });
 
         if (validationError) throw new Error(validationError);
 
         if (mode === SKILL_ACTIVE_STATE_MODE) {
-          const state = await readSafeSkillActiveState(baseStateDir, path);
+          const state = await readSafeSkillActiveState(baseStateDir, path, expectedRootIdentity);
           if (state) {
-            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
-            await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
+            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId, undefined, expectedRootIdentity);
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
+            await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { sessionId: effectiveSessionId });
           }
         } else {
 
           if (mode === 'ralph' && ensureRalphArtifacts) {
-            await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId, baseStateDir);
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'ralph artifact write root');
+            await ensureCanonicalRalphArtifacts(cwd, effectiveSessionId, baseStateDir, expectedRootIdentity);
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'ralph artifact write root');
           }
-          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
-          const data = JSON.parse(await readRegularStateFile(baseStateDir, path, 'written workflow state')) as Record<string, unknown>;
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId, expectedRootIdentity);
+          const data = parseCanonicalStateRecord(
+            await readRegularStateFile(baseStateDir, path, 'written workflow state', expectedRootIdentity),
+            path,
+            'written workflow state',
+          );
 
           const ralplanCompletionHandled = mode === 'ralplan'
             && !isApprovedUnsupportedNativeNonCleanRecoveryState(data, { cwd, sessionId: effectiveSessionId })
@@ -2446,9 +2735,11 @@ async function executeStateOperationInternal(
               state: data,
               explicitSessionId: effectiveSessionId,
               requireNativeSubagents: true,
+              expectedRootIdentity,
             });
 
           if (!ralplanCompletionHandled) {
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
             await syncCanonicalSkillStateForMode({
               cwd,
               baseStateDir,
@@ -2457,8 +2748,10 @@ async function executeStateOperationInternal(
               currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
               sessionId: effectiveSessionId,
               source: 'state-operations',
+              expectedRootIdentity,
             });
-            await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
+            await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state write root');
+            await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { sessionId: effectiveSessionId });
           }
         }
         }, { preparedAlreadyRecorded: options.recoveryOperation !== undefined });
@@ -2480,8 +2773,10 @@ async function executeStateOperationInternal(
         if (!lock) throw new Error('state_clear requires a fenced authority transaction lock');
         const effectiveSessionId = scope.sessionId;
         const baseStateDir = scope.baseStateDir;
+        const expectedRootIdentity = authority.generation.root_identity;
         await initializeStateEnvironment(
           baseStateDir,
+          expectedRootIdentity,
           authority.workspace_identity.canonical_path,
           effectiveSessionId,
           authority.generation.canonical_omx_root,
@@ -2492,7 +2787,7 @@ async function executeStateOperationInternal(
         const path = modeStatePath(baseStateDir, mode, effectiveSessionId);
         const allSessionDirectories = options.recoveryOperation || !allSessions
           ? []
-          : await listStateSessionDirectories(baseStateDir);
+          : await listStateSessionDirectories(baseStateDir, expectedRootIdentity);
         const allSessionIds = allSessionDirectories.map((directory) => basename(directory));
         const discoveredPaths = options.recoveryOperation
           ? []
@@ -2536,27 +2831,54 @@ async function executeStateOperationInternal(
         if (!allSessions && (paths.length !== 1 || paths[0] !== expectedPath)) {
           throw new Error(`prepared state clear recovery target does not match the active session scope: expected=${expectedPath} actual=${paths.join(',')}`);
         }
+        for (const statePath of targetInventory.modeStatePaths) {
+          const content = await readRegularStateFileIfPresent(
+            baseStateDir,
+            statePath,
+            'state clear preflight',
+            expectedRootIdentity,
+          );
+          if (content !== null) parseCanonicalStateRecord(content, statePath, 'state clear preflight');
+        }
+        for (const skillStatePath of targetInventory.skillStatePaths) {
+          await readSafeSkillActiveState(baseStateDir, skillStatePath, expectedRootIdentity);
+        }
+        const rootWorkflowStatePath = !allSessions && mode !== SKILL_ACTIVE_STATE_MODE && effectiveSessionId
+          ? modeStatePath(baseStateDir, mode)
+          : undefined;
+        const rootWorkflowContent = rootWorkflowStatePath
+          ? await readRegularStateFileIfPresent(
+            baseStateDir,
+            rootWorkflowStatePath,
+            'root workflow state clear preflight',
+            expectedRootIdentity,
+          )
+          : null;
+        if (rootWorkflowContent !== null && rootWorkflowStatePath) {
+          parseCanonicalStateRecord(rootWorkflowContent, rootWorkflowStatePath, 'root workflow state clear preflight');
+        }
 
 
         return await withDurableStateOperation(authority, lock, operation, async (markEffectsStarted) => {
-          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId);
+          await assertSessionStateDirectoryForRead(baseStateDir, effectiveSessionId, expectedRootIdentity);
           markEffectsStarted();
           if (!allSessions) {
             if (
               mode !== SKILL_ACTIVE_STATE_MODE
               && effectiveSessionId
-              && await readRegularStateFileIfPresent(baseStateDir, modeStatePath(baseStateDir, mode), 'root workflow state') !== null
+              && rootWorkflowContent !== null
             ) {
-              await writeClearedSessionScopedModeState(baseStateDir, path, mode, effectiveSessionId);
+              await writeClearedSessionScopedModeState(baseStateDir, expectedRootIdentity, path, mode, effectiveSessionId);
 
             } else {
-              await unlinkDurably(baseStateDir, path, 'session state clear target');
+              await unlinkDurably(baseStateDir, expectedRootIdentity, path, 'session state clear target');
 
             }
             const nativeStopCleared = effectiveSessionId
-              ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
+              ? await clearSessionNativeStopState(baseStateDir, expectedRootIdentity, effectiveSessionId)
               : [];
             if (mode !== SKILL_ACTIVE_STATE_MODE) {
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state clear root');
               await syncCanonicalSkillStateForMode({
                 cwd,
                 baseStateDir,
@@ -2564,15 +2886,17 @@ async function executeStateOperationInternal(
                 active: false,
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
+                expectedRootIdentity,
               });
-              await finalizeCanonicalSkillStateDurability(baseStateDir, { sessionId: effectiveSessionId });
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical skill-state clear root');
+              await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { sessionId: effectiveSessionId });
             }
             return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
           }
 
           const removedPaths: string[] = [];
           for (const statePath of paths) {
-            if (await unlinkDurably(baseStateDir, statePath, 'all-session state clear target')) {
+            if (await unlinkDurably(baseStateDir, expectedRootIdentity, statePath, 'all-session state clear target')) {
               removedPaths.push(statePath);
               if (removedPaths.length === 1) {
                 injectStateOperationFault('after_first_state_clear_effect');
@@ -2581,8 +2905,9 @@ async function executeStateOperationInternal(
           }
           if (mode !== SKILL_ACTIVE_STATE_MODE) {
             if (options.recoveryOperation) {
-              await clearPersistedAllSessionSkillStateTargets(baseStateDir, targetInventory.skillStatePaths, mode);
+              await clearPersistedAllSessionSkillStateTargets(baseStateDir, expectedRootIdentity, targetInventory.skillStatePaths, mode);
             } else {
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical all-session skill-state clear root');
               await syncCanonicalSkillStateForMode({
                 cwd,
                 baseStateDir,
@@ -2591,8 +2916,10 @@ async function executeStateOperationInternal(
                 source: 'state-operations',
                 allSessions: true,
                 allSessionIds,
+                expectedRootIdentity,
               });
-              await finalizeCanonicalSkillStateDurability(baseStateDir, { allSessions: true, sessionIds: allSessionIds });
+              await assertExpectedStateRootIdentity(baseStateDir, expectedRootIdentity, 'canonical all-session skill-state clear root');
+              await finalizeCanonicalSkillStateDurability(baseStateDir, expectedRootIdentity, { allSessions: true, sessionIds: allSessionIds });
             }
           }
 

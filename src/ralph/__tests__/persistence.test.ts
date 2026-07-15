@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { ensureCanonicalRalphArtifacts, recordRalphVisualFeedback } from '../persistence.js';
 import { VISUAL_NEXT_ACTIONS_LIMIT } from '../../visual/constants.js';
+import { captureRootFilesystemIdentity } from '../../state/authority.js';
 
 describe('ensureCanonicalRalphArtifacts', () => {
   it('keeps canonical files authoritative when they already exist', async () => {
@@ -30,6 +31,31 @@ describe('ensureCanonicalRalphArtifacts', () => {
       const progress = JSON.parse(await readFile(canonicalProgress, 'utf-8'));
       assert.match(prd, /Existing canonical PRD/);
       assert.equal(progress.canonical, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not recapture a replacement authority state root for canonical progress writes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralph-root-identity-'));
+    try {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const progressPath = join(stateRoot, 'ralph-progress.json');
+      await mkdir(stateRoot, { recursive: true });
+      const expectedRootIdentity = await captureRootFilesystemIdentity(stateRoot);
+      await rm(stateRoot, { recursive: true, force: true });
+      await Promise.all(Array.from({ length: 16 }, (_, index) => mkdir(join(cwd, `.identity-keeper-${index}`))));
+      await mkdir(stateRoot, { recursive: true });
+      await writeFile(progressPath, JSON.stringify({ replacement: true }));
+
+      await assert.rejects(
+        ensureCanonicalRalphArtifacts(cwd, undefined, stateRoot, expectedRootIdentity),
+        /persisted active state-root identity/,
+      );
+      assert.equal(
+        (JSON.parse(await readFile(progressPath, 'utf-8')) as { replacement?: boolean }).replacement,
+        true,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

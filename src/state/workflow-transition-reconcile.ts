@@ -8,6 +8,8 @@ import {
   atomicWriteAuthorityFile,
   captureRootFilesystemIdentity,
   isTrustedAuthorityPlatformRootAlias,
+  sameRootFilesystemIdentity,
+  type RootFilesystemIdentity,
 } from './authority.js';
 import {
   buildWorkflowTransitionError,
@@ -51,6 +53,7 @@ export interface PlannedWorkflowTransition {
   autoCompletedModes: TrackedWorkflowMode[];
   sourceTargets: string[];
   stateRoot: string;
+  rootIdentity: RootFilesystemIdentity;
   requestedMode: TrackedWorkflowMode;
   sessionId?: string;
   nowIso: string;
@@ -66,6 +69,21 @@ function stateReadError(
   message: string,
 ): never {
   throw new StateAuthorityError(code, message);
+}
+
+async function assertPersistedWorkflowStateRootIdentity(
+  stateRoot: string,
+  expectedRootIdentity: RootFilesystemIdentity | undefined,
+  label: string,
+): Promise<void> {
+  if (!expectedRootIdentity) return;
+  const actualRootIdentity = await captureRootFilesystemIdentity(stateRoot);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      `${label} does not match the persisted active state-root identity`,
+    );
+  }
 }
 
 function isPathWithinStateRoot(root: string, candidate: string): boolean {
@@ -127,9 +145,16 @@ async function assertStateDirectoryIfPresent(path: string, label: string): Promi
   }
 }
 
-async function ensureStateDirectory(path: string, label: string): Promise<void> {
+async function ensureStateDirectory(
+  path: string,
+  label: string,
+  stateRoot: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<void> {
+  await assertPersistedWorkflowStateRootIdentity(stateRoot, expectedRootIdentity, label);
   await assertNoSymlinkComponents(path, label);
   await mkdir(path, { recursive: true });
+  await assertPersistedWorkflowStateRootIdentity(stateRoot, expectedRootIdentity, label);
   await assertNoSymlinkComponents(path, label);
   await assertStateDirectory(path, label);
 }
@@ -138,17 +163,18 @@ async function assertWorkflowStateParent(
   stateRoot: string,
   path: string,
   sessionId?: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<void> {
   const root = resolve(stateRoot);
   const target = resolve(path);
+  await assertPersistedWorkflowStateRootIdentity(root, options.expectedRootIdentity, 'workflow state root');
   if (!isPathWithinStateRoot(root, target)) {
     stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `workflow state escapes the active authority root: ${target}`);
   }
   if (sessionId) validateSessionId(sessionId);
 
   if (options.create) {
-    await ensureStateDirectory(root, 'workflow state root');
+    await ensureStateDirectory(root, 'workflow state root', root, options.expectedRootIdentity);
   } else if (!await assertStateDirectoryIfPresent(root, 'workflow state root')) {
     return;
   }
@@ -161,19 +187,19 @@ async function assertWorkflowStateParent(
     }
     return;
   }
-
-  const sessionsDir = join(root, 'sessions');
-  const sessionDir = join(sessionsDir, sessionId);
-  if (dirname(target) !== sessionDir) {
+  if (dirname(target) !== join(root, 'sessions', sessionId)) {
     stateReadError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `workflow state has an invalid session-scoped parent: ${target}`);
   }
+  const sessionsDir = join(root, 'sessions');
+  const sessionDir = join(sessionsDir, sessionId);
   if (options.create) {
-    await ensureStateDirectory(sessionsDir, 'workflow sessions directory');
-    await ensureStateDirectory(sessionDir, 'workflow session directory');
+    await ensureStateDirectory(sessionsDir, 'workflow sessions directory', root, options.expectedRootIdentity);
+    await ensureStateDirectory(sessionDir, 'workflow session directory', root, options.expectedRootIdentity);
   } else if (!await assertStateDirectoryIfPresent(sessionsDir, 'workflow sessions directory')
     || !await assertStateDirectoryIfPresent(sessionDir, 'workflow session directory')) {
     return;
   }
+  await assertPersistedWorkflowStateRootIdentity(root, options.expectedRootIdentity, 'workflow state root');
   await assertNoSymlinkComponents(sessionDir, 'workflow session directory');
   await assertStateDirectory(sessionsDir, 'workflow sessions directory');
   await assertStateDirectory(sessionDir, 'workflow session directory');
@@ -261,14 +287,14 @@ async function writeWorkflowStateFile(
   path: string,
   sessionId: string | undefined,
   state: TransitionStateLike,
+  expectedRootIdentity: RootFilesystemIdentity,
 ): Promise<void> {
   const root = resolve(stateRoot);
   const target = resolve(path);
-  await assertWorkflowStateParent(root, target, sessionId, { create: true });
-  const rootIdentity = await captureRootFilesystemIdentity(root);
+  await assertWorkflowStateParent(root, target, sessionId, { create: true, expectedRootIdentity });
   await atomicWriteAuthorityFile(target, JSON.stringify(state, null, 2), {
     authority_root: root,
-    expected_root_identity: rootIdentity,
+    expected_root_identity: expectedRootIdentity,
   });
 }
 
@@ -341,7 +367,9 @@ async function completeSourceModeState(
   sessionId: string | undefined,
   nowIso: string,
   source: string,
+  expectedRootIdentity: RootFilesystemIdentity,
 ): Promise<string[]> {
+  await assertPersistedWorkflowStateRootIdentity(stateRoot, expectedRootIdentity, 'workflow transition root');
   const transitionMessage = `mode transiting: ${sourceMode} -> ${destinationMode}`;
   const candidatePath = modeStatePathForRoot(sourceMode, stateRoot, sessionId);
   const existing = await readJsonIfExists(stateRoot, candidatePath, sessionId, {
@@ -377,7 +405,7 @@ async function completeSourceModeState(
     const runOutcomeState = applyRunOutcomeContract(nextCandidate, { nowIso }).state as TransitionStateLike;
     const nextState = normalizeTerminalWorkflowState(runOutcomeState, { mode: sourceMode, nowIso }).state as TransitionStateLike;
 
-    await writeWorkflowStateFile(stateRoot, candidatePath, sessionId, nextState);
+    await writeWorkflowStateFile(stateRoot, candidatePath, sessionId, nextState, expectedRootIdentity);
     completedPaths.push(candidatePath);
   }
 
@@ -395,6 +423,7 @@ async function completeSourceModeState(
     sessionId,
     nowIso,
     source,
+    expectedRootIdentity,
   });
 
   return completedPaths;
@@ -419,6 +448,7 @@ export async function planWorkflowTransition(
   } = options;
   const normalizedSessionId = sessionId ? validateSessionId(sessionId) : undefined;
   const stateRoot = workflowStateRoot(cwd, options.baseStateDir);
+  const rootIdentity = await captureRootFilesystemIdentity(stateRoot);
   if (!options.currentModes) {
     await assertAuthoritativeWorkflowStateReadable(stateRoot, normalizedSessionId);
   }
@@ -438,29 +468,61 @@ export async function planWorkflowTransition(
     }
   }
 
-  return {
+  return Object.freeze({
     decision,
     transitionMessage: decision.transitionMessage,
-    autoCompletedModes: decision.autoCompleteModes,
+    autoCompletedModes: [...decision.autoCompleteModes],
     sourceTargets: decision.allowed
       ? decision.autoCompleteModes.map((sourceMode) => modeStatePathForRoot(sourceMode, stateRoot, normalizedSessionId))
       : [],
     stateRoot,
+    rootIdentity,
     requestedMode,
     ...(normalizedSessionId ? { sessionId: normalizedSessionId } : {}),
     nowIso,
     source,
-  };
+  });
 }
 
 export async function applyPlannedWorkflowTransition(
   cwd: string,
   plan: PlannedWorkflowTransition,
-  options: { action?: WorkflowTransitionAction } = {},
+  options: {
+    action?: WorkflowTransitionAction;
+    expectedRootIdentity?: RootFilesystemIdentity;
+  } = {},
 ): Promise<ReconciledWorkflowTransition> {
   const action = options.action ?? 'activate';
   if (!plan.decision.allowed) {
     throw new Error(buildWorkflowTransitionError(plan.decision.currentModes, plan.requestedMode, action));
+  }
+  const expectedRootIdentity = options.expectedRootIdentity;
+  if (!expectedRootIdentity) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'workflow transition apply requires the persisted active state-root identity',
+    );
+  }
+  const actualRootIdentity = await captureRootFilesystemIdentity(plan.stateRoot);
+  if (!sameRootFilesystemIdentity(expectedRootIdentity, plan.rootIdentity)
+    || !sameRootFilesystemIdentity(expectedRootIdentity, actualRootIdentity)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'workflow transition plan no longer matches the persisted active state-root identity',
+    );
+  }
+  await assertAuthoritativeWorkflowStateReadable(plan.stateRoot, plan.sessionId);
+  const currentModes = await visibleTrackedModes(plan.stateRoot, plan.sessionId);
+  const currentDecision = evaluateWorkflowTransition(currentModes, plan.requestedMode);
+  const expectedTargets = currentDecision.allowed
+    ? currentDecision.autoCompleteModes.map((sourceMode) => modeStatePathForRoot(sourceMode, plan.stateRoot, plan.sessionId))
+    : [];
+  if (JSON.stringify(currentDecision) !== JSON.stringify(plan.decision)
+    || JSON.stringify(expectedTargets) !== JSON.stringify(plan.sourceTargets)) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+      'workflow transition source state changed after the plan was created',
+    );
   }
 
   const completedPaths: string[] = [];
@@ -473,6 +535,7 @@ export async function applyPlannedWorkflowTransition(
       plan.sessionId,
       plan.nowIso,
       plan.source,
+      expectedRootIdentity!,
     ));
   }
 
@@ -493,10 +556,18 @@ export async function completeWorkflowModeState(
     nowIso?: string;
     source?: string;
     baseStateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
   } = {},
 ): Promise<string[]> {
   const stateRoot = workflowStateRoot(cwd, options.baseStateDir);
   const sessionId = options.sessionId ? validateSessionId(options.sessionId) : undefined;
+  const expectedRootIdentity = options.expectedRootIdentity;
+  if (!expectedRootIdentity) {
+    stateReadError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'workflow mode completion requires the persisted active state-root identity',
+    );
+  }
   await assertSourceModeAdvanceAllowed(cwd, stateRoot, sourceMode, destinationMode, sessionId);
   return completeSourceModeState(
     cwd,
@@ -506,6 +577,7 @@ export async function completeWorkflowModeState(
     sessionId,
     options.nowIso ?? new Date().toISOString(),
     options.source ?? 'workflow-transition',
+    expectedRootIdentity,
   );
 }
 
@@ -519,8 +591,12 @@ export async function reconcileWorkflowTransition(
     source?: string;
     baseStateDir?: string;
     currentModes?: Iterable<string>;
+    expectedRootIdentity?: RootFilesystemIdentity;
   } = {},
 ): Promise<ReconciledWorkflowTransition> {
   const plan = await planWorkflowTransition(cwd, requestedMode, options);
-  return applyPlannedWorkflowTransition(cwd, plan, { action: options.action });
+  return applyPlannedWorkflowTransition(cwd, plan, {
+    action: options.action,
+    expectedRootIdentity: options.expectedRootIdentity,
+  });
 }

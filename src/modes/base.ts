@@ -5,13 +5,16 @@
 
 import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
+import { basename, dirname, join } from 'node:path';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import {
   assertWorkflowTransitionAllowed,
   isTrackedWorkflowMode,
-  readActiveWorkflowModes,
+  TRACKED_WORKFLOW_MODES,
+  type TrackedWorkflowMode,
 } from '../state/workflow-transition.js';
 import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
+import { resolveStateAuthorityForGuard } from '../state/authority.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
 import { validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
@@ -21,10 +24,6 @@ import { canAdvanceAutopilotRalplanToUltragoal, buildAutopilotRalplanUltragoalGa
 import { deriveAutopilotChildPhase, type AutopilotChildPhase } from '../autopilot/fsm.js';
 import { syncRunStateFromModeState } from '../runtime/run-state.js';
 import {
-  getAuthoritativeActiveStatePaths,
-  getBaseStateDir,
-  getReadScopedStateDirs,
-  getReadScopedStatePaths,
   getStatePath,
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
@@ -136,8 +135,13 @@ function normalizeModeStateOrThrow(mode: string, state: ModeState): ModeState {
   return applySharedRunOutcomeContractOrThrow(normalized);
 }
 
-function stateDir(projectRoot?: string): string {
-  return getBaseStateDir(projectRoot);
+async function readActiveWorkflowModesFromStateDir(stateDir: string): Promise<TrackedWorkflowMode[]> {
+  const activeModes: TrackedWorkflowMode[] = [];
+  for (const mode of TRACKED_WORKFLOW_MODES) {
+    const state = await readModeStateFromPaths([join(stateDir, basename(getStatePath(mode)))]);
+    if (state?.active) activeModes.push(mode);
+  }
+  return activeModes;
 }
 
 export async function assertModeStartAllowed(
@@ -147,7 +151,7 @@ export async function assertModeStartAllowed(
   if (!isTrackedWorkflowMode(mode)) return;
   const scope = await resolveWritableStateScope(projectRoot);
 
-  const activeModes = await readActiveWorkflowModes(projectRoot ?? process.cwd(), scope.sessionId);
+  const activeModes = await readActiveWorkflowModesFromStateDir(scope.stateDir);
   assertWorkflowTransitionAllowed(activeModes, mode, 'start');
 }
 
@@ -161,17 +165,21 @@ export async function startMode(
   projectRoot?: string
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot);
-  const dir = stateDir(projectRoot);
-  await mkdir(dir, { recursive: true });
-
-  const baseStateDir = getBaseStateDir(projectRoot);
+  const modeStatePath = join(scope.stateDir, basename(getStatePath(mode)));
+  const baseStateDir = dirname(dirname(scope.stateDir));
   let transitionMessage: string | undefined;
   if (isTrackedWorkflowMode(mode)) {
+    const authority = await resolveStateAuthorityForGuard({
+      startup_cwd: projectRoot ?? process.cwd(),
+      observed_cwd: projectRoot ?? process.cwd(),
+      session_id: scope.sessionId,
+    });
     const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
       action: 'start',
       sessionId: scope.sessionId,
       source: 'startMode',
       baseStateDir,
+      expectedRootIdentity: authority.generation.root_identity,
     });
     transitionMessage = transition.transitionMessage;
   }
@@ -191,9 +199,14 @@ export async function startMode(
 
   const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
   const state = normalizeModeStateOrThrow(mode, withContext);
-  await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(state, null, 2));
+  await writeFile(modeStatePath, JSON.stringify(state, null, 2));
   await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
   if (isTrackedWorkflowMode(mode)) {
+    const authority = await resolveStateAuthorityForGuard({
+      startup_cwd: projectRoot ?? process.cwd(),
+      observed_cwd: projectRoot ?? process.cwd(),
+      session_id: scope.sessionId,
+    });
     await syncCanonicalSkillStateForMode({
       cwd: projectRoot ?? process.cwd(),
       baseStateDir,
@@ -202,6 +215,7 @@ export async function startMode(
       currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
       sessionId: scope.sessionId,
       source: 'startMode',
+      expectedRootIdentity: authority.generation.root_identity,
     });
   }
   return state;
@@ -211,8 +225,8 @@ export async function startMode(
  * Read current mode state
  */
 export async function readModeState(mode: string, projectRoot?: string): Promise<ModeState | null> {
-  const paths = await getReadScopedStatePaths(mode, projectRoot);
-  return readModeStateFromPaths(paths);
+  const scope = await resolveWritableStateScope(projectRoot);
+  return readModeStateFromPaths([join(scope.stateDir, basename(getStatePath(mode)))]);
 }
 
 async function readModeStateFromPaths(paths: string[]): Promise<ModeState | null> {
@@ -232,13 +246,12 @@ export async function readModeStateForSession(
   sessionId: string | undefined,
   projectRoot?: string,
 ): Promise<ModeState | null> {
-  let paths: string[];
   try {
-    paths = await getReadScopedStatePaths(mode, projectRoot, sessionId);
+    const scope = await resolveWritableStateScope(projectRoot, sessionId);
+    return readModeStateFromPaths([join(scope.stateDir, basename(getStatePath(mode)))]);
   } catch {
     return null;
   }
-  return readModeStateFromPaths(paths);
 }
 
 export async function readModeStateForActiveDecision(
@@ -246,13 +259,12 @@ export async function readModeStateForActiveDecision(
   sessionId: string | undefined,
   projectRoot?: string,
 ): Promise<ModeState | null> {
-  let paths: string[];
   try {
-    paths = await getAuthoritativeActiveStatePaths(mode, projectRoot, sessionId);
+    const scope = await resolveWritableStateScope(projectRoot, sessionId);
+    return readModeStateFromPaths([join(scope.stateDir, basename(getStatePath(mode)))]);
   } catch {
     return null;
   }
-  return readModeStateFromPaths(paths);
 }
 
 function assertRalphUpdateMatchesSession(state: ModeState, sessionId?: string): void {
@@ -283,12 +295,9 @@ export async function updateModeState(
   options: UpdateModeStateOptions = {},
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
-  const baseStateDir = getBaseStateDir(projectRoot);
-  const current = mode === 'ralph' && scope.sessionId
-    ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
-    : explicitSessionId
-      ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
-      : await readModeState(mode, projectRoot);
+  const baseStateDir = dirname(dirname(scope.stateDir));
+  const modeStatePath = join(scope.stateDir, basename(getStatePath(mode)));
+  const current = await readModeStateFromPaths([modeStatePath]);
   if (!current) throw new Error(`Mode ${mode} not found`);
   await mkdir(scope.stateDir, { recursive: true });
 
@@ -366,7 +375,7 @@ export async function updateModeState(
     }
   }
   const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
-  await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(updated, null, 2));
+  await writeFile(modeStatePath, JSON.stringify(updated, null, 2));
   await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
   if (isTrackedWorkflowMode(mode)) {
     const cwd = projectRoot ?? process.cwd();
@@ -377,6 +386,11 @@ export async function updateModeState(
       explicitSessionId: scope.sessionId,
     });
     if (!ralplanCompletionHandled) {
+      const authority = await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: scope.sessionId,
+      });
       await syncCanonicalSkillStateForMode({
         cwd,
         baseStateDir,
@@ -385,6 +399,7 @@ export async function updateModeState(
         currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
         sessionId: scope.sessionId,
         source: 'updateModeState',
+        expectedRootIdentity: authority.generation.root_identity,
       });
     }
   }
@@ -409,23 +424,18 @@ export async function cancelMode(mode: string, projectRoot?: string): Promise<vo
  * Cancel all active modes
  */
 export async function cancelAllModes(projectRoot?: string): Promise<string[]> {
-  const dirs = await getReadScopedStateDirs(projectRoot);
+  const scope = await resolveWritableStateScope(projectRoot);
   const cancelled: string[] = [];
-  const seenModes = new Set<string>();
+  if (!existsSync(scope.stateDir)) return cancelled;
 
-  for (const dir of dirs) {
-    if (!existsSync(dir)) continue;
-    const files = await readdir(dir);
-    for (const f of files) {
-      if (!f.endsWith('-state.json')) continue;
-      const mode = f.replace('-state.json', '');
-      if (seenModes.has(mode)) continue;
-      seenModes.add(mode);
-      const state = await readModeState(mode, projectRoot);
-      if (state?.active) {
-        await cancelMode(mode, projectRoot);
-        cancelled.push(mode);
-      }
+  const files = await readdir(scope.stateDir);
+  for (const f of files) {
+    if (!f.endsWith('-state.json')) continue;
+    const mode = f.replace('-state.json', '');
+    const state = await readModeStateFromPaths([join(scope.stateDir, f)]);
+    if (state?.active) {
+      await cancelMode(mode, projectRoot);
+      cancelled.push(mode);
     }
   }
   return cancelled;
@@ -435,23 +445,16 @@ export async function cancelAllModes(projectRoot?: string): Promise<string[]> {
  * List all active modes
  */
 export async function listActiveModes(projectRoot?: string): Promise<Array<{ mode: string; state: ModeState }>> {
-  const dirs = await getReadScopedStateDirs(projectRoot);
+  const scope = await resolveWritableStateScope(projectRoot);
   const active: Array<{ mode: string; state: ModeState }> = [];
-  const seenModes = new Set<string>();
+  if (!existsSync(scope.stateDir)) return active;
 
-  for (const dir of dirs) {
-    if (!existsSync(dir)) continue;
-    const files = await readdir(dir);
-    for (const f of files) {
-      if (!f.endsWith('-state.json')) continue;
-      const mode = f.replace('-state.json', '');
-      if (seenModes.has(mode)) continue;
-      seenModes.add(mode);
-      const state = await readModeState(mode, projectRoot);
-      if (state?.active) {
-        active.push({ mode, state });
-      }
-    }
+  const files = await readdir(scope.stateDir);
+  for (const f of files) {
+    if (!f.endsWith('-state.json')) continue;
+    const mode = f.replace('-state.json', '');
+    const state = await readModeStateFromPaths([join(scope.stateDir, f)]);
+    if (state?.active) active.push({ mode, state });
   }
   return active;
 }

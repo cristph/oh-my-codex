@@ -5,7 +5,7 @@
 import { constants, existsSync, readFileSync } from "fs";
 import { access, chown, lstat, mkdtemp, readdir, readFile, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, join, relative, resolve as resolvePath } from "path";
+import { basename, dirname, join, relative, resolve as resolvePath } from "path";
 
 import { tmpdir } from "os";
 import {
@@ -91,6 +91,7 @@ import {
 	AUTHORITY_DIAGNOSTIC_CODES,
 	StateAuthorityError,
 	resolveStateAuthority,
+	type ResolvedStateAuthorityContext,
 } from "../state/authority.js";
 import { resolveAuthenticatedTransportAuthority } from "../hooks/session.js";
 
@@ -143,6 +144,63 @@ interface NativeHookDistSmokeOptions {
 	packageRoot?: string;
 	nodePath?: string;
 	runner?: typeof spawnSync;
+}
+
+const NATIVE_HOOK_SMOKE_AUTHORITY_ENV_KEYS = [
+	"OMX_CODEX_LAUNCH_ID",
+	"OMX_STARTUP_CWD",
+	"OMX_ROOT",
+	"OMX_STATE_ROOT",
+	"OMX_TEAM_STATE_ROOT",
+	"OMX_RUNS_DIR",
+	"OMX_SESSION_ID",
+	"OMX_SOURCE_CWD",
+	"CODEX_SESSION_ID",
+	"OMXBOX_ACTIVE",
+	"OMX_MADMAX_DETACHED_CONTEXT",
+	"OMX_HUD_AUTHORITY",
+	"OMX_NOTIFY_TEMP_CONTRACT",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
+] as const;
+
+function authorityScrubbedNativeHookSmokeEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	for (const key of NATIVE_HOOK_SMOKE_AUTHORITY_ENV_KEYS) delete env[key];
+	return { ...env, ...overrides };
+}
+
+function nativeHookSmokeDenialDetail(stdout: unknown): string | null {
+	const raw = typeof stdout === "string" ? stdout : Buffer.isBuffer(stdout) ? stdout.toString("utf-8") : "";
+	const trimmed = raw.trim();
+	if (!trimmed) return "native hook emitted no JSON output";
+
+	let output: unknown;
+	try {
+		output = JSON.parse(trimmed);
+	} catch {
+		return "native hook emitted invalid JSON output";
+	}
+	if (!output || typeof output !== "object" || Array.isArray(output)) {
+		return "native hook emitted a non-object JSON output";
+	}
+	const record = output as Record<string, unknown>;
+	const hookSpecificOutput = record.hookSpecificOutput;
+	const permissionDecision = hookSpecificOutput && typeof hookSpecificOutput === "object" && !Array.isArray(hookSpecificOutput)
+		? (hookSpecificOutput as Record<string, unknown>).permissionDecision
+		: undefined;
+	if (
+		record.continue === false
+		|| record.decision === "block"
+		|| record.stopReason === "state_authority_conflict"
+		|| permissionDecision === "deny"
+	) {
+		return "native hook returned a denial JSON payload";
+	}
+	return null;
 }
 
 type DoctorSetupScope = "user" | "project";
@@ -483,6 +541,7 @@ function authorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
 		env.OMX_STATE_AUTHORITY_ID,
 		env.OMX_STATE_AUTHORITY_GENERATION_ID,
 		env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+		env.OMX_STATE_AUTHORITY_CAPABILITY,
 	].some((value) => typeof value === "string" && value.trim() !== "");
 }
 
@@ -491,32 +550,45 @@ function authoritySessionId(env: NodeJS.ProcessEnv): string | undefined {
 	return sessionId || undefined;
 }
 
-function authorityRootConflict(
-	cwd: string,
+interface AuthorityRootConflict {
+	source: string;
+	persistedStateRoot: string;
+	candidateStateRoot: string;
+}
+
+
+
+async function authorityRootConflict(
 	env: NodeJS.ProcessEnv,
-	canonicalStateRoot: string,
-): string | null {
-	const candidates: Array<{ name: string; path?: string }> = [
-		{ name: "OMX_TEAM_STATE_ROOT", path: env.OMX_TEAM_STATE_ROOT?.trim() },
-		{
-			name: "OMX_ROOT",
-			path: env.OMX_ROOT?.trim()
-				? join(env.OMX_ROOT.trim(), ".omx", "state")
-				: undefined,
-		},
-		{
-			name: "OMX_STATE_ROOT",
-			path: env.OMX_STATE_ROOT?.trim()
-				? join(env.OMX_STATE_ROOT.trim(), ".omx", "state")
-				: undefined,
-		},
+	context: Pick<ResolvedStateAuthorityContext, "canonical_state_root" | "generation" | "workspace_identity">,
+): Promise<AuthorityRootConflict | null> {
+	const workspaceRoot = context.workspace_identity.canonical_path;
+	const persistedStateRoot = resolvePath(context.canonical_state_root);
+	const canonicalOmxRoot = resolvePath(dirname(context.generation.canonical_omx_root));
+	const candidates: Array<{ name: string; value?: string; compatibilityRoot: boolean }> = [
+		{ name: "OMX_TEAM_STATE_ROOT", value: env.OMX_TEAM_STATE_ROOT?.trim(), compatibilityRoot: false },
+		{ name: "OMX_ROOT", value: env.OMX_ROOT?.trim(), compatibilityRoot: true },
+		{ name: "OMX_STATE_ROOT", value: env.OMX_STATE_ROOT?.trim(), compatibilityRoot: true },
 	];
 	for (const candidate of candidates) {
-		if (candidate.path && resolvePath(cwd, candidate.path) !== resolvePath(canonicalStateRoot)) {
-			return candidate.name;
+		if (!candidate.value) continue;
+		const resolvedRoot = resolvePath(workspaceRoot, candidate.value);
+		const candidateStateRoot = candidate.compatibilityRoot
+			? resolvePath(resolvedRoot, ".omx", "state")
+			: resolvedRoot;
+		if (
+			candidateStateRoot !== persistedStateRoot
+			|| (candidate.compatibilityRoot && resolvedRoot !== canonicalOmxRoot)
+		) {
+			return { source: candidate.name, persistedStateRoot, candidateStateRoot };
 		}
 	}
+
 	return null;
+}
+
+function describeAuthorityRootConflict(conflict: AuthorityRootConflict): string {
+	return `${conflict.source} candidate state root ${conflict.candidateStateRoot} conflicts with persisted session authority root ${conflict.persistedStateRoot}; restart through OMX from the candidate workspace to establish a new persisted session binding, or return to the persisted workspace. In-place root rebinding is unsupported.`;
 }
 
 async function resolveAuthorityForDoctor(
@@ -534,14 +606,15 @@ async function resolveAuthorityForDoctor(
 				);
 			}
 			const issues: TeamDoctorIssue[] = [];
-			const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+			const conflictingRoot = await authorityRootConflict(env, context);
 			if (conflictingRoot) {
 				issues.push({
 					code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
-					message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+					message: describeAuthorityRootConflict(conflictingRoot),
 					severity: "fail",
 				});
 			}
+
 			return {
 				stateDir: issues.length === 0 ? context.canonical_state_root : null,
 				issues,
@@ -570,17 +643,25 @@ async function resolveAuthorityForDoctor(
 		if (!resolution.context || !resolution.can_mutate) {
 			const anchorMissingOnly = resolution.diagnostics.length === 1
 				&& resolution.diagnostics[0]?.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing;
-			if (!hasLocator && anchorMissingOnly) {
+			if (anchorMissingOnly) {
 				return { stateDir: omxStateDir(cwd), issues: [], validated: false };
+			}
+			const issues = resolution.diagnostics.map((diagnostic) => ({
+				code: diagnostic.code,
+				message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
+				severity: "fail" as const,
+			}));
+			if (issues.length === 0) {
+				issues.push({
+					code: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+					message: "state authority resolution returned no active authority or diagnostics",
+					severity: "fail",
+				});
 			}
 			return {
 				stateDir: null,
 				validated: false,
-				issues: resolution.diagnostics.map((diagnostic) => ({
-					code: diagnostic.code,
-					message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
-					severity: "fail" as const,
-				})),
+				issues,
 			};
 		}
 
@@ -590,40 +671,11 @@ async function resolveAuthorityForDoctor(
 			message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
 			severity: "fail",
 		}));
-		const locator = env.OMX_STATE_AUTHORITY_PATH?.trim();
-		if (locator && resolvePath(cwd, locator) !== resolvePath(context.authority_path)) {
-			issues.push({
-				code: AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
-				message: "inherited authority locator does not match the persisted active generation",
-				severity: "fail",
-			});
-		}
-		if (env.OMX_STATE_AUTHORITY_ID?.trim() && env.OMX_STATE_AUTHORITY_ID.trim() !== context.generation.authority_id) {
-			issues.push({
-				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
-				message: "inherited authority ID conflicts with the persisted active generation",
-				severity: "fail",
-			});
-		}
-		if (env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim() && env.OMX_STATE_AUTHORITY_GENERATION_ID.trim() !== context.generation.generation_id) {
-			issues.push({
-				code: AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
-				message: "inherited authority generation ID conflicts with the persisted active generation",
-				severity: "fail",
-			});
-		}
-		if (env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim() && env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST.trim() !== context.workspace_identity.digest) {
-			issues.push({
-				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
-				message: "inherited authority workspace digest conflicts with the persisted workspace",
-				severity: "fail",
-			});
-		}
-		const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+		const conflictingRoot = await authorityRootConflict(env, context);
 		if (conflictingRoot) {
 			issues.push({
 				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
-				message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+				message: describeAuthorityRootConflict(conflictingRoot),
 				severity: "fail",
 			});
 		}
@@ -634,15 +686,13 @@ async function resolveAuthorityForDoctor(
 		};
 	} catch (error) {
 		return {
-			stateDir: hasLocator ? null : omxStateDir(cwd),
+			stateDir: null,
 			validated: false,
-			issues: hasLocator
-				? [{
-					code: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
-					message: `cannot resolve inherited authority: ${error instanceof Error ? error.message : String(error)}`,
-					severity: "fail",
-				}]
-				: [],
+			issues: [{
+				code: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+				message: `cannot resolve workspace state authority: ${error instanceof Error ? error.message : String(error)}`,
+				severity: "fail",
+			}],
 		};
 	}
 }
@@ -668,7 +718,16 @@ async function doctorTeam(): Promise<void> {
 	console.log("oh-my-codex doctor --team");
 	console.log("=========================\n");
 
-	const issues = await collectTeamDoctorIssues(process.cwd());
+	let issues: TeamDoctorIssue[];
+	try {
+		issues = await collectTeamDoctorIssues(process.cwd());
+	} catch (error) {
+		issues = [{
+			code: "team_doctor_unexpected_error",
+			message: `team diagnostics could not complete: ${error instanceof Error ? error.message : String(error)}`,
+			severity: "fail",
+		}];
+	}
 	if (issues.length === 0) {
 		console.log("  [OK] team diagnostics: no issues");
 		console.log("\nAll team checks passed.");
@@ -729,9 +788,18 @@ async function collectTeamDoctorIssues(
 
 	const teamDirs: string[] = [];
 	if (existsSync(teamsRoot)) {
-		const entries = await readdir(teamsRoot, { withFileTypes: true });
-		for (const e of entries) {
-			if (e.isDirectory()) teamDirs.push(e.name);
+		try {
+			const entries = await readdir(teamsRoot, { withFileTypes: true });
+			for (const entry of entries) {
+				if (entry.isDirectory()) teamDirs.push(entry.name);
+			}
+		} catch (error) {
+			issues.push({
+				code: "team_state_unreadable",
+				message: `cannot read team state directory: ${error instanceof Error ? error.message : String(error)}`,
+				severity: "fail",
+			});
+			return dedupeIssues(issues);
 		}
 	}
 
@@ -765,8 +833,12 @@ async function collectTeamDoctorIssues(
 					workerLaunchMode = "prompt";
 				}
 				if (Array.isArray(parsed.workers)) promptWorkers = parsed.workers;
-			} catch {
-				// ignore malformed manifest
+			} catch (error) {
+				issues.push({
+					code: "team_manifest_unreadable",
+					message: `${teamName} manifest cannot be read or parsed: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				});
 			}
 		} else if (existsSync(configPath)) {
 			try {
@@ -786,8 +858,12 @@ async function collectTeamDoctorIssues(
 					workerLaunchMode = "prompt";
 				}
 				if (Array.isArray(parsed.workers)) promptWorkers = parsed.workers;
-			} catch {
-				// ignore malformed config
+			} catch (error) {
+				issues.push({
+					code: "team_config_unreadable",
+					message: `${teamName} config cannot be read or parsed: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				});
 			}
 		}
 
@@ -816,7 +892,17 @@ async function collectTeamDoctorIssues(
 		// delayed_status_lag + slow_shutdown checks
 		const workersRoot = join(teamDir, "workers");
 		if (!existsSync(workersRoot)) continue;
-		const workers = await readdir(workersRoot, { withFileTypes: true });
+		let workers: Array<{ name: string; isDirectory(): boolean }>;
+		try {
+			workers = await readdir(workersRoot, { withFileTypes: true });
+		} catch (error) {
+			issues.push({
+				code: "team_workers_unreadable",
+				message: `${teamName} worker state cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+				severity: "fail",
+			});
+			continue;
+		}
 		for (const worker of workers) {
 			if (!worker.isDirectory()) continue;
 			const workerDir = join(workersRoot, worker.name);
@@ -847,8 +933,12 @@ async function collectTeamDoctorIssues(
 							severity: "fail",
 						});
 					}
-				} catch {
-					// ignore malformed files
+				} catch (error) {
+					issues.push({
+						code: "worker_state_unreadable",
+						message: `${teamName}/${worker.name} status or heartbeat cannot be read or parsed: ${error instanceof Error ? error.message : String(error)}`,
+						severity: "fail",
+					});
 				}
 			}
 
@@ -864,8 +954,12 @@ async function collectTeamDoctorIssues(
 							severity: "fail",
 						});
 					}
-				} catch {
-					// ignore malformed files
+				} catch (error) {
+					issues.push({
+						code: "shutdown_request_unreadable",
+						message: `${teamName}/${worker.name} shutdown request cannot be read or parsed: ${error instanceof Error ? error.message : String(error)}`,
+						severity: "fail",
+					});
 				}
 			}
 		}
@@ -899,8 +993,12 @@ async function collectTeamDoctorIssues(
 					});
 				}
 			}
-		} catch {
-			// ignore malformed HUD state
+		} catch (error) {
+			issues.push({
+				code: "leader_state_unreadable",
+				message: `leader runtime state cannot be read or parsed: ${error instanceof Error ? error.message : String(error)}`,
+				severity: "fail",
+			});
 		}
 	}
 
@@ -1929,16 +2027,11 @@ async function checkPluginScopedNativeHooks(
 		const result = spawnSync(process.execPath, [expectedHookLauncherPath], {
 			cwd: smokeCwd,
 			encoding: "utf-8",
-			env: {
-				...process.env,
+			env: authorityScrubbedNativeHookSmokeEnv({
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
-				OMX_ROOT: join(smokeCwd, ".omx-doctor-root"),
-				OMX_SESSION_ID: "omx-doctor-plugin-hook-smoke",
-				OMX_SOURCE_CWD: smokeCwd,
 				OMX_ENTRY_PATH: join(getPackageRoot(), "dist", "cli", "omx.js"),
-				OMX_CODEX_LAUNCH_ID: "omx-doctor-plugin-hook-smoke-launch",
-				OMX_STARTUP_CWD: smokeCwd,
-			},
+			}),
+
 			input: payload,
 			timeout: 5_000,
 		});
@@ -1957,6 +2050,15 @@ async function checkPluginScopedNativeHooks(
 				message: `plugin-scoped native hook smoke failed from ${expectedHookLauncherPath} (${detail})`,
 			};
 		}
+		const denialDetail = nativeHookSmokeDenialDetail(result.stdout);
+		if (denialDetail) {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message: `plugin-scoped native hook smoke failed from ${expectedHookLauncherPath} (${denialDetail})`,
+			};
+		}
+
 	} finally {
 		await rm(smokeCwd, { recursive: true, force: true });
 	}
@@ -2104,14 +2206,10 @@ export async function checkNativeHookDistSmoke(
 		const result = runner(nodePath, [scriptPath], {
 			cwd: smokeCwd,
 			encoding: "utf-8",
-			env: {
-				...process.env,
+			env: authorityScrubbedNativeHookSmokeEnv({
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
-				OMX_ROOT: join(smokeCwd, ".omx-doctor-root"),
-				OMX_SESSION_ID: "omx-doctor-native-hook-dist-smoke",
-				OMX_SOURCE_CWD: smokeCwd,
-				OMX_STARTUP_CWD: smokeCwd,
-			},
+			}),
+
 			input: payload,
 			timeout: 5_000,
 		});
@@ -2133,6 +2231,15 @@ export async function checkNativeHookDistSmoke(
 				message: `installed native hook dist failed a minimal UserPromptSubmit smoke (${detail}); reinstall with "npm install -g oh-my-codex@${packageVersion} --force --min-release-age=0 --before=" and then run "omx setup --force"`,
 			};
 		}
+		const denialDetail = nativeHookSmokeDenialDetail(result.stdout);
+		if (denialDetail) {
+			return {
+				name: "Native hook dist smoke",
+				status: "fail",
+				message: `installed native hook dist denied a minimal UserPromptSubmit smoke (${denialDetail}); reinstall with "npm install -g oh-my-codex@${packageVersion} --force --min-release-age=0 --before=" and then run "omx setup --force"`,
+			};
+		}
+
 
 		return {
 			name: "Native hook dist smoke",
@@ -2248,10 +2355,9 @@ async function checkNativePostCompactHookRuntime(
 		const result = spawnSync(smokeInvocation.command, smokeInvocation.args, {
 			cwd,
 			encoding: "utf-8",
-			env: {
-				...process.env,
+			env: authorityScrubbedNativeHookSmokeEnv({
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
-			},
+			}),
 			input: payload,
 			shell: smokeInvocation.shell,
 			timeout: 5_000,

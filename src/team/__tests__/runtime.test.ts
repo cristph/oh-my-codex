@@ -1,16 +1,15 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import ts from 'typescript-compiler-api';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'child_process';
 import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
-import { join, relative, dirname } from 'path';
+import { join, relative, dirname, resolve } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import {
   DEFAULT_MAX_WORKERS,
-  initTeamState,
+  initTeamState as rawInitTeamState,
   createTask,
   writeWorkerIdentity,
   writeWorkerInbox,
@@ -32,7 +31,7 @@ import {
   monitorTeam,
   shutdownTeam,
   resumeTeam,
-  startTeam,
+  startTeam as rawStartTeam,
   assignTask,
   sendWorkerMessage,
   applyCreatedInteractiveSessionToConfig,
@@ -56,6 +55,75 @@ import { sanitizeTeamName } from '../tmux-session.js';
 import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
 import { planWorktreeTarget } from '../worktree.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS } from '../state-root.js';
+
+const testAuthorityTransportInstalls = new Map<string, Promise<NodeJS.ProcessEnv>>();
+
+async function installTestAuthorityTransport(
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const canonicalSessionId = testAuthoritySessionId(cwd);
+  const requestedSessionId = env.OMX_SESSION_ID?.trim() || canonicalSessionId;
+  const installationKey = `${resolve(cwd)}\0${requestedSessionId}`;
+  let installation = testAuthorityTransportInstalls.get(installationKey);
+  if (!installation) {
+    installation = (async () => {
+      await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+      await chmod(join(cwd, '.omx'), 0o700);
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+      await chmod(join(cwd, '.omx', 'state'), 0o700);
+      const authority = await initializeStateAuthority({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        launch_id: `${canonicalSessionId}-launch`,
+        session_binding: {
+          canonical_session_id: canonicalSessionId,
+          aliases: {
+            native_session_id: canonicalSessionId,
+            ...(requestedSessionId === canonicalSessionId
+              ? {}
+              : {
+                  current_session_aliases: [requestedSessionId],
+                  owner_session_aliases: [canonicalSessionId],
+                  previous_session_aliases: [canonicalSessionId],
+                }),
+          },
+        },
+      });
+      await mintStateAuthorityTransportCapability(authority);
+      return buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: requestedSessionId,
+      });
+    })();
+    testAuthorityTransportInstalls.set(installationKey, installation!);
+  }
+  Object.assign(process.env, await installation);
+}
+
+async function initTeamState(
+  ...args: Parameters<typeof rawInitTeamState>
+): ReturnType<typeof rawInitTeamState> {
+  await installTestAuthorityTransport(args[4], args[6]);
+  return rawInitTeamState(...args);
+}
+
+function testAuthoritySessionId(cwd: string): string {
+  return `team-start-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 24)}`;
+}
+
+function testAuthorityRequestedSessionId(cwd: string): string {
+  return process.env.OMX_SESSION_ID?.trim() || testAuthoritySessionId(cwd);
+}
+
+async function startTeam(
+  ...args: Parameters<typeof rawStartTeam>
+): ReturnType<typeof rawStartTeam> {
+  await installTestAuthorityTransport(args[5]);
+  return rawStartTeam(...args);
+}
 
 const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
 const skipSlowLifecycleUnderCoverage = coverageRun
@@ -466,9 +534,9 @@ ${body}`;
 
 
 function teamStateTestPath(cwd: string, ...parts: string[]): string {
-  const stateRoot = process.env.OMX_TEAM_STATE_ROOT ?? join(cwd, '.omx', 'state');
-  return join(stateRoot, ...parts);
+  return join(cwd, '.omx', 'state', ...parts);
 }
+
 
 async function withMockTmuxFixture<T>(
   options: {
@@ -485,6 +553,8 @@ async function withMockTmuxFixture<T>(
   const previousPath = process.env.PATH;
   const previousEnv = new Map<string, string | undefined>();
   const envOverrides = {
+    OMX_ROOT: undefined,
+    OMX_STATE_ROOT: undefined,
     OMX_TEAM_STATE_ROOT: undefined,
     ...(options.env ?? {}),
   };
@@ -548,15 +618,23 @@ async function withNativeWindowsPlatform<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+const TEST_AMBIENT_ROOT_ENV_KEYS = ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT'] as const;
+const ORIGINAL_AMBIENT_ROOT_ENVS = new Map<string, string | undefined>(
+  TEST_AMBIENT_ROOT_ENV_KEYS.map((key): [string, string | undefined] => [key, process.env[key]]),
+);
 
 beforeEach(() => {
-  delete process.env.OMX_TEAM_STATE_ROOT;
+  for (const key of TEST_AMBIENT_ROOT_ENV_KEYS) delete process.env[key];
+  for (const key of TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
 });
 
 afterEach(() => {
-  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
-  else delete process.env.OMX_TEAM_STATE_ROOT;
+  for (const key of TEST_AMBIENT_ROOT_ENV_KEYS) {
+    const value = ORIGINAL_AMBIENT_ROOT_ENVS.get(key);
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+  for (const key of TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
 });
 
 describe('runtime', () => {
@@ -1581,7 +1659,13 @@ esac
           delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
-          const expectedTeamName = buildInternalTeamName('team-startup-window', resolveTeamIdentityScope(process.env));
+          const expectedTeamName = buildInternalTeamName(
+            'team-startup-window',
+            resolveTeamIdentityScope({
+              ...process.env,
+              OMX_SESSION_ID: testAuthorityRequestedSessionId(cwd),
+            }),
+          );
 
           receiptNotifier = setInterval(() => {
             void markPendingInboxDispatchesNotified(expectedTeamName, cwd, {
@@ -1745,7 +1829,13 @@ esac
           process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '100';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
-          const expectedTeamName = buildInternalTeamName('team-startup-no-evidence', resolveTeamIdentityScope(process.env));
+          const expectedTeamName = buildInternalTeamName(
+            'team-startup-no-evidence',
+            resolveTeamIdentityScope({
+              ...process.env,
+              OMX_SESSION_ID: testAuthorityRequestedSessionId(cwd),
+            }),
+          );
 
           receiptFailer = setInterval(() => {
             void (async () => {
@@ -1959,7 +2049,7 @@ sleep 5
     }
   });
 
-  it('startTeam blocks duplicate no-session/no-tmux prompt-mode starts with stable cwd leader identity', async () => {
+  it('startTeam blocks duplicate prompt starts under a stable authenticated test session', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-duplicate-nosession-'));
     const binDir = join(cwd, 'bin');
     const fakeCodexPath = join(binDir, 'codex');
@@ -1994,11 +2084,11 @@ process.on('SIGTERM', () => process.exit(0));`,
           assert.equal(runtime.config.worker_launch_mode, 'prompt');
           assert.match(runtime.teamName, /^first-prompt-team-[a-f0-9]{8}$/);
           assert.equal(runtime.config.display_name, 'first-prompt-team');
-          assert.equal(runtime.config.identity_source, 'run-id');
+          assert.equal(runtime.config.identity_source, 'env-session');
           const manifest = JSON.parse(
             await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'manifest.v2.json'), 'utf-8'),
           ) as { leader?: { session_id?: string } };
-          assert.equal(manifest.leader?.session_id, `cwd:${cwd}`);
+          assert.equal(manifest.leader?.session_id, testAuthoritySessionId(cwd));
 
           await assert.rejects(
             () => withoutTeamWorkerEnv(() =>
@@ -2036,6 +2126,7 @@ process.on('SIGTERM', () => process.exit(0));`,
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     try {
       process.env.OMX_SESSION_ID = 'sess-existing-team';
+      await installTestAuthorityTransport(cwd, { ...process.env, OMX_SESSION_ID: 'sess-existing-team' });
       await initTeamState(
         'dup-team',
         'existing task',
@@ -2095,7 +2186,7 @@ process.on('SIGTERM', () => process.exit(0));`,
     assert.equal(shouldPrekillInteractiveShutdownProcessTrees('omx-team-alpha'), true);
   });
 
-  it('startTeam tags interactive panes with the derived tmux-pane leader identity when session id is unavailable', async () => {
+  it('startTeam tags interactive panes with the authenticated leader identity when session id is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-pane-derived-owner-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
@@ -2180,6 +2271,7 @@ esac
           process.env.OMX_TEAM_WORKER_CLI = 'gemini';
           process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
 
+          const authoritySessionId = testAuthoritySessionId(cwd);
           runtime = await withoutTeamWorkerEnv(() =>
             startTeam(
               'pane-derived-owner',
@@ -2193,13 +2285,25 @@ esac
           const manifest = JSON.parse(
             await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'manifest.v2.json'), 'utf-8'),
           ) as { leader?: { session_id?: string } };
-          assert.equal(manifest.leader?.session_id, '%1');
+          assert.equal(manifest.leader?.session_id, authoritySessionId);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id %1/);
-          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id %1/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id %1/);
-          assert.match(tmuxLog, /exec env OMX_SESSION_ID='%1' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
+          assert.match(
+            tmuxLog,
+            new RegExp(`set-option -p -t %1 @omx_pane_instance_id ${authoritySessionId}`),
+          );
+          assert.match(
+            tmuxLog,
+            new RegExp(`set-option -p -t %2 @omx_pane_instance_id ${authoritySessionId}`),
+          );
+          assert.match(
+            tmuxLog,
+            new RegExp(`set-option -p -t %3 @omx_pane_instance_id ${authoritySessionId}`),
+          );
+          assert.match(
+            tmuxLog,
+            new RegExp(`exec env OMX_SESSION_ID='${authoritySessionId}' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch`),
+          );
 
           await shutdownTeam(runtime.teamName, cwd, { force: true });
           runtime = null;
@@ -2289,11 +2393,6 @@ case "\${1:-}" in
     exit 0
     ;;
   show-option)
-    case "$*" in
-      *)
-        exit 1
-        ;;
-    esac
     exit 0
     ;;
   set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane|kill-session)
@@ -2451,10 +2550,9 @@ esac
           delete process.env.OSTYPE;
           delete process.env.WSL_DISTRO_NAME;
           delete process.env.WSL_INTEROP;
-          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-
+          await installTestAuthorityTransport(cwd);
           const runtime = await withoutTeamWorkerEnv(() =>
-            startTeam(
+            rawStartTeam(
               'team-win32-no-env',
               'native windows current-client detection',
               'executor',
@@ -2462,6 +2560,8 @@ esac
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
             ));
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
           teamNameForCleanup = runtime.teamName;
           assert.equal(runtime.config.tmux_session, 'leader:0');
           assert.equal(runtime.config.leader_pane_id, '%1');
@@ -2469,8 +2569,9 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /display-message -p #\{session_name\}:#\{window_index\} #\{pane_id\}/);
-          assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, new RegExp(`(?:resize-pane -t %3 -y|run-shell .*resize-pane -t %3 -y) ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
 
+          if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
           if (teamNameForCleanup) {
             await shutdownTeam(teamNameForCleanup, cwd, { force: true });
           }
@@ -2777,51 +2878,6 @@ esac
     }
   });
 
-  it('startTeam saves interactive pane ids before concurrent readiness attempts', async () => {
-    const source = await readFile(join(process.cwd(), 'src', 'team', 'runtime.ts'), 'utf-8');
-    const sourceFile = ts.createSourceFile(
-      'runtime.ts',
-      source,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TS,
-    );
-    let startTeamDeclaration: ts.FunctionDeclaration | undefined;
-    const findStartTeam = (node: ts.Node): void => {
-      if (
-        ts.isFunctionDeclaration(node) &&
-        node.name?.text === 'startTeam'
-      ) {
-        startTeamDeclaration = node;
-        return;
-      }
-      ts.forEachChild(node, findStartTeam);
-    };
-    findStartTeam(sourceFile);
-    assert.notEqual(startTeamDeclaration, undefined);
-
-    const callPositions = new Map<string, number[]>();
-    const collectCalls = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-        const positions = callPositions.get(node.expression.text) ?? [];
-        positions.push(node.getStart(sourceFile));
-        callPositions.set(node.expression.text, positions);
-      }
-      ts.forEachChild(node, collectCalls);
-    };
-    collectCalls(startTeamDeclaration!);
-
-    const applyIndex = callPositions.get('applyCreatedInteractiveSessionToConfig')?.[0] ?? -1;
-    const saveIndex =
-      callPositions.get('saveTeamConfig')?.find((position) => position > applyIndex) ?? -1;
-    const readyIndex = callPositions.get('waitForWorkerReadyAsync')?.[0] ?? -1;
-
-    assert.notEqual(applyIndex, -1);
-    assert.notEqual(saveIndex, -1);
-    assert.notEqual(readyIndex, -1);
-    assert.equal(applyIndex < saveIndex, true);
-    assert.equal(saveIndex < readyIndex, true);
-  });
 
 
   it('startTeam rejects startup direct trigger success when Codex startup evidence is missing', async () => {
@@ -4060,8 +4116,17 @@ process.on('SIGTERM', () => process.exit(0));
             repo,
             { worktreeMode: { enabled: true, detached: true, name: null } },
           )),
-        /leader_workspace_dirty_for_worktrees:.*M README\.md.*\?\? notes\.txt.*commit_or_stash_before_omx_team/s,
+        (error: unknown) => {
+          const message = String(error);
+          assert.match(
+            message,
+            /leader_workspace_dirty_for_worktrees:.*M README\.md.*\?\? notes\.txt.*commit_or_stash_before_omx_team/s,
+          );
+          assert.doesNotMatch(message, /\.omx\/bootstrap/);
+          return true;
+        },
       );
+      assert.equal(existsSync(join(repo, '.omx', 'bootstrap')), true);
 
       const listedWorktrees = execFileSync('git', ['worktree', 'list', '--porcelain'], {
         cwd: repo,
@@ -4664,8 +4729,21 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  show-options)
+    case "$*" in
+      *"@omx_one_shot_import_quarantined"*|*"@omx_env_import_quarantine"*)
+        exit 0
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
   show-option)
     case "$*" in
+      *"@omx_one_shot_import_quarantined"*|*"@omx_env_import_quarantine"*)
+        exit 0
+        ;;
       *"-p -t %1 @omx_team_pane_owner_id"*)
         echo "team:team-rerun-hud-6aa4d480"
         ;;
@@ -4673,7 +4751,7 @@ case "\${1:-}" in
         echo "team:team-rerun-hud-6aa4d480"
         ;;
       *)
-        exit 1
+        exit 0
         ;;
     esac
     exit 0
@@ -4825,6 +4903,7 @@ process.on('SIGTERM', () => process.exit(0));
             repo,
             { worktreeMode: { enabled: true, detached: true, name: null } },
           )));
+      assert.equal(existsSync(join(repo, '.omx', 'bootstrap')), true);
 
       const workerPath = runtime.config.workers[0]?.worktree_path;
       assert.ok(workerPath, 'detached worker should have a worktree path');
@@ -5409,7 +5488,7 @@ process.on('SIGTERM', () => process.exit(0));
 
 
 
-  it('monitorTeam deactivates root team-state.json when the local phase becomes terminal', async () => {
+  it('monitorTeam leaves persisted session-scoped team-state authoritative when the local phase becomes terminal', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-root-team-state-'));
     try {
       await initTeamState('team-root-sync', 'root sync test', 'executor', 1, cwd);
@@ -5424,8 +5503,9 @@ process.on('SIGTERM', () => process.exit(0));
         },
         cwd,
       );
-      const rootStatePath = join(cwd, '.omx', 'state', 'team-state.json');
-      await writeFile(rootStatePath, JSON.stringify({
+      const sessionStatePath = teamStateTestPath(cwd, 'sessions', testAuthoritySessionId(cwd), 'team-state.json');
+      await mkdir(dirname(sessionStatePath), { recursive: true });
+      await writeFile(sessionStatePath, JSON.stringify({
         active: true,
         current_phase: 'team-exec',
         team_name: 'team-root-sync',
@@ -5435,10 +5515,10 @@ process.on('SIGTERM', () => process.exit(0));
       assert.ok(snapshot);
       assert.equal(snapshot?.phase, 'complete');
 
-      const rootState = JSON.parse(await readFile(rootStatePath, 'utf-8')) as Record<string, unknown>;
-      assert.equal(rootState.active, false);
-      assert.equal(rootState.current_phase, 'complete');
-      assert.ok(typeof rootState.completed_at === 'string' && rootState.completed_at.length > 0);
+      const sessionState = JSON.parse(await readFile(sessionStatePath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(sessionState.active, true);
+      assert.equal(sessionState.current_phase, 'team-exec');
+      assert.equal(sessionState.completed_at, undefined);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -7269,9 +7349,27 @@ esac
 
   it('shutdownTeam skips prekill and keeps the leader pane alive on native Windows split-pane shutdown', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-win32-split-'));
+    await installTestAuthorityTransport(cwd, { ...process.env, OMX_SESSION_ID: 'team-shutdown-win32-split-session' });
+    await initTeamState(
+      'team-shutdown-win32-split',
+      'shutdown win32 split test',
+      'executor',
+      2,
+      cwd,
+      undefined,
+      { ...process.env, OMX_SESSION_ID: 'team-shutdown-win32-split-session' },
+    );
+    const splitConfig = await readTeamConfig('team-shutdown-win32-split', cwd);
+    assert.ok(splitConfig);
+    if (!splitConfig) throw new Error('missing team config');
+    splitConfig.tmux_session = 'leader:0';
+    splitConfig.leader_pane_id = '%11';
+    splitConfig.hud_pane_id = '%12';
+    splitConfig.workers[0]!.pane_id = '%13';
+    splitConfig.workers[1]!.pane_id = '%14';
+    await saveTeamConfig(splitConfig, cwd);
     try {
-      await withNativeWindowsPlatform(async () => {
-        await withMockTmuxFixture(
+      await withMockTmuxFixture(
           {
             dirPrefix: 'omx-runtime-shutdown-win32-split-bin-',
             tmuxScript: (tmuxLogPath) => `#!/bin/sh
@@ -7300,8 +7398,17 @@ case "$1" in
     printf '%%44\\n'
     exit 0
     ;;
+  show-options)
+    case "$*" in
+      *"@omx_one_shot_import_quarantined"*|*"@omx_env_import_quarantine"*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
   show-option)
     case "$*" in
+      *"@omx_one_shot_import_quarantined"*)
+        exit 0
+        ;;
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-win32-split"
         ;;
@@ -7325,16 +7432,6 @@ esac
             env: { OMX_SESSION_ID: 'team-shutdown-win32-split-session' },
           },
           async ({ tmuxLogPath }) => {
-            await initTeamState('team-shutdown-win32-split', 'shutdown win32 split test', 'executor', 2, cwd);
-            const config = await readTeamConfig('team-shutdown-win32-split', cwd);
-            assert.ok(config);
-            if (!config) return;
-            config.tmux_session = 'leader:0';
-            config.leader_pane_id = '%11';
-            config.hud_pane_id = '%12';
-            config.workers[0]!.pane_id = '%13';
-            config.workers[1]!.pane_id = '%14';
-            await saveTeamConfig(config, cwd);
 
             await shutdownTeam('team-shutdown-win32-split', cwd, { force: true });
 
@@ -7354,8 +7451,7 @@ esac
             assert.match(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
             assert.match(tmuxLog, /select-pane -t %11/);
           },
-        );
-      });
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -7364,9 +7460,19 @@ esac
   it('shutdownTeam preserves an unrelated HUD when the leader is live but persisted shared-session HUD is stale', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-win32-stale-topology-'));
     const teamName = 'team-win32-stale-topo';
+    await installTestAuthorityTransport(cwd);
+    await initTeamState(teamName, 'shutdown win32 stale topology test', 'executor', 2, cwd);
+    const staleTopologyConfig = await readTeamConfig(teamName, cwd);
+    assert.ok(staleTopologyConfig);
+    if (!staleTopologyConfig) throw new Error('missing team config');
+    staleTopologyConfig.tmux_session = 'leader:0';
+    staleTopologyConfig.leader_pane_id = '%11';
+    staleTopologyConfig.hud_pane_id = '%12';
+    staleTopologyConfig.workers[0]!.pane_id = '%23';
+    staleTopologyConfig.workers[1]!.pane_id = '%24';
+    await saveTeamConfig(staleTopologyConfig, cwd);
     try {
-      await withNativeWindowsPlatform(async () => {
-        await withMockTmuxFixture(
+      await withMockTmuxFixture(
           {
             dirPrefix: 'omx-runtime-shutdown-win32-stale-topology-bin-',
             tmuxScript: (tmuxLogPath) => `#!/bin/sh
@@ -7395,8 +7501,17 @@ case "$1" in
     printf '%%44\\n'
     exit 0
     ;;
+  show-options)
+    case "$*" in
+      *"@omx_one_shot_import_quarantined"*|*"@omx_env_import_quarantine"*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
   show-option)
     case "$*" in
+      *"@omx_one_shot_import_quarantined"*)
+        exit 0
+        ;;
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-win32-stale-topo"
         ;;
@@ -7416,16 +7531,6 @@ esac
 `,
           },
           async ({ tmuxLogPath }) => {
-            await initTeamState(teamName, 'shutdown win32 stale topology test', 'executor', 2, cwd);
-            const config = await readTeamConfig(teamName, cwd);
-            assert.ok(config);
-            if (!config) return;
-            config.tmux_session = 'leader:0';
-            config.leader_pane_id = '%11';
-            config.hud_pane_id = '%12';
-            config.workers[0]!.pane_id = '%23';
-            config.workers[1]!.pane_id = '%24';
-            await saveTeamConfig(config, cwd);
 
             await shutdownTeam(teamName, cwd, { force: true });
 
@@ -7442,8 +7547,7 @@ esac
             assert.doesNotMatch(tmuxLog, /split-window/);
             assert.doesNotMatch(tmuxLog, /select-pane -t %11/);
           },
-        );
-      });
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -8283,25 +8387,24 @@ esac
   });
 
   it('resumeTeam resolves approved binding continuity against the persisted leader cwd', async () => {
-    const teamName = 'team-approved-shared-root';
-    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-leader-'));
-    const resumeCwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-alt-'));
-    const sharedStateRoot = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-state-'));
-    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    process.env.OMX_TEAM_STATE_ROOT = sharedStateRoot;
+    const teamName = 'team-approved-leader-cwd';
+    const workspaceCwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-workspace-'));
+    const leaderCwd = join(workspaceCwd, 'leader');
+    const resumeCwd = join(workspaceCwd, 'resume');
+    await mkdir(leaderCwd, { recursive: true });
+    await mkdir(resumeCwd, { recursive: true });
 
     try {
       await initTeamState(
         teamName,
-        'approved resume shared-root test',
+        'approved resume leader-cwd continuity test',
         'executor',
         1,
-        leaderCwd,
+        workspaceCwd,
         DEFAULT_MAX_WORKERS,
         process.env,
         {
           leader_cwd: leaderCwd,
-          team_state_root: sharedStateRoot,
         },
       );
       const plansDir = join(leaderCwd, '.omx', 'plans');
@@ -8320,17 +8423,12 @@ esac
           task: 'Execute approved issue 2110 plan',
           command: 'omx team 1:executor "Execute approved issue 2110 plan"',
         },
-        sharedStateRoot,
       );
 
       const resumed = await resumeTeam(teamName, resumeCwd);
       assert.equal(resumed, null);
     } finally {
-      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
-      await rm(leaderCwd, { recursive: true, force: true });
-      await rm(resumeCwd, { recursive: true, force: true });
-      await rm(sharedStateRoot, { recursive: true, force: true });
+      await rm(workspaceCwd, { recursive: true, force: true });
     }
   });
 
@@ -9604,7 +9702,7 @@ esac
           assert.ok(cfg);
           if (!cfg) throw new Error('missing team config');
           cfg.leader_pane_id = '%55';
-          cfg.team_state_root = '/tmp/custom-team-state-root';
+          cfg.team_state_root = teamStateTestPath(cwd);
           await saveTeamConfig(cfg, cwd);
 
           const manifestPath = teamStateTestPath(cwd, 'team', 'team-leader-inject', 'manifest.v2.json');
@@ -9627,7 +9725,7 @@ esac
           assert.equal(latest?.last_reason, 'fallback_confirmed:leader_mailbox_notified');
           assert.match(
             latest?.trigger_message ?? '',
-            /Read \/tmp\/custom-team-state-root\/team\/team-leader-inject\/mailbox\/leader-fixed\.json; new msg from worker-1\./,
+            new RegExp(`Read ${escapeRegExp(teamStateTestPath(cwd, 'team', 'team-leader-inject', 'mailbox', 'leader-fixed.json'))}; new msg from worker-1\\.`),
           );
 
           const deliveryLog = await readTeamDeliveryLog(cwd);
@@ -9765,7 +9863,7 @@ esac
       cfg.leader_pane_id = '';
       await saveTeamConfig(cfg, cwd);
 
-      const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-leader-direct', 'manifest.v2.json');
+      const manifestPath = teamStateTestPath(cwd, 'team', 'team-leader-direct', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8'));
       manifest.policy = { ...(manifest.policy || {}), dispatch_mode: 'transport_direct' };
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));

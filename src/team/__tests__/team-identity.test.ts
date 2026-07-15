@@ -1,11 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { TEAM_NAME_SAFE_PATTERN } from '../contracts.js';
 import { buildInternalTeamName, resolveTeamIdentityScope, resolveTeamNameForCurrentContext, TeamLookupAmbiguityError } from '../team-identity.js';
 import { initTeamState } from '../state.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 const longDisplay = 'this-is-a-very-long-team-display-name-that-would-overflow';
 
@@ -40,24 +43,94 @@ describe('team identity', () => {
     assert.equal(scope.paneId, '%42');
   });
 
-  it('resolves display names from OMX_TEAM_STATE_ROOT when cwd has no local team state', async () => {
-    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-leader-'));
-    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-worker-'));
+  it('keeps ambient root combinations out of canonical persistence and lookup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-canonical-'));
+    const foreignTeamStateRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-team-'));
+    const foreignOmxRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-root-'));
+    const foreignStateRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-state-'));
+    const previous = {
+      teamStateRoot: process.env.OMX_TEAM_STATE_ROOT,
+      root: process.env.OMX_ROOT,
+      stateRoot: process.env.OMX_STATE_ROOT,
+    };
+    const teamName = 'shared-demo-aaaaaaaa';
     try {
-      await initTeamState('shared-demo-aaaaaaaa', 'task', 'executor', 1, leaderCwd, undefined, { OMX_SESSION_ID: 'session-shared' }, {
+      process.env.OMX_TEAM_STATE_ROOT = foreignTeamStateRoot;
+      process.env.OMX_ROOT = foreignOmxRoot;
+      process.env.OMX_STATE_ROOT = foreignStateRoot;
+      await initTeamState(teamName, 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-shared' }, {
         display_name: 'shared-demo', requested_name: 'shared-demo', identity_source: 'env-session',
       });
 
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'config.json')), true);
       assert.equal(
-        resolveTeamNameForCurrentContext('shared-demo', workerCwd, {
+        resolveTeamNameForCurrentContext('shared-demo', cwd, {
           OMX_SESSION_ID: 'session-shared',
-          OMX_TEAM_STATE_ROOT: join(leaderCwd, '.omx', 'state'),
+          OMX_TEAM_STATE_ROOT: foreignTeamStateRoot,
+          OMX_ROOT: foreignOmxRoot,
+          OMX_STATE_ROOT: foreignStateRoot,
         }),
-        'shared-demo-aaaaaaaa',
+        teamName,
       );
+      for (const root of [
+        foreignTeamStateRoot,
+        join(foreignOmxRoot, '.omx', 'state'),
+        join(foreignStateRoot, '.omx', 'state'),
+      ]) {
+        assert.equal(existsSync(join(root, 'team', teamName)), false);
+      }
+    } finally {
+      if (typeof previous.teamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previous.teamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      if (typeof previous.root === 'string') process.env.OMX_ROOT = previous.root;
+      else delete process.env.OMX_ROOT;
+      if (typeof previous.stateRoot === 'string') process.env.OMX_STATE_ROOT = previous.stateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(foreignTeamStateRoot, { recursive: true, force: true });
+      await rm(foreignOmxRoot, { recursive: true, force: true });
+      await rm(foreignStateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('uses authenticated worker authority for canonical lookup and isolates conflicting ambient roots', async () => {
+    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-authority-'));
+    const workerCwd = join(leaderCwd, 'worker');
+    const foreignRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-authority-foreign-'));
+    const teamName = 'worker-demo-aaaaaaaa';
+    try {
+      await mkdir(workerCwd, { recursive: true });
+      const authority = await initializeStateAuthority({
+        startup_cwd: leaderCwd,
+        observed_cwd: leaderCwd,
+        launch_id: 'team-identity-worker-authority',
+        session_binding: { canonical_session_id: 'session-worker-authority' },
+      });
+      await mintStateAuthorityTransportCapability(authority);
+      await initTeamState(teamName, 'task', 'executor', 1, leaderCwd, undefined, {
+        OMX_SESSION_ID: 'session-worker-authority',
+      }, {
+        display_name: 'worker-demo', requested_name: 'worker-demo', identity_source: 'env-session',
+      });
+
+      const transport = buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: 'session-worker-authority',
+      });
+      assert.equal(resolveTeamNameForCurrentContext('worker-demo', workerCwd, transport), teamName);
+      for (const [name, value] of [
+        ['OMX_TEAM_STATE_ROOT', foreignRoot],
+        ['OMX_ROOT', foreignRoot],
+        ['OMX_STATE_ROOT', foreignRoot],
+      ]) {
+        assert.throws(
+          () => resolveTeamNameForCurrentContext('worker-demo', workerCwd, { ...transport, [name]: value }),
+          (error: unknown) => error instanceof Error && 'code' in error && error.code === 'authority_workspace_mismatch',
+        );
+      }
+      assert.equal(existsSync(join(foreignRoot, 'team', teamName)), false);
     } finally {
       await rm(leaderCwd, { recursive: true, force: true });
-      await rm(workerCwd, { recursive: true, force: true });
+      await rm(foreignRoot, { recursive: true, force: true });
     }
   });
 
@@ -132,7 +205,7 @@ describe('team identity', () => {
     }
   });
 
-  it('keeps a retained terminal pane bound instead of selecting another active team', async () => {
+  it('keeps a retained terminal session binding instead of selecting another active team', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-terminal-pane-'));
     try {
       await initTeamState('demo-terminal-current', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-current' }, {

@@ -1,4 +1,5 @@
-import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, rm, rename, readdir, lstat } from 'fs/promises';
+
 import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
@@ -66,7 +67,9 @@ import {
 } from './contracts.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
-import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import { resolveCanonicalTeamMutationStateRoot, resolveCanonicalTeamStateRoot } from './state-root.js';
+import { atomicWriteAuthorityFile } from '../state/authority.js';
+
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
@@ -452,6 +455,56 @@ function assertPathWithinDir(filePath: string, rootDir: string): void {
   }
 }
 
+function teamStateMutationRoot(filePath: string): string | null {
+  const target = resolve(filePath);
+  const segments = target.split(sep);
+  const teamIndex = segments.lastIndexOf('team');
+  if (teamIndex <= 0 || teamIndex === segments.length - 1) return null;
+  return segments.slice(0, teamIndex).join(sep) || sep;
+}
+
+async function assertTeamStateMutationPath(
+  stateRoot: string,
+  targetPath: string,
+): Promise<void> {
+  const root = resolve(stateRoot);
+  const target = resolve(targetPath);
+  assertPathWithinDir(target, root);
+
+  let rootDetails: Awaited<ReturnType<typeof lstat>>;
+  try {
+    rootDetails = await lstat(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (rootDetails.isSymbolicLink()) {
+    throw new Error(`Team state mutation root must not be a symbolic link: ${root}`);
+  }
+  if (!rootDetails.isDirectory()) {
+    throw new Error(`Team state mutation root must be a directory: ${root}`);
+  }
+
+  const relativeTarget = target === root ? '' : target.slice(root.length + 1);
+  let current = root;
+  for (const segment of relativeTarget.split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      const details = await lstat(current);
+      if (details.isSymbolicLink()) {
+        throw new Error(`Team state mutation path has a symbolic-link component: ${current}`);
+      }
+      if (!details.isDirectory() && current !== target) {
+        throw new Error(`Team state mutation path has a non-directory component: ${current}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
+}
+
+
 function validateWorkerName(name: string): void {
   if (!WORKER_NAME_SAFE_PATTERN.test(name)) {
     throw new Error(
@@ -604,6 +657,7 @@ function resolvePermissionsSnapshot(env: NodeJS.ProcessEnv): PermissionsSnapshot
 async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
   const fromEnv = readEnvValue(env, ['OMX_SESSION_ID', 'CODEX_SESSION_ID', 'SESSION_ID']);
   if (fromEnv) return fromEnv;
+  if (!existsSync(join(resolveCanonicalTeamStateRoot(cwd, env), 'session.json'))) return '';
   return (await readUsableSessionState(cwd))?.session_id ?? '';
 }
 
@@ -620,20 +674,6 @@ function normalizeTask(task: TeamTask): TeamTaskV2 {
 
 // Team state directory: .omx/state/team/{teamName}/
 function resolveTeamStateRoot(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
-  if (
-    env.OMX_STATE_AUTHORITY_PATH?.trim()
-    || env.OMX_STATE_AUTHORITY_ID?.trim()
-    || env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim()
-    || env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim()
-  ) {
-    return resolveCanonicalTeamStateRoot(cwd, env);
-  }
-  const teamStateRoot = env.OMX_TEAM_STATE_ROOT?.trim();
-  if (teamStateRoot) return resolve(cwd, teamStateRoot);
-  const omxRoot = env.OMX_ROOT?.trim();
-  if (omxRoot) return join(resolve(cwd, omxRoot), '.omx', 'state');
-  const omxStateRoot = env.OMX_STATE_ROOT?.trim();
-  if (omxStateRoot) return join(resolve(cwd, omxStateRoot), '.omx', 'state');
   return resolveCanonicalTeamStateRoot(cwd, env);
 }
 
@@ -649,15 +689,23 @@ function teamDir(teamName: string, cwd: string): string {
 }
 
 function workerDir(teamName: string, workerName: string, cwd: string): string {
-  return join(teamDir(teamName, cwd), 'workers', workerName);
+  validateWorkerName(workerName);
+  const path = join(teamDir(teamName, cwd), 'workers', workerName);
+  assertPathWithinDir(path, resolveTeamStateRoot(cwd));
+  return path;
 }
 
 function teamConfigPath(teamName: string, cwd: string): string {
   return join(teamDir(teamName, cwd), 'config.json');
 }
 
-function teamManifestV2Path(teamName: string, cwd: string): string {
-  return join(teamDir(teamName, cwd), 'manifest.v2.json');
+function teamManifestV2Path(
+  teamName: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  assertSafeTeamName(teamName);
+  return join(resolveTeamStateRoot(cwd, env), 'team', teamName, 'manifest.v2.json');
 }
 
 function taskClaimLockDir(teamName: string, taskId: string, cwd: string): string {
@@ -765,11 +813,19 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
   return true;
 }
 
-// Atomic write: write to {path}.tmp.{pid}, then rename
+// Atomic write: write to {path}.tmp.{pid}, then rename.
 export async function writeAtomic(filePath: string, data: string): Promise<void> {
   const parent = dirname(filePath);
-  await mkdir(parent, { recursive: true });
+  const stateRoot = teamStateMutationRoot(filePath);
+  if (stateRoot) {
+    await assertTeamStateMutationPath(stateRoot, filePath);
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await assertTeamStateMutationPath(stateRoot, filePath);
+    await atomicWriteAuthorityFile(filePath, data, { authority_root: stateRoot });
+    return;
+  }
 
+  await mkdir(parent, { recursive: true, mode: 0o700 });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
 
@@ -788,6 +844,7 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
     throw error;
   }
 }
+
 
 // Initialize team state directory + config.json
 // Creates: .omx/state/team/{name}/, workers/{worker-1}..{worker-N}/, tasks/
@@ -813,7 +870,19 @@ export async function initTeamState(
     throw new Error(`workerCount (${workerCount}) exceeds maxWorkers (${maxWorkers})`);
   }
 
-  const root = teamDir(teamName, cwd);
+  const stateRoot = resolveCanonicalTeamMutationStateRoot(cwd, env);
+  const leaderSessionId = await resolveLeaderSessionId(cwd, env);
+  const configuredDiagnosticRoot = workspace.team_state_root?.trim();
+  if (
+    configuredDiagnosticRoot
+    && resolve(cwd, configuredDiagnosticRoot) !== resolve(stateRoot)
+  ) {
+    throw new Error(
+      `team_state_root_authority_conflict:${resolve(cwd, configuredDiagnosticRoot)}:${resolve(stateRoot)}; restart the session from the intended workspace or rebind the session authority before retrying`,
+    );
+  }
+
+  const root = join(stateRoot, 'team', teamName);
   const workersRoot = join(root, 'workers');
   const tasksRoot = join(root, 'tasks');
   const claimsRoot = join(root, 'claims');
@@ -821,14 +890,32 @@ export async function initTeamState(
   const dispatchRoot = join(root, 'dispatch');
   const eventsRoot = join(root, 'events');
   const approvalsRoot = join(root, 'approvals');
+  const initializationPaths = [
+    root,
+    workersRoot,
+    tasksRoot,
+    claimsRoot,
+    mailboxRoot,
+    dispatchRoot,
+    eventsRoot,
+    approvalsRoot,
+  ];
+  for (const path of initializationPaths) {
+    await assertTeamStateMutationPath(stateRoot, path);
+  }
 
-  await mkdir(workersRoot, { recursive: true });
-  await mkdir(tasksRoot, { recursive: true });
-  await mkdir(claimsRoot, { recursive: true });
-  await mkdir(mailboxRoot, { recursive: true });
-  await mkdir(dispatchRoot, { recursive: true });
-  await mkdir(eventsRoot, { recursive: true });
-  await mkdir(approvalsRoot, { recursive: true });
+
+  await mkdir(workersRoot, { recursive: true, mode: 0o700 });
+  await mkdir(tasksRoot, { recursive: true, mode: 0o700 });
+  await mkdir(claimsRoot, { recursive: true, mode: 0o700 });
+  await mkdir(mailboxRoot, { recursive: true, mode: 0o700 });
+  await mkdir(dispatchRoot, { recursive: true, mode: 0o700 });
+  await mkdir(eventsRoot, { recursive: true, mode: 0o700 });
+  await mkdir(approvalsRoot, { recursive: true, mode: 0o700 });
+  for (const path of initializationPaths) {
+    await assertTeamStateMutationPath(stateRoot, path);
+  }
+
   await writeAtomic(join(dispatchRoot, 'requests.json'), JSON.stringify([], null, 2));
 
   const workers: WorkerInfo[] = [];
@@ -836,10 +923,10 @@ export async function initTeamState(
     const name = `worker-${i}`;
     const worker: WorkerInfo = { name, index: i, role: agentType, assigned_tasks: [] };
     workers.push(worker);
-    await mkdir(join(workersRoot, name), { recursive: true });
-  }
+    await assertTeamStateMutationPath(stateRoot, join(workersRoot, name));
+    await mkdir(join(workersRoot, name), { recursive: true, mode: 0o700 });
 
-  const leaderSessionId = await resolveLeaderSessionId(cwd, env);
+  }
   const leaderWorkerId = readEnvValue(env, ['OMX_TEAM_WORKER']) ?? 'leader-fixed';
   const displayMode = resolveDisplayModeFromEnv(env);
   const permissionsSnapshot = resolvePermissionsSnapshot(env);
@@ -859,7 +946,7 @@ export async function initTeamState(
     tmux_session: `omx-team-${teamName}`,
     next_task_id: 1,
     leader_cwd: workspace.leader_cwd,
-    team_state_root: workspace.team_state_root,
+    team_state_root: stateRoot,
     workspace_mode: workspace.workspace_mode,
     worktree_mode: workspace.worktree_mode,
     leader_pane_id: null,
@@ -874,16 +961,19 @@ export async function initTeamState(
   };
 
   await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2));
-  await writeTeamPhase(
-    teamName,
-    {
-      current_phase: 'team-exec',
-      max_fix_attempts: 3,
-      current_fix_attempt: 0,
-      transitions: [],
-      updated_at: new Date().toISOString(),
-    },
-    cwd
+  await writeAtomic(
+    join(root, 'phase.json'),
+    JSON.stringify(
+      {
+        current_phase: 'team-exec',
+        max_fix_attempts: 3,
+        current_fix_attempt: 0,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
   );
   await writeTeamManifestV2(
     {
@@ -905,7 +995,7 @@ export async function initTeamState(
       next_task_id: 1,
       created_at: config.created_at,
       leader_cwd: workspace.leader_cwd,
-      team_state_root: workspace.team_state_root,
+      team_state_root: stateRoot,
       workspace_mode: workspace.workspace_mode,
       worktree_mode: workspace.worktree_mode,
       leader_pane_id: null,
@@ -918,7 +1008,8 @@ export async function initTeamState(
       requested_name: workspace.requested_name,
       identity_source: workspace.identity_source,
     },
-    cwd
+    cwd,
+    env,
   );
   return config;
 }
@@ -1048,7 +1139,11 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
   };
 }
 
-export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string): Promise<void> {
+export async function writeTeamManifestV2(
+  manifest: TeamManifestV2,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
     worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
@@ -1060,7 +1155,7 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
   const tmuxPaneOwnerId = typeof manifest.tmux_pane_owner_id === 'string' && manifest.tmux_pane_owner_id.trim() !== ''
     ? manifest.tmux_pane_owner_id.trim()
     : defaultTmuxPaneOwnerId(manifest.name);
-  const p = teamManifestV2Path(manifest.name, cwd);
+  const p = teamManifestV2Path(manifest.name, cwd, env);
   await writeAtomic(
     p,
     JSON.stringify(
@@ -1167,14 +1262,10 @@ async function computeNextTaskIdFromDisk(teamName: string, cwd: string): Promise
   return maxId + 1;
 }
 
-// Read team config
+// Read team config without migrating or repairing persisted state.
 export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
   const v2 = await readTeamManifestV2(teamName, cwd);
   if (v2) return teamConfigFromManifest(v2);
-
-  // Attempt idempotent migration on first read.
-  const migrated = await migrateV1ToV2(teamName, cwd);
-  if (migrated) return teamConfigFromManifest(migrated);
 
   try {
     const p = teamConfigPath(teamName, cwd);
@@ -1495,10 +1586,24 @@ export async function appendTeamEvent(teamName: string, event: Omit<TeamEvent, '
     team: teamName,
     created_at: new Date().toISOString(),
   } as TeamEvent;
-  const p = teamEventLogPath(teamName, cwd);
-  await mkdir(dirname(p), { recursive: true });
-  await appendFile(p, `${JSON.stringify(full)}\n`, 'utf8');
-  return full;
+  try {
+    return await withMailboxLock(teamName, 'event-log', cwd, async () => {
+      const p = teamEventLogPath(teamName, cwd);
+      const stateRoot = resolveTeamStateRoot(cwd);
+      await assertTeamStateMutationPath(stateRoot, p);
+      const existing = await readFile(p, 'utf8').catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return '';
+        throw error;
+      });
+      await writeAtomic(p, `${existing}${JSON.stringify(full)}\n`);
+      return full;
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === `Timed out acquiring mailbox lock for ${teamName}/event-log`) {
+      throw new Error(`team_event_append_lock_timeout:${teamName}`);
+    }
+    throw error;
+  }
 }
 
 async function readMailbox(teamName: string, workerName: string, cwd: string): Promise<TeamMailbox> {
@@ -2229,7 +2334,11 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string): Promise<v
   await writeConfig(config, cwd);
 }
 
-// Delete team state directory
+// Delete team state directory.
 export async function cleanupTeamState(teamName: string, cwd: string): Promise<void> {
-  await rm(teamDir(teamName, cwd), { recursive: true, force: true });
+  assertSafeTeamName(teamName);
+  const root = resolveTeamStateRoot(cwd);
+  const path = teamDir(teamName, cwd);
+  await assertTeamStateMutationPath(root, path);
+  await rm(path, { recursive: true, force: true });
 }

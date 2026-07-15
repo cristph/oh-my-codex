@@ -52,10 +52,20 @@ function canonicalizeExistingPath(path: string, label: string): string {
   }
 }
 
-function readTrimmedFile(path: string): string | null {
+function readTrimmedFile(path: string, strict = false): string | null {
   try {
-    return readFileSync(path, 'utf-8').trim() || null;
-  } catch {
+    const value = readFileSync(path, 'utf-8').trim();
+    if (!value) {
+      if (strict) throw new Error(`empty Git metadata file at ${path}`);
+      return null;
+    }
+    return value;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    if (strict) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`cannot read Git metadata file at ${path}: ${detail}`);
+    }
     return null;
   }
 }
@@ -78,7 +88,7 @@ function resolveGitDirPointer(path: string, strict = false): string | null {
 }
 
 function resolveGitCommonDir(gitDir: string, strict = false): string {
-  const commonDir = readTrimmedFile(join(gitDir, 'commondir'));
+  const commonDir = readTrimmedFile(join(gitDir, 'commondir'), strict);
   if (!commonDir) return gitDir;
   if (commonDir.includes('\0') || commonDir.split(/\r?\n/).filter(Boolean).length !== 1) {
     if (strict) throw new Error(`malformed commondir file in ${gitDir}`);
