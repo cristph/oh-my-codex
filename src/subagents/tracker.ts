@@ -4,7 +4,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { AGENT_DEFINITIONS } from '../agents/definitions.js';
-import { getBaseStateDir } from '../state/paths.js';
+import { getBaseStateDir, getBaseStateDirWithSource } from '../state/paths.js';
+import { canonicalizeOriginCwd } from '../leader/contract.js';
+
 import { codexAgentsDir, projectCodexAgentsDir } from '../utils/paths.js';
 
 export const SUBAGENT_TRACKING_SCHEMA_VERSION = 1;
@@ -82,6 +84,11 @@ export interface PendingRoleIntent {
   correlation_token: string;
   created_at: string;
   expires_at: string;
+  binding_state?: 'bound';
+  binding_claimant_token?: string;
+  bound_at?: string;
+
+  origin_cwd?: string;
 }
 
 export interface SubagentSessionSummary {
@@ -125,6 +132,7 @@ const KNOWN_TYPED_AGENT_ROLES = new Set(Object.keys(AGENT_DEFINITIONS).map((role
 export function subagentTrackingPath(cwd: string): string {
   return join(getBaseStateDir(cwd), 'subagent-tracking.json');
 }
+
 
 export function resolveInstalledRoleName(role: string, codexHomeOverride?: string): string | null {
   const normalizedRole = role.trim().toLowerCase();
@@ -236,18 +244,30 @@ function normalizePendingRoleIntent(value: unknown): PendingRoleIntent | null {
   const role = readOptionalTrimmedString(candidate.role);
   const sessionId = readOptionalTrimmedString(candidate.session_id);
   const parentThreadId = readOptionalTrimmedString(candidate.parent_thread_id);
-  const correlationToken = readOptionalTrimmedString(candidate.correlation_token);
   const createdAt = readOptionalTrimmedString(candidate.created_at);
   const expiresAt = readOptionalTrimmedString(candidate.expires_at);
-  if (!role || !sessionId || !parentThreadId || !correlationToken || !createdAt || !expiresAt) return null;
+  if (!role || !sessionId || !parentThreadId || !Object.hasOwn(candidate, 'correlation_token') || !createdAt || !expiresAt) return null;
   if (!Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(expiresAt))) return null;
+
+  const bindingState = candidate.binding_state === 'bound' ? 'bound' : undefined;
+  const boundAt = readOptionalTrimmedString(candidate.bound_at);
+  const hasValidBoundAt = Boolean(boundAt && Number.isFinite(Date.parse(boundAt)));
+  const originCwd = readOptionalTrimmedString(candidate.origin_cwd);
   return {
     role,
     session_id: sessionId,
     parent_thread_id: parentThreadId,
-    correlation_token: correlationToken,
+    // Bound journals are durable security records. Retain malformed credentials verbatim so
+    // completion can reject them rather than silently converting them into claimant-less data.
+    correlation_token: candidate.correlation_token as string,
     created_at: createdAt,
     expires_at: expiresAt,
+    ...(bindingState ? { binding_state: bindingState } : {}),
+    ...(bindingState && Object.hasOwn(candidate, 'binding_claimant_token')
+      ? { binding_claimant_token: candidate.binding_claimant_token }
+      : {}),
+    ...(bindingState && hasValidBoundAt ? { bound_at: boundAt } : {}),
+    ...(originCwd ? { origin_cwd: originCwd } : {}),
   };
 }
 
@@ -509,7 +529,15 @@ function restoreQuarantinedCrossProcessLock(lockPath: string, quarantinedPath: s
   try {
     linkSync(quarantinedPath, lockPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return;
+    const code = (error as NodeJS.ErrnoException).code;
+    // EEXIST: a replacement claim already holds the lock; the displaced copy is redundant.
+    // ENOENT: the displaced artifact was already removed (e.g. by a concurrent bounded
+    // sweep) — a fenced clean terminal outcome, never a cleanup failure to throw on.
+    if (code === 'EEXIST') {
+      removeCrossProcessLockFile(quarantinedPath);
+      return;
+    }
+    if (code === 'ENOENT') return;
     throw error;
   }
   removeCrossProcessLockFile(quarantinedPath);
@@ -519,13 +547,16 @@ function recoverCrossProcessFileLock(lockPath: string, observed: CrossProcessLoc
   if (observed.kind === 'missing') return true;
   if (observed.kind === 'claim' && !isCrossProcessLockReclaimable(observed.claim)) return false;
 
-  const quarantinedPath = `${lockPath}.${randomUUID()}.quarantine`;
+  const quarantinedPath = `${lockPath}.${Date.now()}.${randomUUID()}.quarantine`;
   try {
     renameSync(lockPath, quarantinedPath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
     throw error;
   }
+  const barrier = crossProcessQuarantineBarrier;
+  crossProcessQuarantineBarrier = null;
+  barrier?.(lockPath, quarantinedPath);
 
   const captured = readCrossProcessLockState(quarantinedPath);
   const capturedExpectedClaim = observed.kind === 'claim'
@@ -552,13 +583,16 @@ function releaseCrossProcessFileLock(lockPath: string, token: string): void {
   const observed = readCrossProcessLockState(lockPath);
   if (observed.kind !== 'claim' || observed.claim.token !== token) return;
 
-  const quarantinedPath = `${lockPath}.${randomUUID()}.release`;
+  const quarantinedPath = `${lockPath}.${Date.now()}.${randomUUID()}.release`;
   try {
     renameSync(lockPath, quarantinedPath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
+  const barrier = crossProcessQuarantineBarrier;
+  crossProcessQuarantineBarrier = null;
+  barrier?.(lockPath, quarantinedPath);
 
   const captured = readCrossProcessLockState(quarantinedPath);
   if (captured.kind === 'claim' && captured.claim.token === token) {
@@ -587,10 +621,44 @@ function sweepForeignCrossProcessLockStages(resourcePath: string, token: string)
   }
 }
 
+export const CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP = 64;
+
+function sweepAbandonedCrossProcessLockArtifacts(resourcePath: string): void {
+  const directory = dirname(resourcePath);
+  const lockName = basename(crossProcessLockPath(resourcePath));
+  const escapedLockName = lockName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const artifactPattern = new RegExp(`^${escapedLockName}\\.([^.]+)\\.[^.]+\\.(?:quarantine|release)$`);
+  const nowMs = Date.now();
+  const aged: Array<{ displacedAtMs: number; entry: string }> = [];
+  for (const entry of readdirSync(directory)) {
+    const match = artifactPattern.exec(entry);
+    if (!match) continue;
+    const displacedAtMs = Number(match[1]);
+    // Only lease-aged, parseable-timestamp artifacts are eligible; fresh/live/malformed-ts
+    // artifacts are always preserved (never delete a live successor's in-flight evidence).
+    if (!Number.isFinite(displacedAtMs) || nowMs - displacedAtMs <= CROSS_PROCESS_LOCK_LEASE_MS) continue;
+    aged.push({ displacedAtMs, entry });
+  }
+  // Bounded, deterministic cleanup: process oldest-first (tie-break by name) and remove at
+  // most CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP per acquisition, so a large backlog drains
+  // predictably across acquisitions instead of doing unbounded work in a single lock take.
+  aged.sort((a, b) => a.displacedAtMs - b.displacedAtMs || (a.entry < b.entry ? -1 : a.entry > b.entry ? 1 : 0));
+  for (const { entry } of aged.slice(0, CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP)) {
+    removeCrossProcessLockFile(join(directory, entry));
+  }
+}
+
 let crossProcessPublishBarrier: (() => void) | null = null;
+let crossProcessQuarantineBarrier: ((lockPath: string, quarantinedPath: string) => void) | null = null;
 
 export function __setCrossProcessPublishBarrierForTest(barrier: (() => void) | null): void {
   crossProcessPublishBarrier = barrier;
+}
+
+export function __setCrossProcessQuarantineBarrierForTest(
+  barrier: ((lockPath: string, quarantinedPath: string) => void) | null,
+): void {
+  crossProcessQuarantineBarrier = barrier;
 }
 
 export function withCrossProcessFileLockSync<T>(
@@ -635,6 +703,7 @@ export function withCrossProcessFileLockSync<T>(
 
   try {
     sweepForeignCrossProcessLockStages(resourcePath, token);
+    sweepAbandonedCrossProcessLockArtifacts(resourcePath);
     createCrossProcessLockStage(stagePath);
     return operation({
       assertOwnership: () => assertCrossProcessFileLockOwnership(lockPath, token),
@@ -725,8 +794,102 @@ function normalizeNowMs(nowMs: number | undefined): number {
 }
 
 function isExpiredPendingRoleIntent(intent: PendingRoleIntent, nowMs: number): boolean {
+  if (intent.binding_state === 'bound') return false;
   const expiresAtMs = Date.parse(intent.expires_at);
   return !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs;
+}
+
+function pendingRoleIntentPredicates(cwd: string, canonicalOrigin: string | null, nowMs: number) {
+  const isCwdPartitionedStateRoot = getBaseStateDirWithSource(cwd).rootSource === 'cwd-default';
+  const isOwn = (intent: PendingRoleIntent) => (
+    intent.origin_cwd
+      ? canonicalizeOriginCwd(intent.origin_cwd) === canonicalOrigin
+      : isCwdPartitionedStateRoot
+  );
+  const shouldPruneExpired = (intent: PendingRoleIntent) => (
+    isOwn(intent)
+    && intent.binding_state !== 'bound'
+    && isExpiredPendingRoleIntent(intent, nowMs)
+  );
+  return { isOwn, shouldPruneExpired };
+}
+
+export function isRoleIntentOwnedByCwd(cwd: string, intent: PendingRoleIntent): boolean {
+  return pendingRoleIntentPredicates(cwd, canonicalizeOriginCwd(cwd), Date.now()).isOwn(intent);
+}
+
+function sameLogicalRoleIntent(
+  intent: PendingRoleIntent,
+  sessionId: string,
+  parentThreadId: string,
+  correlationToken?: string,
+): boolean {
+  return (
+    intent.session_id === sessionId
+    && intent.parent_thread_id === parentThreadId
+    && (correlationToken === undefined || intent.correlation_token === correlationToken)
+  );
+}
+
+export function isCanonicalCorrelationToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+}
+
+export function isCanonicalClaimantToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+function hasOwnBoundLogicalIntent(
+  all: PendingRoleIntent[],
+  isOwn: (intent: PendingRoleIntent) => boolean,
+  sessionId: string,
+  parentThreadId: string,
+  correlationToken?: string,
+): boolean {
+  return all.some((intent) => (
+    isOwn(intent)
+    && intent.binding_state === 'bound'
+    && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken)
+  ));
+}
+
+function selectDominantRoleIntent(
+  candidates: PendingRoleIntent[],
+  canonicalOrigin: string,
+): PendingRoleIntent | null {
+  return [...candidates].sort((left, right) => {
+    const leftIsBound = left.binding_state === 'bound';
+    const rightIsBound = right.binding_state === 'bound';
+    if (leftIsBound !== rightIsBound) return leftIsBound ? -1 : 1;
+
+    const leftIsExactOrigin = left.origin_cwd !== undefined
+      && canonicalizeOriginCwd(left.origin_cwd) === canonicalOrigin;
+    const rightIsExactOrigin = right.origin_cwd !== undefined
+      && canonicalizeOriginCwd(right.origin_cwd) === canonicalOrigin;
+    if (leftIsExactOrigin !== rightIsExactOrigin) return leftIsExactOrigin ? -1 : 1;
+
+    const leftStableKey = [
+      left.role,
+      left.correlation_token,
+      left.created_at,
+      left.expires_at,
+      left.binding_state ?? '',
+      left.binding_claimant_token ?? '',
+      left.bound_at ?? '',
+      left.origin_cwd ?? '',
+    ].join('\u0000');
+    const rightStableKey = [
+      right.role,
+      right.correlation_token,
+      right.created_at,
+      right.expires_at,
+      right.binding_state ?? '',
+      right.binding_claimant_token ?? '',
+      right.bound_at ?? '',
+      right.origin_cwd ?? '',
+    ].join('\u0000');
+    return leftStableKey.localeCompare(rightStableKey);
+  })[0] ?? null;
 }
 
 export function recordPendingRoleIntent(
@@ -739,19 +902,29 @@ export function recordPendingRoleIntent(
     ttlMs?: number;
     nowMs?: number;
   },
-): { ok: true; intent: PendingRoleIntent } | { ok: false; reason: 'unknown_role' | 'invalid_correlation_token' | 'single_flight_conflict' } {
+): { ok: true; intent: PendingRoleIntent } | { ok: false; reason: 'unknown_role' | 'invalid_correlation_token' | 'invalid_origin' | 'single_flight_conflict' } {
   const role = resolveInstalledRoleName(input.role);
   if (!role) return { ok: false, reason: 'unknown_role' };
-  const correlationToken = readOptionalTrimmedString(input.correlationToken);
-  if (!correlationToken) return { ok: false, reason: 'invalid_correlation_token' };
+  const correlationToken = input.correlationToken;
+  if (!isCanonicalCorrelationToken(correlationToken)) {
+    return { ok: false, reason: 'invalid_correlation_token' };
+  }
 
   const nowMs = normalizeNowMs(input.nowMs);
   const sessionId = input.sessionId.trim();
   const parentThreadId = input.parentThreadId.trim();
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return { ok: false, reason: 'invalid_origin' };
+  const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
   return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
     const state = readSubagentTrackingStateSync(cwd);
-    const pendingRoleIntents = state.pending_role_intents.filter((intent) => !isExpiredPendingRoleIntent(intent, nowMs));
-    if (pendingRoleIntents.some((intent) => intent.session_id === sessionId && intent.parent_thread_id === parentThreadId)) {
+    const all = state.pending_role_intents;
+    if (all.some((intent) => (
+      isOwn(intent)
+      && intent.session_id === sessionId
+      && intent.parent_thread_id === parentThreadId
+      && (intent.binding_state === 'bound' || !isExpiredPendingRoleIntent(intent, nowMs))
+    ))) {
       return { ok: false, reason: 'single_flight_conflict' };
     }
 
@@ -763,8 +936,10 @@ export function recordPendingRoleIntent(
       correlation_token: correlationToken,
       created_at: new Date(nowMs).toISOString(),
       expires_at: new Date(nowMs + ttlMs).toISOString(),
+      // Store the canonical origin workspace so it authenticates future bind/complete/recover.
+      ...(canonicalOrigin ? { origin_cwd: canonicalOrigin } : {}),
     };
-    state.pending_role_intents = [...pendingRoleIntents, intent];
+    state.pending_role_intents = [...all.filter((candidate) => !shouldPruneExpired(candidate)), intent];
     context.assertOwnership();
     writeSubagentTrackingStateSync(cwd, state, context.publish);
     return { ok: true, intent };
@@ -775,23 +950,35 @@ export function bindPendingRoleIntentUnderLock(
   cwd: string,
   input: { sessionId: string; parentThreadId: string; correlationToken?: string; nowMs?: number },
   bind: (state: SubagentTrackingState, intent: { role: string; provenanceKind: typeof OMX_ADAPTED_PROVENANCE }) => SubagentTrackingState,
-): { role: string; provenanceKind: typeof OMX_ADAPTED_PROVENANCE } | null {
+): { role: string; provenanceKind: typeof OMX_ADAPTED_PROVENANCE; claimantToken: string | undefined; alreadyBound: boolean } | null {
   const nowMs = normalizeNowMs(input.nowMs);
   const sessionId = input.sessionId.trim();
   const parentThreadId = input.parentThreadId.trim();
-  const correlationToken = readOptionalTrimmedString(input.correlationToken);
+  const correlationToken = input.correlationToken;
+  if (!isCanonicalCorrelationToken(correlationToken)) return null;
+  // Fail-closed origin authentication: establish the caller's canonical origin workspace up
+  // front. A malformed/unavailable origin can never disclose role/claimant, run the bind
+  // callback, mutate pending->bound, or acquire the lock.
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return null;
   return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
     const state = readSubagentTrackingStateSync(cwd);
-    const pendingRoleIntents = state.pending_role_intents.filter((intent) => !isExpiredPendingRoleIntent(intent, nowMs));
-    const consumed = pendingRoleIntents.find((intent) => (
-      intent.session_id === sessionId
-      && intent.parent_thread_id === parentThreadId
-      && intent.correlation_token === correlationToken
-    )) ?? null;
+    const all = state.pending_role_intents;
+    const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
+    const matchedIntent = selectDominantRoleIntent(
+      all.filter((intent) => (
+        isOwn(intent)
+        && correlationToken !== undefined
+        && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken)
+        && (intent.binding_state === 'bound' || !isExpiredPendingRoleIntent(intent, nowMs))
+      )),
+      canonicalOrigin,
+    );
 
-    if (!consumed) {
-      if (pendingRoleIntents.length !== state.pending_role_intents.length) {
-        state.pending_role_intents = pendingRoleIntents;
+    if (!matchedIntent) {
+      const retained = all.filter((intent) => !shouldPruneExpired(intent));
+      if (retained.length !== all.length) {
+        state.pending_role_intents = retained;
         context.assertOwnership();
         writeSubagentTrackingStateSync(cwd, state, context.publish);
       }
@@ -799,22 +986,178 @@ export function bindPendingRoleIntentUnderLock(
     }
 
     const adaptedIntent = {
-      role: consumed.role,
+      role: matchedIntent.role,
       provenanceKind: OMX_ADAPTED_PROVENANCE,
     } as const;
+    if (matchedIntent.binding_state === 'bound') {
+      const next = all
+        .filter((intent) => (
+          intent.binding_state === 'bound'
+          || !(isOwn(intent) && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken))
+        ))
+        .map((intent) => (
+          intent === matchedIntent && !intent.origin_cwd
+            ? { ...intent, origin_cwd: canonicalOrigin }
+            : intent
+        ));
+      if (next.length !== all.length || !matchedIntent.origin_cwd) {
+        state.pending_role_intents = next;
+        context.assertOwnership();
+        writeSubagentTrackingStateSync(cwd, state, context.publish);
+      }
+      return {
+        ...adaptedIntent,
+        claimantToken: undefined,
+        alreadyBound: true,
+      };
+    }
+
+    const claimantToken = randomUUID();
     const boundState = bind(state, adaptedIntent);
-    boundState.pending_role_intents = pendingRoleIntents.filter((intent) => intent !== consumed);
+    boundState.pending_role_intents = all
+      .filter((intent) => !shouldPruneExpired(intent))
+      .filter((intent) => (
+        intent === matchedIntent
+        || !(isOwn(intent) && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken))
+      ))
+      .map((intent) => (
+        intent === matchedIntent
+          ? {
+            ...matchedIntent,
+            binding_state: 'bound',
+            binding_claimant_token: claimantToken,
+            bound_at: new Date(nowMs).toISOString(),
+            origin_cwd: matchedIntent.origin_cwd ?? canonicalOrigin,
+          }
+          : intent
+      ));
     context.assertOwnership();
     writeSubagentTrackingStateSync(cwd, boundState, context.publish);
-    return adaptedIntent;
+    return { ...adaptedIntent, claimantToken, alreadyBound: false };
   });
 }
 
 export function consumePendingRoleIntent(
   cwd: string,
   input: { sessionId: string; parentThreadId: string; correlationToken?: string; nowMs?: number },
-): { role: string; provenanceKind: 'omx_adapted' } | null {
-  return bindPendingRoleIntentUnderLock(cwd, input, (state) => state);
+): { role: string; provenanceKind: typeof OMX_ADAPTED_PROVENANCE } | null {
+  const nowMs = normalizeNowMs(input.nowMs);
+  const sessionId = input.sessionId.trim();
+  const parentThreadId = input.parentThreadId.trim();
+  const correlationToken = input.correlationToken;
+  if (!isCanonicalCorrelationToken(correlationToken)) return null;
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return null;
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const state = readSubagentTrackingStateSync(cwd);
+    const all = state.pending_role_intents;
+    const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
+    if (hasOwnBoundLogicalIntent(all, isOwn, sessionId, parentThreadId, correlationToken)) return null;
+
+    const consumed = selectDominantRoleIntent(
+      all.filter((intent) => (
+        isOwn(intent)
+        && intent.binding_state !== 'bound'
+        && !isExpiredPendingRoleIntent(intent, nowMs)
+        && correlationToken !== undefined
+        && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken)
+      )),
+      canonicalOrigin,
+    );
+
+    if (!consumed) {
+      const retained = all.filter((intent) => !shouldPruneExpired(intent));
+      if (retained.length !== all.length) {
+        state.pending_role_intents = retained;
+        context.assertOwnership();
+        writeSubagentTrackingStateSync(cwd, state, context.publish);
+      }
+      return null;
+    }
+
+    state.pending_role_intents = all
+      .filter((intent) => !shouldPruneExpired(intent))
+      .filter((intent) => (
+        intent.binding_state === 'bound'
+        || !(isOwn(intent) && sameLogicalRoleIntent(intent, sessionId, parentThreadId, correlationToken))
+      ));
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, state, context.publish);
+    return { role: consumed.role, provenanceKind: OMX_ADAPTED_PROVENANCE };
+  });
+}
+
+export function completeAdaptedRoleBinding(
+  cwd: string,
+  input: { sessionId: string; parentThreadId: string; correlationToken?: string; claimantToken?: string; nowMs?: number },
+): 'completed' | 'not_found' | 'claimant_mismatch' {
+  const nowMs = normalizeNowMs(input.nowMs);
+  const sessionId = input.sessionId.trim();
+  const parentThreadId = input.parentThreadId.trim();
+  const correlationToken = input.correlationToken;
+  const claimantToken = input.claimantToken;
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return 'not_found';
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const state = readSubagentTrackingStateSync(cwd);
+    const all = state.pending_role_intents;
+    const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
+    // Select the owned bound scope before authenticating it. Credentials are not a lookup key:
+    // otherwise an invalid dominant duplicate could be bypassed by a lower valid duplicate.
+    const boundIntent = selectDominantRoleIntent(
+      all.filter((intent) => (
+        isOwn(intent)
+        && intent.binding_state === 'bound'
+        && sameLogicalRoleIntent(intent, sessionId, parentThreadId)
+      )),
+      canonicalOrigin,
+    );
+    if (!boundIntent) {
+      const retained = all.filter((intent) => !shouldPruneExpired(intent));
+      if (retained.length !== all.length) {
+        state.pending_role_intents = retained;
+        context.assertOwnership();
+        writeSubagentTrackingStateSync(cwd, state, context.publish);
+      }
+      return 'not_found';
+    }
+    const hasClaimant = Object.hasOwn(boundIntent, 'binding_claimant_token');
+    if (
+      !isCanonicalCorrelationToken(boundIntent.correlation_token)
+      || !isCanonicalCorrelationToken(correlationToken)
+      || boundIntent.correlation_token !== correlationToken
+      || (hasClaimant && (
+        !isCanonicalClaimantToken(boundIntent.binding_claimant_token)
+        || !isCanonicalClaimantToken(claimantToken)
+        || boundIntent.binding_claimant_token !== claimantToken
+      ))
+    ) return 'claimant_mismatch';
+
+    state.pending_role_intents = all
+      .filter((intent) => !shouldPruneExpired(intent))
+      .filter((intent) => !(isOwn(intent) && sameLogicalRoleIntent(intent, sessionId, parentThreadId, boundIntent.correlation_token as string)));
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, state, context.publish);
+    return 'completed';
+  });
+}
+
+export function listBoundAdaptedRoleIntents(cwd: string, _nowMs?: number, ownedDominant = false): PendingRoleIntent[] {
+  const allBound = readSubagentTrackingStateSync(cwd).pending_role_intents.filter((intent) => intent.binding_state === 'bound');
+  if (!ownedDominant) return allBound;
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return [];
+  const { isOwn } = pendingRoleIntentPredicates(cwd, canonicalOrigin, Date.now());
+  const scopes = new Map<string, PendingRoleIntent[]>();
+  for (const intent of allBound) {
+    if (!isOwn(intent)) continue;
+    const key = `${intent.session_id}\u0000${intent.parent_thread_id}`;
+    scopes.set(key, [...(scopes.get(key) ?? []), intent]);
+  }
+  return [...scopes.values()].flatMap((candidates) => {
+    const dominant = selectDominantRoleIntent(candidates, canonicalOrigin);
+    return dominant ? [dominant] : [];
+  });
 }
 
 export function recordSubagentTurn(state: SubagentTrackingState, input: RecordSubagentTurnInput): SubagentTrackingState {

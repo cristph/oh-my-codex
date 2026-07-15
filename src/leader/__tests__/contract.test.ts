@@ -1,5 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   LEADER_CONDUCTOR_BLOCK,
   LEADER_CONDUCTOR_DELEGATION_NOTE,
@@ -20,6 +24,13 @@ import {
   isUnsupportedNativeSubagentEvidenceForScope,
   type RoleRoutingUnavailableMarker,
   resolveNativeSubagentSupportStatus,
+  NATIVE_SPAWN_TASK_NAME_PATTERN,
+  ROLE_INTENT_SPAWN_TASK_NAME_PREFIX,
+  ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
+  canonicalizeOriginCwd,
+  buildRoleIntentSpawnTaskName,
+  isAppCompatibleSpawnTaskName,
+  parseRoleIntentCorrelationToken,
 } from '../contract.js';
 
 describe('leader conductor contract', () => {
@@ -359,5 +370,74 @@ describe('leader conductor contract', () => {
       }, { sessionId: 'sess-1' }),
       true,
     );
+  });
+  it('builds and parses App-compatible native role-intent task names', () => {
+    const taskName = buildRoleIntentSpawnTaskName('abc123');
+    assert.equal(taskName, 'omx_role_intent_abc123');
+    assert.equal(taskName, `${ROLE_INTENT_SPAWN_TASK_NAME_PREFIX}abc123`);
+    assert.match(taskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
+
+    assert.equal(isAppCompatibleSpawnTaskName('omx-role-intent:9f8e'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_DEADBEEF'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead-beef'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead:beef'), false);
+    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_deadbeef'), true);
+    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc123'), true);
+    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc_def'), false);
+    assert.throws(() => buildRoleIntentSpawnTaskName('abc_def'), /Invalid role-intent correlation token/);
+
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118'), 'a3118');
+    assert.equal(parseRoleIntentCorrelationToken(['omx_role_intent_a3118']), undefined);
+    assert.equal(parseRoleIntentCorrelationToken({ toString: () => 'omx_role_intent_a3118' }), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(' omx_role_intent_a3118'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118 '), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx-role-intent:deadbeef'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_abc_def'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_DEADBEEF'), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(''), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(42), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(null), undefined);
+    assert.equal(parseRoleIntentCorrelationToken(undefined), undefined);
+
+    const generatedTaskName = buildRoleIntentSpawnTaskName(randomUUID().replace(/-/g, ''));
+    assert.match(generatedTaskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
+    assert.doesNotMatch(generatedTaskName, /[-:]/);
+  });
+
+  it('canonicalizes symlinked and nonexistent-leaf origins while rejecting ELOOP identities', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-contract-canonical-origin-'));
+    const realWorkspace = join(root, 'real-workspace');
+    const aliasWorkspace = join(root, 'alias-workspace');
+    const loopA = join(root, 'loop-a');
+    const loopB = join(root, 'loop-b');
+    try {
+      await mkdir(realWorkspace);
+      await symlink(realWorkspace, aliasWorkspace, 'dir');
+      await symlink('loop-a', loopA);
+      await symlink('loop-b', loopB);
+
+      assert.equal(
+        canonicalizeOriginCwd(join(aliasWorkspace, 'missing', 'leaf')),
+        canonicalizeOriginCwd(join(realWorkspace, 'missing', 'leaf')),
+      );
+      assert.equal(canonicalizeOriginCwd(loopA), null);
+      assert.equal(canonicalizeOriginCwd(loopB), null);
+      assert.equal(canonicalizeOriginCwd(undefined), null);
+      assert.equal(canonicalizeOriginCwd(''), null);
+
+      assert.equal(
+        resolveNativeSubagentSupportStatus({
+          cwd: aliasWorkspace,
+          persistedSupportBlocker: {
+            status: 'unsupported',
+            reason: 'multi_agent_v1_unavailable',
+            cwd: realWorkspace,
+          },
+        }).status,
+        'unsupported',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
