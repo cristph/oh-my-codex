@@ -3307,9 +3307,7 @@ esac
       assert.equal(await readFile(taskPath, 'utf-8'), taskRaw);
       assert.equal(await readFile(firstTaskPath, 'utf-8'), firstTaskRaw);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'task-reconcile-fail', 'workers', 'worker-2')), true);
-      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-      ]);
+      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), []);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

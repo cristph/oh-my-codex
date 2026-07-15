@@ -1343,44 +1343,12 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: pane teardown must be resolved before canonical membership changes.
-    // A successful kill command is insufficient: teardownWorkerPanes requires a
-    // fresh exact global proof that the pane is gone after the effect.
-    const targetPaneIds = targetWorkers
-      .map((worker) => worker.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
-      leaderPaneId: config.leader_pane_id,
-      hudPaneId: config.hud_pane_id,
-    });
-    const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
-    const unresolvedWorkers = targetWorkers.filter((worker) => (
-      typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
-    ));
-    if (unresolvedWorkers.length > 0) {
-      await restorePriorWorkerStatuses(targetWorkers);
-      if (paneTeardown.proofUnavailable.length > 0) {
-        const detail = paneTeardown.proofUnavailable
-          .map((proof) => `${proof.paneId}:${proof.reason}`)
-          .join(',');
-        return { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
-      }
-      const debt = [
-        paneTeardown.kill.failedPaneIds.length > 0
-          ? `pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`
-          : null,
-        paneTeardown.proofUnavailable.length > 0
-          ? `pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`
-          : null,
-        ...unresolvedWorkers
-          .filter((worker) => !paneTeardown.kill.failedPaneIds.includes(worker.pane_id ?? ''))
-          .filter((worker) => !paneTeardown.proofUnavailable.some((proof) => proof.paneId === worker.pane_id))
-          .map((worker) => `pane_teardown_unresolved:${worker.pane_id}`),
-      ].filter((entry): entry is string => entry !== null);
-      return { ok: false, error: `scale_down_cleanup_debt:${debt.join(';')}` };
-    }
+    // Phase 3: acquire the membership barrier and task claim locks before any
+    // pane effect. The barrier and locks remain held through the canonical
+    // snapshot, exact pane teardown, and forward-recoverable commit.
     const removableWorkers = targetWorkers;
     const removableWorkerNames = new Set(removableWorkers.map((worker) => worker.name));
+    let teardownFailure: ScaleError | null = null;
     try {
       await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
         await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
@@ -1388,77 +1356,110 @@ export async function scaleDown(
           .filter((task) => task.status !== 'completed' && task.status !== 'failed')
           .map((task) => task.id);
         await withTaskClaimLocks(sanitized, candidateTaskIds, leaderCwd, async () => {
-          // The membership barrier remains held through this snapshot and commit.
-        const lockedTasks = await listTasks(sanitized, leaderCwd);
-        const configPath = join(teamStateRoot, 'team', sanitized, 'config.json');
-        const configSnapshot = await readFile(configPath);
-        const manifestPath = join(teamStateRoot, 'team', sanitized, 'manifest.v2.json');
-        const manifestSnapshot = existsSync(manifestPath) ? await readFile(manifestPath) : null;
-        const reconciledTasks = lockedTasks.filter((task) => task.status !== 'completed' && task.status !== 'failed'
-          && (removableWorkerNames.has(task.owner ?? '') || removableWorkerNames.has(task.claim?.owner ?? '')));
-        const taskSnapshots = new Map<string, Buffer>();
-        for (const task of reconciledTasks) {
-          taskSnapshots.set(task.id, await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`)));
-        }
-        const postSnapshotMarker = env.OMX_TEAM_SCALE_DOWN_POST_SNAPSHOT_MARKER;
-        if (postSnapshotMarker) await writeFile(postSnapshotMarker, 'snapshot-held\n');
-        const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
-        if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
-        const currentConfig = JSON.parse(configSnapshot.toString('utf8')) as TeamConfig;
-        const nextConfig: TeamConfig = {
-          ...currentConfig,
-          workers: currentConfig.workers.filter((worker) => !removableWorkerNames.has(worker.name)),
-        };
-        nextConfig.worker_count = nextConfig.workers.length;
-        const nextManifest = manifestSnapshot
-          ? JSON.stringify({
-            ...(JSON.parse(manifestSnapshot.toString('utf8')) as Record<string, unknown>),
-            workers: nextConfig.workers,
-            worker_count: nextConfig.worker_count,
-          }, null, 2)
-          : null;
-        await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
-          tasks: reconciledTasks.map((task) => ({
-            taskId: task.id,
-            oldBytes: taskSnapshots.get(task.id)?.toString('utf8') ?? null,
-            newBytes: JSON.stringify({
-              ...task,
-              owner: undefined,
-              claim: undefined,
-              status: task.status === 'in_progress' ? 'pending' : task.status,
-              version: Math.max(1, task.version ?? 1) + 1,
-            } satisfies TeamTask, null, 2),
-          })),
-          config: {
-            oldBytes: configSnapshot.toString('utf8'),
-            newBytes: JSON.stringify(nextConfig, null, 2),
-          },
-          manifest: {
-            oldBytes: manifestSnapshot?.toString('utf8') ?? null,
-            newBytes: nextManifest,
-          },
-          interruptAfterFirstTaskWrite: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write',
-          failRollbackPersistence: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'rollback-persistence-failure',
-          recoverToNewOnFailure: true,
-        });
-        const committed = await readTeamConfig(sanitized, leaderCwd);
-        if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) {
-          throw new Error('canonical_scale_down_config_verification_failed');
-        }
-        config.workers = committed.workers;
-        config.worker_count = committed.worker_count;
-        for (const task of reconciledTasks) {
-          const reconciled = await readTask(sanitized, task.id, leaderCwd);
-          if (reconciled && (removableWorkerNames.has(reconciled.owner ?? '') || removableWorkerNames.has(reconciled.claim?.owner ?? ''))) {
-            throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
+          const lockedTasks = await listTasks(sanitized, leaderCwd);
+          const configPath = join(teamStateRoot, 'team', sanitized, 'config.json');
+          const configSnapshot = await readFile(configPath);
+          const manifestPath = join(teamStateRoot, 'team', sanitized, 'manifest.v2.json');
+          const manifestSnapshot = existsSync(manifestPath) ? await readFile(manifestPath) : null;
+          const reconciledTasks = lockedTasks.filter((task) => task.status !== 'completed' && task.status !== 'failed'
+            && (removableWorkerNames.has(task.owner ?? '') || removableWorkerNames.has(task.claim?.owner ?? '')));
+          const taskSnapshots = new Map<string, Buffer>();
+          for (const task of reconciledTasks) {
+            taskSnapshots.set(task.id, await readFile(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${task.id}.json`)));
           }
-        }
-      });
+          const postSnapshotMarker = env.OMX_TEAM_SCALE_DOWN_POST_SNAPSHOT_MARKER;
+          if (postSnapshotMarker) await writeFile(postSnapshotMarker, 'snapshot-held\n');
+          const boundaryHoldMs = Number.parseInt(env.OMX_TEAM_SCALE_DOWN_BOUNDARY_HOLD_MS ?? '', 10);
+          if (Number.isFinite(boundaryHoldMs) && boundaryHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, boundaryHoldMs));
+
+          const targetPaneIds = removableWorkers
+            .map((worker) => worker.pane_id)
+            .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
+          const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
+            leaderPaneId: config.leader_pane_id,
+            hudPaneId: config.hud_pane_id,
+          });
+          const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
+          const unresolvedWorkers = removableWorkers.filter((worker) => (
+            typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
+          ));
+          if (unresolvedWorkers.length > 0) {
+            await restorePriorWorkerStatuses(removableWorkers);
+            if (paneTeardown.proofUnavailable.length > 0) {
+              const detail = paneTeardown.proofUnavailable
+                .map((proof) => `${proof.paneId}:${proof.reason}`)
+                .join(',');
+              teardownFailure = { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
+              return;
+            }
+            const debt = [
+              paneTeardown.kill.failedPaneIds.length > 0
+                ? `pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`
+                : null,
+              ...unresolvedWorkers
+                .filter((worker) => !paneTeardown.kill.failedPaneIds.includes(worker.pane_id ?? ''))
+                .map((worker) => `pane_teardown_unresolved:${worker.pane_id}`),
+            ].filter((entry): entry is string => entry !== null);
+            teardownFailure = { ok: false, error: `scale_down_cleanup_debt:${debt.join(';')}` };
+            return;
+          }
+
+          const currentConfig = JSON.parse(configSnapshot.toString('utf8')) as TeamConfig;
+          const nextConfig: TeamConfig = {
+            ...currentConfig,
+            workers: currentConfig.workers.filter((worker) => !removableWorkerNames.has(worker.name)),
+          };
+          nextConfig.worker_count = nextConfig.workers.length;
+          const nextManifest = manifestSnapshot
+            ? JSON.stringify({
+              ...(JSON.parse(manifestSnapshot.toString('utf8')) as Record<string, unknown>),
+              workers: nextConfig.workers,
+              worker_count: nextConfig.worker_count,
+            }, null, 2)
+            : null;
+          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+            tasks: reconciledTasks.map((task) => ({
+              taskId: task.id,
+              oldBytes: taskSnapshots.get(task.id)?.toString('utf8') ?? null,
+              newBytes: JSON.stringify({
+                ...task,
+                owner: undefined,
+                claim: undefined,
+                status: task.status === 'in_progress' ? 'pending' : task.status,
+                version: Math.max(1, task.version ?? 1) + 1,
+              } satisfies TeamTask, null, 2),
+            })),
+            config: {
+              oldBytes: configSnapshot.toString('utf8'),
+              newBytes: JSON.stringify(nextConfig, null, 2),
+            },
+            manifest: {
+              oldBytes: manifestSnapshot?.toString('utf8') ?? null,
+              newBytes: nextManifest,
+            },
+            interruptAfterFirstTaskWrite: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'after-first-task-write',
+            failRollbackPersistence: env.OMX_TEAM_SCALE_DOWN_INJECT_FAILURE === 'rollback-persistence-failure',
+            recoverToNewOnFailure: true,
+          });
+          const committed = await readTeamConfig(sanitized, leaderCwd);
+          if (!committed || committed.workers.some((worker) => removableWorkerNames.has(worker.name))) {
+            throw new Error('canonical_scale_down_config_verification_failed');
+          }
+          config.workers = committed.workers;
+          config.worker_count = committed.worker_count;
+          for (const task of reconciledTasks) {
+            const reconciled = await readTask(sanitized, task.id, leaderCwd);
+            if (reconciled && (removableWorkerNames.has(reconciled.owner ?? '') || removableWorkerNames.has(reconciled.claim?.owner ?? ''))) {
+              throw new Error(`canonical_scale_down_task_verification_failed:${task.id}`);
+            }
+          }
+        });
       });
     } catch (error) {
       await restorePriorWorkerStatuses(removableWorkers);
       return { ok: false, error: `scale_down_task_reconciliation_failed:${String(error)}` };
     }
+    if (teardownFailure) return teardownFailure;
     targetWorkers = removableWorkers;
 
     // Phase 4: cleanup is deliberately after the canonical commit. Failures are
