@@ -376,6 +376,7 @@ export interface TaskApprovalRecord {
 
 let renameForAtomicWrite: typeof rename = rename;
 let openForAtomicWrite: typeof open = open;
+let platformForAtomicWrite: NodeJS.Platform = process.platform;
 
 export function setWriteAtomicOpenForTests(fn: typeof open): void {
   openForAtomicWrite = fn;
@@ -385,6 +386,13 @@ export function resetWriteAtomicOpenForTests(): void {
   openForAtomicWrite = open;
 }
 
+export function setWriteAtomicPlatformForTests(platform: NodeJS.Platform): void {
+  platformForAtomicWrite = platform;
+}
+
+export function resetWriteAtomicPlatformForTests(): void {
+  platformForAtomicWrite = process.platform;
+}
 
 export function setWriteAtomicRenameForTests(fn: typeof rename): void {
   renameForAtomicWrite = fn;
@@ -765,7 +773,12 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
 // Atomic write: write to {path}.tmp.{pid}, fsync it, rename, then fsync parent.
 function isUnsupportedParentDirectorySyncError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
-  return code === 'EPERM' || code === 'EINVAL' || code === 'ENOTSUP' || code === 'EISDIR';
+  return (
+    code === 'EINVAL'
+    || code === 'ENOTSUP'
+    || code === 'EISDIR'
+    || (code === 'EPERM' && platformForAtomicWrite === 'win32')
+  );
 }
 
 async function syncParentDirectory(path: string): Promise<void> {
@@ -1831,16 +1844,43 @@ async function readDispatchRequests(teamName: string, cwd: string): Promise<Team
   }
 }
 
-/** Read only the target team's canonical legacy request file for rollback scoping. */
+/** Read only strictly recognized target-team legacy request records for rollback scoping. */
+function isStrictLegacyDispatchRequestForRollback(
+  value: unknown,
+  teamName: string,
+): value is TeamDispatchRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  const requiredFields = [
+    'request_id', 'kind', 'team_name', 'to_worker', 'trigger_message',
+    'transport_preference', 'fallback_allowed', 'status', 'attempt_count',
+    'created_at', 'updated_at',
+  ];
+  if (requiredFields.some((field) => !Object.prototype.hasOwnProperty.call(request, field))) return false;
+  return typeof request.request_id === 'string'
+    && request.request_id.length > 0
+    && ['inbox', 'mailbox', 'nudge'].includes(String(request.kind))
+    && request.team_name === teamName
+    && typeof request.to_worker === 'string'
+    && request.to_worker.length > 0
+    && typeof request.trigger_message === 'string'
+    && ['hook_preferred_with_fallback', 'transport_direct', 'prompt_stdin'].includes(String(request.transport_preference))
+    && typeof request.fallback_allowed === 'boolean'
+    && ['pending', 'notified', 'delivered', 'failed'].includes(String(request.status))
+    && typeof request.attempt_count === 'number'
+    && Number.isFinite(request.attempt_count)
+    && typeof request.created_at === 'string'
+    && typeof request.updated_at === 'string';
+}
+
 async function readLegacyDispatchRequestsForRollback(teamName: string, cwd: string): Promise<TeamDispatchRequest[]> {
   const path = dispatchRequestsPath(teamName, cwd);
   try {
     const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
-    if (!Array.isArray(raw)) return [];
-    const nowIso = new Date().toISOString();
-    return raw
-      .map((entry) => normalizeDispatchRequestImpl(teamName, (entry ?? {}) as Partial<TeamDispatchRequest>, nowIso))
-      .filter((entry): entry is TeamDispatchRequest => entry !== null);
+    if (!Array.isArray(raw) || raw.some((entry) => !isStrictLegacyDispatchRequestForRollback(entry, teamName))) {
+      throw new Error('legacy dispatch rollback evidence is malformed or unrecognized');
+    }
+    return raw as TeamDispatchRequest[];
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
@@ -1953,11 +1993,9 @@ export async function removeDispatchRequestsForWorkers(
       if (verificationSnapshot.event !== 'SnapshotCaptured') {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
-      const remainingScoped = bridge.readDispatchRecordsStrict().some((record) => {
-        const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
-        return metadataTeam === teamName && names.has(record.target);
-      });
-      if (remainingScoped) {
+      const remainingRemovedRecord = bridge.readDispatchRecordsStrict()
+        .some((record) => removedRequestIds.includes(record.request_id));
+      if (remainingRemovedRecord) {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
     }

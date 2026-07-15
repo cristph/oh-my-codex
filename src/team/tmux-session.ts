@@ -219,6 +219,12 @@ function killExactPaneSync(paneId: string, expectedPid?: number): void {
   }
   const result = runTmux(['kill-pane', '-t', proof.paneId]);
   if (!result.ok) throw new Error(`failed to kill tmux pane ${proof.paneId}: ${result.stderr}`);
+  const afterKill = readExactPaneProofSync(proof.paneId);
+  if (afterKill.status === 'unavailable') throw new ExactPaneProofUnavailableError(afterKill);
+  if (afterKill.status !== 'gone') {
+    if (afterKill.pid !== proof.pid) throw new Error(`tmux pane identity changed: ${paneId}`);
+    throw new Error(`tmux pane remains live after kill: ${paneId}`);
+  }
 }
 
 function appendNoUnderlineStyleFlags(style: string): string {
@@ -750,11 +756,15 @@ function buildBestEffortShellCommand(command: string): string {
 function buildAuthoritativeHudResizeShellCommand(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  expectedPanePid?: number,
 ): string {
   const target = buildHudPaneTarget(hudPaneId);
   const snapshot = buildNestedTmuxShellCommand("list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}'");
   const resize = buildNestedTmuxShellCommand(buildHudResizeCommand(target, heightLines));
-  const proof = `awk -F '\\t' -v pane='${target}' 'NF != 3 || $1 !~ /^%[0-9]+$/ || ($2 != "0" && $2 != "1") || $3 !~ /^[1-9][0-9]*$/ || length($3) > 16 || (length($3) == 16 && ("x" $3) > "x9007199254740991") || seen[$1]++ { bad = 1 } $1 == pane && $2 == "0" { live = 1 } END { exit bad || !live }'`;
+  const expectedPid = typeof expectedPanePid === 'number' && Number.isSafeInteger(expectedPanePid) && expectedPanePid > 0
+    ? ` && $3 == "${expectedPanePid}"`
+    : '';
+  const proof = `awk -F '\\t' -v pane='${target}' 'NF != 3 || $1 !~ /^%[0-9]+$/ || ($2 != "0" && $2 != "1") || $3 !~ /^[1-9][0-9]*$/ || length($3) > 16 || (length($3) == 16 && ("x" $3) > "x9007199254740991") || seen[$1]++ { bad = 1 } $1 == pane && $2 == "0"${expectedPid} { live = 1 } END { exit bad || !live }'`;
   return `if snapshot=$(${snapshot}); then printf '%s\\n' "$snapshot" | ${proof} && ${resize}; fi`;
 }
 
@@ -782,8 +792,9 @@ export function buildRegisterResizeHookArgs(
   hookName: string,
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  expectedPanePid?: number,
 ): string[] {
-  const resizeCommand = buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines));
+  const resizeCommand = buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines, expectedPanePid));
   const hookCommand = shellQuoteSingle(
     `${resizeCommand}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeCommand}`,
   );
@@ -814,10 +825,11 @@ export function buildRegisterClientAttachedReconcileArgs(
   hookName: string,
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  expectedPanePid?: number,
 ): string[] {
   const hookSlot = buildClientAttachedHookSlot(hookName);
   const oneShotCommand = shellQuoteSingle(
-    `${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
+    `${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines, expectedPanePid))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
   );
   return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}`];
 }
@@ -835,16 +847,18 @@ export function buildScheduleDelayedHudResizeArgs(
   hudPaneId: string,
   delaySeconds: number = HUD_RESIZE_RECONCILE_DELAY_SECONDS,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  expectedPanePid?: number,
 ): string[] {
   const delay = Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : HUD_RESIZE_RECONCILE_DELAY_SECONDS;
-  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))}`];
+  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines, expectedPanePid))}`];
 }
 
 export function buildReconcileHudResizeArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  expectedPanePid?: number,
 ): string[] {
-  return ['run-shell', buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines))];
+  return ['run-shell', buildBestEffortShellCommand(buildAuthoritativeHudResizeShellCommand(hudPaneId, heightLines, expectedPanePid))];
 }
 
 function redrawLeaderPaneAfterTeamLayout(leaderPaneId: string): void {
@@ -2033,8 +2047,17 @@ export function restoreStandaloneHudPane(
       )));
       if (!reconcile.ok) throw new Error(`failed to reconcile standalone HUD resize: ${reconcile.stderr}`);
     } else {
-      runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId));
-      runTmux(buildReconcileHudResizeArgs(existingHudPaneId));
+      runTmux(buildScheduleDelayedHudResizeArgs(
+        existingHudPaneId,
+        HUD_RESIZE_RECONCILE_DELAY_SECONDS,
+        HUD_TMUX_TEAM_HEIGHT_LINES,
+        ownedHudPanePids.get(existingHudPaneId),
+      ));
+      runTmux(buildReconcileHudResizeArgs(
+        existingHudPaneId,
+        HUD_TMUX_TEAM_HEIGHT_LINES,
+        ownedHudPanePids.get(existingHudPaneId),
+      ));
     }
     runTmux(['select-pane', '-t', requireLiveExactPaneSync(normalizedLeaderPaneId, leaderPanePid)]);
     return existingHudPaneId;
@@ -2072,12 +2095,23 @@ export function restoreStandaloneHudPane(
   const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
   if (!paneId.startsWith('%')) return null;
 
+  const hudPanePid = (() => {
+    const proof = readExactPaneProofSync(paneId);
+    if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+    if (proof.status === 'gone') throw new Error(`tmux pane is not proven live: ${paneId}`);
+    return proof.pid;
+  })();
   if (isNativeWindows()) {
-    const reconcile = runTmux(buildHudResizeArgs(requireLiveExactPaneSync(paneId)));
+    const reconcile = runTmux(buildHudResizeArgs(requireLiveExactPaneSync(paneId, hudPanePid)));
     if (!reconcile.ok) throw new Error(`failed to reconcile standalone HUD resize: ${reconcile.stderr}`);
   } else {
-    runTmux(buildScheduleDelayedHudResizeArgs(paneId));
-    runTmux(buildReconcileHudResizeArgs(paneId));
+    runTmux(buildScheduleDelayedHudResizeArgs(
+      paneId,
+      HUD_RESIZE_RECONCILE_DELAY_SECONDS,
+      HUD_TMUX_TEAM_HEIGHT_LINES,
+      hudPanePid,
+    ));
+    runTmux(buildReconcileHudResizeArgs(paneId, HUD_TMUX_TEAM_HEIGHT_LINES, hudPanePid));
   }
   runTmux(['select-pane', '-t', requireLiveExactPaneSync(normalizedLeaderPaneId, leaderPanePid)]);
   return paneId;
@@ -3218,9 +3252,20 @@ export async function teardownWorkerPanes(
 
     summary.kill.attempted += 1;
     const result = await runTmuxAsync(['kill-pane', '-t', proof.paneId]);
-    if (result.ok) {
+    if (!result.ok) {
+      summary.kill.failed += 1;
+      summary.kill.failedPaneIds.push(proof.paneId);
+      await sleep(perPaneGrace);
+      continue;
+    }
+
+    const afterKill = await readExactPaneProof(proof.paneId);
+    if (afterKill.status === 'gone') {
       summary.kill.succeeded += 1;
       summary.killedPaneIds.push(proof.paneId);
+    } else if (afterKill.status === 'unavailable') {
+      summary.proofUnavailable.push(afterKill);
+      break;
     } else {
       summary.kill.failed += 1;
       summary.kill.failedPaneIds.push(proof.paneId);

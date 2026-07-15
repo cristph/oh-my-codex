@@ -3378,7 +3378,23 @@ export async function startTeam(
       createdLeaderPaneId = partialSession.leaderPaneId;
       applyCreatedInteractiveSessionToConfig(config, partialSession, workerPaneIds);
       await saveTeamConfig(config, leaderCwd);
+      const cleanupDebt = [
+        ...error.cleanupErrors,
+        ...error.proofUnavailable.map((proof) => `pane_proof_unavailable:${proof.paneId}:${proof.reason}`),
+      ];
+      if (cleanupDebt.length > 0) {
+        await appendTeamEvent(sanitized, {
+          type: 'team_leader_nudge',
+          worker: 'leader-fixed',
+          reason: `startup_create_session_cleanup_debt:${cleanupDebt.join(';')}; retry preserved session resources`,
+        }, leaderCwd).catch(() => {});
+      }
+      // CreateTeamSessionPartialError means create-time teardown did not reach a
+      // proven-gone state. Preserve its config, hook registration, state and
+      // worktrees exactly as saved above for a later retry; generic rollback
+      // would otherwise destroy the retry evidence.
       assertPaneTeardownProofsAvailable('startup_rollback', error.proofUnavailable);
+      throw error;
     }
 
 

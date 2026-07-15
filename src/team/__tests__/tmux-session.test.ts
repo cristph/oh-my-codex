@@ -4397,7 +4397,8 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%1\\t0\\t2000000001\\n%%2\\t0\\t2000000002\\n%%3\\t0\\t2000000003\\n%%4\\t0\\t2000000004\\n%%7\\t0\\t2000000007\\n%%8\\t0\\t2000000008\\n"
+        printf "%%1\t0\t2000000001\n%%3\t0\t2000000003\n%%4\t0\t2000000004\n%%7\t0\t2000000007\n%%8\t0\t2000000008\n"
+        if [ ! -f "${logPath}.killed-%2" ]; then printf "%%2\t0\t2000000002\n"; fi
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -4422,7 +4423,11 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
-  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane)
+  kill-pane)
+    : > "${logPath}.killed-$3"
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys)
     exit 0
     ;;
   *)
@@ -4724,10 +4729,11 @@ case "$1" in
         if [ -f "${proofStatePath}" ]; then proof_count=$(cat "${proofStatePath}"); fi
         proof_count=$((proof_count + 1))
         printf '%s' "$proof_count" > "${proofStatePath}"
-        if [ "$proof_count" -eq 8 ]; then
+        if [ "$proof_count" -eq 9 ]; then
           printf 'not-a-pane-snapshot\n'
         else
-          printf "%%11\t0\t2000000011\n%%44\t0\t2000000044\n%%45\t0\t2000000045\n"
+          printf "%%11\t0\t2000000011\n%%44\t0\t2000000044\n"
+          if [ ! -f "${logPath}.killed-%45" ]; then printf "%%45\t0\t2000000045\n"; fi
         fi
         ;;
       *)
@@ -4738,7 +4744,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|run-shell|select-pane|resize-pane)
+  kill-pane)
+    : > "${logPath}.killed-$3"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane)
     exit 0
     ;;
   *)
@@ -4796,6 +4806,89 @@ esac
           );
           const commands = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean);
           assert.doesNotMatch(commands.join('\n'), /split-window|resize-pane|select-pane/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not resize a PID-reused existing standalone HUD on POSIX', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-existing-hud-posix-pid-reuse-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-standalone-existing-hud-posix-pid-reuse-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      count=0
+      if [ -f "${logPath}.proof-count" ]; then count=$(cat "${logPath}.proof-count"); fi
+      count=$((count + 1))
+      printf '%s' "$count" > "${logPath}.proof-count"
+      if [ "$count" -ge 3 ]; then
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000099\\n'
+      else
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n'
+      fi
+    else
+      printf '%%11\\tzsh\\tzsh\\n%%44\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%%11 node /omx.js hud --watch\\n'
+    fi
+    ;;
+  run-shell) /bin/sh -c "\${3:-$2}" ;;
+  resize-pane|select-pane) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(restoreStandaloneHudPane('%11', cwd), '%44');
+          const commands = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(commands, /^resize-pane/m);
+          assert.match(commands, /\$3 == "2000000044"/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not resize a PID-reused newly created standalone HUD on POSIX', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-new-hud-posix-pid-reuse-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-standalone-new-hud-posix-pid-reuse-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      count=0
+      if [ -f "${logPath}.proof-count" ]; then count=$(cat "${logPath}.proof-count"); fi
+      count=$((count + 1))
+      printf '%s' "$count" > "${logPath}.proof-count"
+      if [ "$count" -ge 4 ]; then
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000099\\n'
+      else
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n'
+      fi
+    else
+      printf '%%11\\tzsh\\tzsh\\n'
+    fi
+    ;;
+  split-window) printf '%%44\\n' ;;
+  run-shell) /bin/sh -c "\${3:-$2}" ;;
+  resize-pane|select-pane) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(restoreStandaloneHudPane('%11', cwd), '%44');
+          const commands = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(commands, /^resize-pane/m);
+          assert.match(commands, /\$3 == "2000000044"/);
         },
       );
     } finally {
@@ -5454,7 +5547,8 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%1\\t0\\t2000000001\\n%%2\\t0\\t2000000002\\n"
+        printf "%%1\t0\t2000000001\n"
+        if [ ! -f "${logPath}.killed-%2" ]; then printf "%%2\t0\t2000000002\n"; fi
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -5476,7 +5570,11 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
-  kill-pane|select-layout|set-window-option|select-pane|resize-pane|set-hook|run-shell)
+  kill-pane)
+    : > "${logPath}.killed-$3"
+    exit 0
+    ;;
+  select-layout|set-window-option|select-pane|resize-pane|set-hook|run-shell)
     exit 0
     ;;
   *)
@@ -6848,13 +6946,17 @@ set -eu
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
   list-panes)
-    printf '%%3\t0\t%s\n' "$$"
+    if [ ! -f "${logPath}.dead" ]; then
+      printf '%%3\t0\t%s\n' "$$"
+    fi
+    ;;
+  kill-pane)
+    : > "${logPath}.dead"
     ;;
   *)
     exit 0
     ;;
-esac
-`,
+esac`,
       async ({ logPath }) => {
         const summary = await teardownWorkerPanes(['%1', '%2', '%3'], {
           leaderPaneId: '%1',
@@ -6870,6 +6972,41 @@ esac
         assert.match(log, /kill-pane -t %3/);
         assert.doesNotMatch(log, /kill-pane -t %1/);
         assert.doesNotMatch(log, /kill-pane -t %2/);
+      },
+    );
+  });
+
+  it('treats an exit-zero kill as unresolved when the pane ID is freshly reused', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-teardown-reused-pane-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ -f "${logPath}.killed" ]; then
+      printf '%%77\t0\t7702\n'
+    else
+      printf '%%77\t0\t7701\n'
+    fi
+    ;;
+  kill-pane)
+    : > "${logPath}.killed"
+    ;;
+esac`,
+      async ({ logPath }) => {
+        const summary = await teardownWorkerPanes(['%77'], { graceMs: 1 });
+        assert.equal(summary.kill.attempted, 1);
+        assert.equal(summary.kill.succeeded, 0);
+        assert.equal(summary.kill.failed, 1);
+        assert.deepEqual(summary.kill.failedPaneIds, ['%77']);
+        assert.deepEqual(summary.killedPaneIds, []);
+        const commands = (await readFile(logPath, 'utf-8')).trim().split('\n');
+        assert.deepEqual(commands, [
+          'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+          'kill-pane -t %77',
+          'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        ]);
       },
     );
   });

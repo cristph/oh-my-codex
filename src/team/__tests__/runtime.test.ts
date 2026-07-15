@@ -491,7 +491,6 @@ async function withMockTmuxFixture<T>(
 
   try {
     const tmuxFixture = options.tmuxScript(tmuxLogPath);
-    // Dedicated strict fixtures own their global exact-pane response; never prefix them.
     const fixtureDefinesGlobalExactPaneSnapshot = tmuxFixture.includes('-a -F #{pane_id}');
     const compatibleTmuxFixture = fixtureDefinesGlobalExactPaneSnapshot
       ? tmuxFixture
@@ -510,7 +509,6 @@ if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ] && [ "\${3:-}" = "-F" ] 
 fi
 `,
       );
-
     await writeFile(tmuxStubPath, compatibleTmuxFixture);
     await chmod(tmuxStubPath, 0o755);
 
@@ -2431,7 +2429,9 @@ case "\${1:-}" in
     case "$*" in
       *"-a -F #{pane_id}"*)
         printf '%s\n' 'dedicated-strict-native-win32-global-proof' >> "${tmuxLogPath}"
-        printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n%%3\t0\t2000000003\n"
+        printf "%%1\t0\t2000000001\n"
+        if [ ! -f "${tmuxLogPath}.killed-%2" ]; then printf "%%2\t0\t2000000002\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%3" ]; then printf "%%3\t0\t2000000003\n"; fi
         ;;
 
       *"pane_current_command"*)
@@ -2454,7 +2454,11 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
-  resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell)
     exit 0
     ;;
   *)
@@ -6959,8 +6963,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf 'proof\\n' >> "${orderPath}"
-        printf "%%11\\t0\\t2000000011\\n%%13\\t0\\t${paneOnePid}\\n%%14\\t0\\t${paneTwoPid}\\n"
+        printf 'proof\n' >> "${orderPath}"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${orderPath}.killed-%13" ]; then printf "%%13\t0\t${paneOnePid}\n"; fi
+        if [ ! -f "${orderPath}.killed-%14" ]; then printf "%%14\t0\t${paneTwoPid}\n"; fi
         exit 0
         ;;
       *"-t omx-team-team-shutdown-prekill-order"*)
@@ -6972,7 +6978,11 @@ case "$1" in
         ;;
     esac
     ;;
-  kill-pane|kill-session)
+  kill-pane)
+    : > "${orderPath}.killed-$3"
+    exit 0
+    ;;
+  kill-session)
     exit 0
     ;;
   *)
@@ -7203,7 +7213,23 @@ case "$1" in
         exit 0
         ;;
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n%%15\t0\t2000000015\n%%16\t0\t2000000016\n%%17\t0\t2000000017\n%%18\t0\t2000000018\n%%19\t0\t2000000019\n%%20\t0\t2000000020\n%%21\t0\t2000000021\n%%22\t0\t2000000022\n"
+        printf "%%11\t0\t2000000011\n"
+        for pane in %12 %13 %14 %16 %17 %18 %19; do
+          if [ ! -f "${tmuxLogPath}.killed-$pane" ]; then
+            case "$pane" in
+              %12) pid=2000000012 ;;
+              %13) pid=2000000013 ;;
+              %14) pid=2000000014 ;;
+              %16) pid=2000000016 ;;
+              %17) pid=2000000017 ;;
+              %18) pid=2000000018 ;;
+              %19) pid=2000000019 ;;
+            esac
+            printf '%s\t0\t%s\n' "$pane" "$pid"
+          fi
+        done
+        printf "%%15\t0\t2000000015\n%%20\t0\t2000000020\n%%21\t0\t2000000021\n%%22\t0\t2000000022\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
@@ -7245,6 +7271,7 @@ case "$1" in
       echo "missing pane" >&2
       exit 1
     fi
+    : > "${tmuxLogPath}.killed-$3"
     exit 0
     ;;
   kill-session|select-pane|run-shell)
@@ -7484,7 +7511,11 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%10\t0\t2000000010\n%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n%%15\t0\t2000000015\n"
+        printf "%%10\t0\t2000000010\n%%11\t0\t2000000011\n%%15\t0\t2000000015\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%14" ]; then printf "%%14\t0\t2000000014\n"; fi
+        if [ -f "$restored_marker" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7521,7 +7552,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -7585,7 +7620,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%10\t0\t2000000010\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%15\t0\t2000000015\n"
+        printf "%%10\t0\t2000000010\n%%15\t0\t2000000015\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7601,7 +7639,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -7618,7 +7657,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -7673,7 +7716,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        printf "%%11\t0\t2000000011\n%%14\t0\t2000000014\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7689,7 +7735,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -7709,7 +7756,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -7763,7 +7814,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        printf "%%11\t0\t2000000011\n%%14\t0\t2000000014\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7779,7 +7833,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -7799,7 +7854,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -7851,7 +7910,9 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7877,7 +7938,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -7931,7 +7996,8 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n"
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -7963,7 +8029,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8019,7 +8089,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%14" ]; then printf "%%14\t0\t2000000014\n"; fi
         if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
@@ -8054,7 +8127,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane)
     exit 0
     ;;
   *)
@@ -8120,7 +8197,9 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%22\t0\t2000000022\n%%23\t0\t2000000023\n%%24\t0\t2000000024\n"
+        printf "%%11\t0\t2000000011\n%%22\t0\t2000000022\n"
+        if [ ! -f "${tmuxLogPath}.killed-%23" ]; then printf "%%23\t0\t2000000023\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%24" ]; then printf "%%24\t0\t2000000024\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8150,7 +8229,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane)
     exit 0
     ;;
   *)
@@ -8210,7 +8293,11 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%14" ]; then printf "%%14\t0\t2000000014\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8226,7 +8313,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8243,7 +8331,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane)
     exit 0
     ;;
   *)
@@ -8315,7 +8407,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
@@ -8328,6 +8423,7 @@ case "$1" in
     esac
     ;;
   split-window)
+    : > "${tmuxLogPath}.hud-created"
     printf '%%44\n'
     exit 0
     ;;
@@ -8345,7 +8441,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|kill-session|select-pane)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  kill-session|select-pane)
     exit 0
     ;;
   *)
@@ -8419,7 +8519,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n%%14\t0\t2000000014\n"
+        printf "%%11\t0\t2000000011\n%%14\t0\t2000000014\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8439,7 +8542,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8456,7 +8560,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8517,7 +8625,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8537,7 +8648,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8554,7 +8666,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8618,7 +8734,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8638,7 +8757,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8655,7 +8775,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8716,7 +8840,10 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
+        if [ -f "${tmuxLogPath}.hud-created" ]; then printf "%%44\t0\t2000000044\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8736,7 +8863,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${tmuxLogPath}.hud-created"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8759,7 +8887,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8819,7 +8951,9 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        printf "%%11\t0\t2000000011\n"
+        printf "%%12\t0\t2000000012\n"
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
         exit 0
         ;;
       *"-F #{pane_dead} #{pane_pid}"*)
@@ -8855,7 +8989,11 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  resize-pane|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -8907,14 +9045,19 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        printf "%%12\t0\t2000000012\n%%13\t0\t2000000013\n"
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf "%%12\t0\t2000000012\n"; fi
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf "%%13\t0\t2000000013\n"; fi
         ;;
       *)
         exit 1
         ;;
     esac
     ;;
-  kill-pane|kill-session)
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  kill-session)
     exit 0
     ;;
   *)

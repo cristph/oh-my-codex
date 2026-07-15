@@ -159,6 +159,25 @@ export function resolveBridgeStateDir(cwd: string, env: NodeJS.ProcessEnv = proc
   return resolveCanonicalTeamStateRoot(cwd, env);
 }
 
+function isStrictDispatchRecord(record: unknown): record is DispatchRecord {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+  const value = record as Record<string, unknown>;
+  const requiredFields = [
+    'request_id', 'target', 'status', 'created_at', 'notified_at',
+    'delivered_at', 'failed_at', 'reason', 'metadata',
+  ];
+  if (requiredFields.some((field) => !Object.prototype.hasOwnProperty.call(value, field))) return false;
+  return typeof value.request_id === 'string'
+    && typeof value.target === 'string'
+    && ['pending', 'notified', 'delivered', 'failed'].includes(String(value.status))
+    && typeof value.created_at === 'string'
+    && (value.notified_at === null || typeof value.notified_at === 'string')
+    && (value.delivered_at === null || typeof value.delivered_at === 'string')
+    && (value.failed_at === null || typeof value.failed_at === 'string')
+    && (value.reason === null || typeof value.reason === 'string')
+    && (value.metadata === null || (typeof value.metadata === 'object' && !Array.isArray(value.metadata)));
+}
+
 export class RuntimeBridge {
   private binaryPath: string;
   private stateDir: string | undefined;
@@ -292,14 +311,7 @@ export class RuntimeBridge {
       throw new RuntimeBridgeError('dispatch compatibility output has an invalid shape', { command: 'dispatch-read' });
     }
     const records = (parsed as { records: unknown[] }).records;
-    if (records.some((record) => {
-      if (!record || typeof record !== 'object') return true;
-      const value = record as Partial<DispatchRecord>;
-      return typeof value.request_id !== 'string'
-        || typeof value.target !== 'string'
-        || !['pending', 'notified', 'delivered', 'failed'].includes(String(value.status))
-        || (value.metadata !== null && value.metadata !== undefined && typeof value.metadata !== 'object');
-    })) {
+    if (records.some((record) => !isStrictDispatchRecord(record))) {
       throw new RuntimeBridgeError('dispatch compatibility output contains an invalid record', { command: 'dispatch-read' });
     }
     return records as DispatchRecord[];

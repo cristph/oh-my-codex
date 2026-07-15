@@ -666,6 +666,50 @@ export async function scaleUp(
       if (context.workerName && context.paneId && unresolvedPaneIds.has(context.paneId)) {
         unresolvedWorkerNames.add(context.workerName);
       }
+      if (unresolvedWorkerNames.size > 0) {
+        try {
+          await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+            await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+            const currentConfigBytes = await readFile(configPath, 'utf8');
+            const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
+            const currentConfig = JSON.parse(currentConfigBytes) as TeamConfig;
+            const retainedWorkers = rollbackWorkers.filter((worker) => unresolvedWorkerNames.has(worker.name));
+            const retainedByName = new Map(currentConfig.workers.map((worker) => [worker.name, worker]));
+            for (const worker of retainedWorkers) retainedByName.set(worker.name, worker);
+            const nextConfig: TeamConfig = {
+              ...currentConfig,
+              workers: [...retainedByName.values()],
+              worker_count: retainedByName.size,
+              next_worker_index: Math.max(
+                currentConfig.next_worker_index ?? (currentConfig.workers.length + 1),
+                ...retainedWorkers.map((worker) => Number.parseInt(worker.name.replace(/^worker-/, ''), 10) + 1),
+              ),
+            };
+            const nextManifestBytes = currentManifestBytes === null
+              ? null
+              : JSON.stringify({
+                ...(JSON.parse(currentManifestBytes) as Record<string, unknown>),
+                workers: nextConfig.workers,
+                worker_count: nextConfig.worker_count,
+                next_worker_index: nextConfig.next_worker_index,
+              }, null, 2);
+            await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+              tasks: [],
+              config: { oldBytes: currentConfigBytes, newBytes: JSON.stringify(nextConfig, null, 2) },
+              manifest: { oldBytes: currentManifestBytes, newBytes: nextManifestBytes },
+              retainJournalOnSuccess: true,
+            });
+            const verified = await readTeamConfig(sanitized, leaderCwd);
+            if (!verified || retainedWorkers.some((worker) => !verified.workers.some((entry) => entry.name === worker.name && entry.pane_id === worker.pane_id))) {
+              throw new Error('canonical_scale_up_rollback_unresolved_membership_verification_failed');
+            }
+            await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
+            Object.assign(config, verified);
+          });
+        } catch (rollbackError) {
+          cleanupDebt.push(`unresolved_membership_persistence_failed:${String(rollbackError)}`);
+        }
+      }
       const cleanupWorkerNames = new Set([
         ...rollbackWorkers
           .filter((worker) => typeof worker.pane_id !== 'string' || resolvedPaneIds.has(worker.pane_id))
@@ -674,15 +718,17 @@ export async function scaleUp(
       ]);
       try {
         for (const taskId of createdTaskIds) {
+          const task = await readTask(sanitized, taskId, leaderCwd);
+          if (task && unresolvedWorkerNames.has(task.owner ?? '')) continue;
           await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
         }
         await Promise.all([...cleanupWorkerNames].map(async (workerName) => {
           await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
         }));
         for (const taskId of createdTaskIds) {
-          if (await readTask(sanitized, taskId, leaderCwd)) {
-            throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
-          }
+          const task = await readTask(sanitized, taskId, leaderCwd);
+          if (task && unresolvedWorkerNames.has(task.owner ?? '')) continue;
+          if (task) throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
         }
         for (const workerName of cleanupWorkerNames) {
           if (existsSync(join(teamStateRoot, 'team', sanitized, 'workers', workerName))) {
@@ -1297,22 +1343,43 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: exact proof determines removability before canonical mutation.
-    // Proof-unavailable workers retain their membership, task ownership, and artifacts.
-    const proofUnavailable = targetWorkers.flatMap((worker) => {
-      if (typeof worker.pane_id !== 'string') return [];
-      const proof = readExactPaneProofSync(worker.pane_id);
-      return proof.status === 'unavailable' ? [{ worker, reason: proof.reason }] : [];
+    // Phase 3: pane teardown must be resolved before canonical membership changes.
+    // A successful kill command is insufficient: teardownWorkerPanes requires a
+    // fresh exact global proof that the pane is gone after the effect.
+    const targetPaneIds = targetWorkers
+      .map((worker) => worker.pane_id)
+      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
+    const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
+      leaderPaneId: config.leader_pane_id,
+      hudPaneId: config.hud_pane_id,
     });
-    const proofUnavailableWorkers = proofUnavailable.map(({ worker }) => worker);
-    const removableWorkers = targetWorkers.filter((worker) => !proofUnavailableWorkers.includes(worker));
-    if (proofUnavailableWorkers.length > 0) await restorePriorWorkerStatuses(proofUnavailableWorkers);
-    if (removableWorkers.length === 0) {
-      const detail = proofUnavailable
-        .map(({ worker, reason }) => `${worker.pane_id ?? worker.name}:${reason}`)
-        .join(',');
-      return { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
+    const resolvedPaneIds = new Set([...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]);
+    const unresolvedWorkers = targetWorkers.filter((worker) => (
+      typeof worker.pane_id === 'string' && !resolvedPaneIds.has(worker.pane_id)
+    ));
+    if (unresolvedWorkers.length > 0) {
+      await restorePriorWorkerStatuses(targetWorkers);
+      if (paneTeardown.proofUnavailable.length > 0) {
+        const detail = paneTeardown.proofUnavailable
+          .map((proof) => `${proof.paneId}:${proof.reason}`)
+          .join(',');
+        return { ok: false, error: `scale_down_pane_proof_unavailable:${detail}` };
+      }
+      const debt = [
+        paneTeardown.kill.failedPaneIds.length > 0
+          ? `pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`
+          : null,
+        paneTeardown.proofUnavailable.length > 0
+          ? `pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`
+          : null,
+        ...unresolvedWorkers
+          .filter((worker) => !paneTeardown.kill.failedPaneIds.includes(worker.pane_id ?? ''))
+          .filter((worker) => !paneTeardown.proofUnavailable.some((proof) => proof.paneId === worker.pane_id))
+          .map((worker) => `pane_teardown_unresolved:${worker.pane_id}`),
+      ].filter((entry): entry is string => entry !== null);
+      return { ok: false, error: `scale_down_cleanup_debt:${debt.join(';')}` };
     }
+    const removableWorkers = targetWorkers;
     const removableWorkerNames = new Set(removableWorkers.map((worker) => worker.name));
     try {
       await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
@@ -1396,31 +1463,10 @@ export async function scaleDown(
     // Phase 4: cleanup is deliberately after the canonical commit. Failures are
     // durable retry debt: removed workers and their task ownership are never put back.
     removedNames.push(...targetWorkers.map((worker) => worker.name));
+    // Pane teardown completed with a fresh gone proof before the canonical
+    // transaction above. Resource cleanup may now follow the committed state.
     const cleanupDebt: string[] = [];
-    const targetPaneIds = targetWorkers
-      .map((worker) => worker.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    const resolvedPaneIds = new Set<string>();
-    try {
-      const paneTeardown = await teardownWorkerPanes(targetPaneIds, {
-        leaderPaneId: config.leader_pane_id,
-        hudPaneId: config.hud_pane_id,
-      });
-      for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
-      if (paneTeardown.kill.failedPaneIds.length > 0) {
-        cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
-      }
-      if (paneTeardown.proofUnavailable.length > 0) {
-        cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
-      }
-    } catch (error) {
-      cleanupDebt.push(`pane_cleanup_exception:${String(error)}`);
-    }
-    const cleanupWorkers = targetWorkers.filter((worker) => (
-      typeof worker.pane_id !== 'string' || resolvedPaneIds.has(worker.pane_id)
-    ));
-    const unresolvedCleanupWorkers = targetWorkers.filter((worker) => !cleanupWorkers.includes(worker));
-    if (unresolvedCleanupWorkers.length > 0) await restorePriorWorkerStatuses(unresolvedCleanupWorkers);
+    const cleanupWorkers = targetWorkers;
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = cleanupWorkers
       .filter((worker) => worker.worktree_created === true && worker.worktree_detached === true
         && typeof worker.worktree_repo_root === 'string' && typeof worker.worktree_path === 'string')

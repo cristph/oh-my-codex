@@ -133,6 +133,17 @@ describe('RuntimeBridge.readDispatchRecordsStrict', () => {
       assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
       writeFileSync(join(stateDir, 'dispatch.json'), JSON.stringify({ records: [{}] }));
       assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
+      writeFileSync(join(stateDir, 'dispatch.json'), JSON.stringify({ records: [{
+        request_id: 'missing-required-fields',
+        target: 'worker-1',
+        status: 'pending',
+        created_at: '2026-01-01T00:00:00.000Z',
+        notified_at: null,
+        delivered_at: null,
+        failed_at: null,
+        metadata: null,
+      }] }));
+      assert.throws(() => bridge.readDispatchRecordsStrict(), RuntimeBridgeError);
       writeFileSync(join(stateDir, 'dispatch.json'), JSON.stringify({ records: [] }));
       assert.deepEqual(bridge.readDispatchRecordsStrict(), []);
     } finally {

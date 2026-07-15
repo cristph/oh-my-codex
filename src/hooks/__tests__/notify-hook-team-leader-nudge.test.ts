@@ -1995,7 +1995,7 @@ exit 0
     });
   });
 
-  it('injects leader nudge when capture-pane fails but the leader pane is a live codex pane', async () => {
+  it('defers leader nudge when capture-pane cannot verify readiness despite authoritative live-pane proof', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -2104,15 +2104,27 @@ exit 0
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/, 'should retain authoritative exact-pane live proof');
+      assert.match(tmuxLog, /display-message -p -t %74 #\{pane_current_command\}/, 'should query the exact pane command before capture readiness');
       assert.match(tmuxLog, /capture-pane -t %74 -p -S -80/);
-      assert.match(tmuxLog, /send-keys -t %74/, 'capture failures should not suppress leader injection into a live codex pane');
+      assert.doesNotMatch(tmuxLog, /(?:set-buffer|paste-buffer|send-keys)/, 'capture readiness failure must suppress all input-effect tmux commands');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
-      if (existsSync(eventsPath)) {
-        const events = (await readFile(eventsPath, 'utf-8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-        const deferred = events.find((entry: { type?: string }) => entry.type === 'leader_notification_deferred');
-        assert.equal(deferred, undefined, 'capture failure alone should not defer a live codex leader pane');
-      }
+      const events = (await readFile(eventsPath, 'utf-8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      const deferred = events.find((entry: { type?: string; reason?: string; pane_current_command?: string; tmux_injection_attempted?: boolean }) =>
+        entry.type === 'leader_notification_deferred' && entry.reason === 'pane_readiness_unverified');
+      assert.ok(deferred, 'capture readiness failure should emit a fail-closed deferred event');
+      assert.equal(deferred.pane_current_command, 'codex');
+      assert.equal(deferred.tmux_injection_attempted, false);
+
+      const deliveryLog = await readTeamDeliveryLog(cwd);
+      assert.ok(deliveryLog.some((entry) =>
+        entry.event === 'nudge_triggered'
+        && entry.team === teamName
+        && entry.to_worker === 'leader-fixed'
+        && entry.transport === 'none'
+        && entry.result === 'deferred'
+        && entry.reason === 'pane_readiness_unverified'), 'capture readiness failure should record a fail-closed delivery receipt');
     });
   });
 

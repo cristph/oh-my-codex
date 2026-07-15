@@ -460,7 +460,7 @@ exit 0
     }
   });
 
-  it('treats capture-pane failure as non-blocking for a live codex pane', async () => {
+  it('fails closed without input effects when exact-pane readiness queries fail', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
@@ -497,20 +497,48 @@ exit 0
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
-      const result = runEvaluatePaneInjectionReadinessInChild({
+      const captureResult = runEvaluatePaneInjectionReadinessInChild({
         fakeBinDir,
         moduleUrl,
         paneTarget: '%42',
-        options: { skipIfScrolling: true },
+        options: { skipIfScrolling: true, exactPaneId: '%42' },
       });
 
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.error, undefined);
-      const parsed = JSON.parse(result.stdout);
-      assert.equal(parsed.ok, true);
-      assert.equal(parsed.reason, 'ok');
-      assert.equal(parsed.paneCurrentCommand, 'codex');
-      assert.equal(parsed.paneCapture, '');
+      assert.equal(captureResult.status, 0, captureResult.stderr);
+      assert.equal(captureResult.error, undefined);
+      const captureParsed = JSON.parse(captureResult.stdout);
+      assert.equal(captureParsed.ok, false);
+      assert.equal(captureParsed.reason, 'pane_readiness_unverified');
+      assert.equal(captureParsed.readinessEvidence, 'capture_failed');
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /set-buffer|paste-buffer|send-keys|delete-buffer/);
+
+      await writeFile(
+        join(fakeBinDir, 'tmux'),
+        `#!/usr/bin/env bash
+set -eu
+${liveExactPaneProof()}
+echo "$@" >> "${tmuxLogPath}"
+if [[ "$1" == "display-message" ]]; then
+  echo "pane current command query failed" >&2
+  exit 1
+fi
+exit 0
+`,
+      );
+      const commandResult = runEvaluatePaneInjectionReadinessInChild({
+        fakeBinDir,
+        moduleUrl,
+        paneTarget: '%42',
+        options: { exactPaneId: '%42' },
+      });
+
+      assert.equal(commandResult.status, 0, commandResult.stderr);
+      assert.equal(commandResult.error, undefined);
+      const commandParsed = JSON.parse(commandResult.stdout);
+      assert.equal(commandParsed.ok, false);
+      assert.equal(commandParsed.reason, 'pane_readiness_unverified');
+      assert.equal(commandParsed.readinessEvidence, 'command_failed');
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /set-buffer|paste-buffer|send-keys|delete-buffer/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

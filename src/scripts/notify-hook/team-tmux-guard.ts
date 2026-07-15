@@ -123,6 +123,7 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   }
 
   const exactPaneIdentity = safeString(exactPaneId).trim();
+  const exactPaneIdentityProvided = explicitPaneIdentity(exactPaneId).provided;
   let exactPaneProof: any = null;
   const verifyExplicitPane = async () => {
     const paneProof = await verifyExactPaneLive(exactPaneIdentity);
@@ -176,6 +177,9 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       paneCurrentCommand = safeString(result.stdout).trim();
       paneRunningShell = requireRunningAgent && isPaneRunningShell(paneCurrentCommand);
     } catch {
+      if (exactPaneIdentityProvided) {
+        return buildReadinessResult(false, PANE_READINESS_UNVERIFIED_REASON, '', 'command_failed');
+      }
       paneCurrentCommand = '';
     }
   }
@@ -229,6 +233,9 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       }
       return buildReadinessResult(true, 'ok', paneCapture, hasCaptureEvidence ? 'captured' : (paneCurrentCommand ? 'command_only' : 'none'));
     } catch {
+      if (exactPaneIdentityProvided) {
+        return buildReadinessResult(false, PANE_READINESS_UNVERIFIED_REASON, '', 'capture_failed');
+      }
       if (paneRunningShell) {
         return buildReadinessResult(false, 'pane_running_shell', '', 'capture_failed');
       }

@@ -38,6 +38,8 @@ import {
   resetWriteAtomicRenameForTests,
   setWriteAtomicOpenForTests,
   resetWriteAtomicOpenForTests,
+  setWriteAtomicPlatformForTests,
+  resetWriteAtomicPlatformForTests,
   writeWorkerInbox,
   enqueueDispatchRequest,
   listDispatchRequests,
@@ -54,6 +56,7 @@ import {
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 import { claimTask as claimTaskWithDeps } from '../state/tasks.js';
+import { withScalingLock as withScalingLeaseLock, withTeamLock } from '../state/locks.js';
 import type { TeamTaskV2 } from '../state/types.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
@@ -65,6 +68,7 @@ beforeEach(() => {
 afterEach(() => {
   resetWriteAtomicRenameForTests();
   resetWriteAtomicOpenForTests();
+  resetWriteAtomicPlatformForTests();
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
 });
@@ -191,8 +195,10 @@ switch (command.command) {
   }
   case 'RemoveDispatchRecords': {
     const ids = new Set(command.request_ids || []);
-    dispatch.records = dispatch.records.filter((entry) => !ids.has(entry.request_id));
-    writeJson(dispatchPath, dispatch);
+    if (process.env.OMX_TEST_ACK_RETAIN_DISPATCH !== '1') {
+      dispatch.records = dispatch.records.filter((entry) => !ids.has(entry.request_id));
+      writeJson(dispatchPath, dispatch);
+    }
     process.stdout.write(JSON.stringify({ event: 'DispatchRecordsRemoved', request_ids: command.request_ids || [] }) + '\\n');
     process.exit(0);
   }
@@ -572,7 +578,19 @@ exit 1
       process.env.OMX_RUNTIME_BRIDGE = '1';
       process.env.OMX_TEST_SKIP_SNAPSHOT_COMPAT_WRITE = '1';
       const legacyPath = join(cwd, '.omx', 'state', 'team', teamName, 'dispatch', 'requests.json');
-      const legacyBytes = JSON.stringify([{ request_id: 'legacy-preserved', target: 'worker-1', status: 'pending' }], null, 2);
+      const legacyBytes = JSON.stringify([{
+        request_id: 'legacy-preserved',
+        kind: 'inbox',
+        team_name: teamName,
+        to_worker: 'worker-1',
+        trigger_message: 'preserve rollback evidence',
+        transport_preference: 'hook_preferred_with_fallback',
+        fallback_allowed: true,
+        status: 'pending',
+        attempt_count: 0,
+        created_at: '2026-01-01T00:00:00.000Z',
+        updated_at: '2026-01-01T00:00:00.000Z',
+      }], null, 2);
       await writeFile(legacyPath, legacyBytes);
       const dispatchPath = join(cwd, '.omx', 'state', 'dispatch.json');
 
@@ -645,6 +663,81 @@ exit 1
       else delete process.env.OMX_RUNTIME_BINARY;
       if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
       else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves malformed legacy rollback evidence byte-for-byte', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-legacy-malformed-'));
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      const teamName = 'dispatch-legacy-malformed';
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const legacyPath = join(cwd, '.omx', 'state', 'team', teamName, 'dispatch', 'requests.json');
+      const legacyBytes = '{\n  "records": "not-an-array"\n}\n';
+      await writeFile(legacyPath, legacyBytes);
+
+      await assert.rejects(
+        () => removeDispatchRequestsForWorkers(teamName, ['worker-1'], cwd),
+        /legacy dispatch rollback evidence is malformed or unrecognized/,
+      );
+      assert.equal(await readFile(legacyPath, 'utf8'), legacyBytes);
+    } finally {
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an acknowledged retained dispatch ID even when its scope fields changed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-retained-id-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    const previousAckRetain = process.env.OMX_TEST_ACK_RETAIN_DISPATCH;
+    try {
+      const teamName = 'dispatch-retained-id';
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      await mkdir(fakeBinDir, { recursive: true });
+      const runtimePath = join(fakeBinDir, 'omx-runtime');
+      await writeCompatRuntimeFixture(runtimePath, join(cwd, 'runtime.log'));
+      process.env.OMX_RUNTIME_BINARY = runtimePath;
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      const queued = await enqueueDispatchRequest(teamName, {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        trigger_message: 'remove by exact ID',
+      }, cwd);
+      const legacyPath = join(cwd, '.omx', 'state', 'team', teamName, 'dispatch', 'requests.json');
+      const legacyBytes = await readFile(legacyPath, 'utf8');
+      const dispatchPath = join(cwd, '.omx', 'state', 'dispatch.json');
+      await writeFile(dispatchPath, JSON.stringify({ records: [{
+        request_id: queued.request.request_id,
+        target: 'worker-renamed',
+        status: 'pending',
+        created_at: '2026-01-01T00:00:00.000Z',
+        notified_at: null,
+        delivered_at: null,
+        failed_at: null,
+        reason: null,
+        metadata: { team_name: 'different-team' },
+      }] }, null, 2));
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      process.env.OMX_TEST_ACK_RETAIN_DISPATCH = '1';
+
+      await assert.rejects(
+        () => removeDispatchRequestsForWorkers(teamName, ['worker-1'], cwd),
+        /authoritative_dispatch_rollback_verification_failed/,
+      );
+      assert.equal(await readFile(legacyPath, 'utf8'), legacyBytes);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      if (typeof previousAckRetain === 'string') process.env.OMX_TEST_ACK_RETAIN_DISPATCH = previousAckRetain;
+      else delete process.env.OMX_TEST_ACK_RETAIN_DISPATCH;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -2244,7 +2337,7 @@ exit 1
     }
   });
 
-  for (const code of ['EPERM', 'EINVAL', 'ENOTSUP', 'EISDIR'] as const) {
+  for (const code of ['EINVAL', 'ENOTSUP', 'EISDIR'] as const) {
     it(`writeAtomic tolerates unsupported parent directory sync ${code} after fsyncing the file`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
       try {
@@ -2281,6 +2374,7 @@ exit 1
     try {
       const p = join(cwd, 'atomic-parent-open-eperm.txt');
       let fileSyncs = 0;
+      setWriteAtomicPlatformForTests('win32');
       setWriteAtomicOpenForTests(async (...args) => {
         const [path] = args;
         if (path === cwd) {
@@ -2299,6 +2393,101 @@ exit 1
 
       await writeAtomic(p, 'durable data');
 
+      assert.equal(fileSyncs, 1);
+      assert.equal(readFileSync(p, 'utf8'), 'durable data');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic tolerates Windows EPERM syncing the parent directory after fsyncing the file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-parent-sync-eperm.txt');
+      let fileSyncs = 0;
+      setWriteAtomicPlatformForTests('win32');
+      setWriteAtomicOpenForTests(async (...args) => {
+        const [path] = args;
+        const handle = await open(...args);
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          if (path === cwd) {
+            const error = new Error('Windows cannot sync directory') as NodeJS.ErrnoException;
+            error.code = 'EPERM';
+            throw error;
+          }
+          fileSyncs += 1;
+          await sync();
+        };
+        return handle;
+      });
+
+      await writeAtomic(p, 'durable data');
+
+      assert.equal(fileSyncs, 1);
+      assert.equal(readFileSync(p, 'utf8'), 'durable data');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic surfaces POSIX EPERM opening the parent directory after fsyncing the file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-parent-open-posix-eperm.txt');
+      let fileSyncs = 0;
+      setWriteAtomicPlatformForTests('linux');
+      setWriteAtomicOpenForTests(async (...args) => {
+        const [path] = args;
+        if (path === cwd) {
+          const error = new Error('POSIX parent open denied') as NodeJS.ErrnoException;
+          error.code = 'EPERM';
+          throw error;
+        }
+        const handle = await open(...args);
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          fileSyncs += 1;
+          await sync();
+        };
+        return handle;
+      });
+
+      await assert.rejects(() => writeAtomic(p, 'durable data'), (error: unknown) => {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+      });
+      assert.equal(fileSyncs, 1);
+      assert.equal(readFileSync(p, 'utf8'), 'durable data');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic surfaces POSIX EPERM syncing the parent directory after fsyncing the file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-parent-sync-posix-eperm.txt');
+      let fileSyncs = 0;
+      setWriteAtomicPlatformForTests('linux');
+      setWriteAtomicOpenForTests(async (...args) => {
+        const [path] = args;
+        const handle = await open(...args);
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          if (path === cwd) {
+            const error = new Error('POSIX parent sync denied') as NodeJS.ErrnoException;
+            error.code = 'EPERM';
+            throw error;
+          }
+          fileSyncs += 1;
+          await sync();
+        };
+        return handle;
+      });
+
+      await assert.rejects(() => writeAtomic(p, 'durable data'), (error: unknown) => {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+      });
       assert.equal(fileSyncs, 1);
       assert.equal(readFileSync(p, 'utf8'), 'durable data');
     } finally {
@@ -2742,6 +2931,63 @@ exit 1
       assert.equal(snapshot?.integrationByWorker?.['worker-1']?.last_integrated_head, 'abc123');
       assert.equal(snapshot?.integrationByWorker?.['worker-2']?.status, undefined);
       assert.equal(snapshot?.integrationByWorker?.['worker-2']?.last_integrated_head, 'def456');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('heartbeats live scaling and membership leases while reclaiming stale crashed locks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lock-lease-'));
+    const teamName = 'team-lock-lease';
+    const staleMs = 90;
+    const deps = {
+      teamDir: (name: string, root: string) => join(root, '.omx', 'state', 'team', name),
+      taskClaimLockDir: (name: string, taskId: string, root: string) => join(root, '.omx', 'state', 'team', name, 'claims', `task-${taskId}.lock`),
+      mailboxLockDir: (name: string, worker: string, root: string) => join(root, '.omx', 'state', 'team', name, 'mailboxes', `${worker}.lock`),
+    };
+    const locks = [
+      {
+        label: 'scaling',
+        lockDir: join(cwd, '.omx', 'state', '.team-locks', `${teamName}.scaling`),
+        acquire: (fn: () => Promise<void>) => withScalingLeaseLock(teamName, cwd, staleMs, deps, fn),
+      },
+      {
+        label: 'membership',
+        lockDir: join(cwd, '.omx', 'state', '.team-locks', `${teamName}.membership`),
+        acquire: (fn: () => Promise<void>) => withTeamLock(teamName, cwd, staleMs, deps, fn),
+      },
+    ];
+
+    try {
+      for (const lock of locks) {
+        let releaseHeld!: () => void;
+        const heldRelease = new Promise<void>((resolve) => { releaseHeld = resolve; });
+        let heldEntered!: () => void;
+        const heldEnteredPromise = new Promise<void>((resolve) => { heldEntered = resolve; });
+        const held = lock.acquire(async () => {
+          heldEntered();
+          await heldRelease;
+        });
+        await heldEnteredPromise;
+
+        let contenderEntered = false;
+        const contender = lock.acquire(async () => { contenderEntered = true; });
+        await new Promise((resolve) => setTimeout(resolve, staleMs * 3));
+        assert.equal(contenderEntered, false, `live ${lock.label} lock must not be reclaimed after its directory mtime becomes stale`);
+        releaseHeld();
+        await Promise.all([held, contender]);
+
+        await mkdir(lock.lockDir, { recursive: true });
+        await writeFile(join(lock.lockDir, 'owner'), 'crashed-owner');
+        await writeFile(join(lock.lockDir, 'lease'), 'crashed-owner');
+        const staleTime = new Date(Date.now() - staleMs * 2);
+        await utimes(lock.lockDir, staleTime, staleTime);
+        await utimes(join(lock.lockDir, 'lease'), staleTime, staleTime);
+
+        let reclaimed = false;
+        await lock.acquire(async () => { reclaimed = true; });
+        assert.equal(reclaimed, true, `stale ${lock.label} lock must be reclaimed after its lease expires`);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

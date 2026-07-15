@@ -1592,6 +1592,8 @@ describe('teamCommand shutdown --force parsing', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-cli-'));
     const binDir = join(wd, 'bin');
     const tmuxLogPath = join(wd, 'tmux.log');
+    const killedHudPanePath = join(wd, 'killed-hud-pane');
+    const restoredHudPanePath = join(wd, 'restored-hud-pane');
     const tmuxPath = join(binDir, 'tmux');
     const previousPath = process.env.PATH;
 
@@ -1609,7 +1611,11 @@ case "$1" in
   list-panes)
     case "$*" in
       "list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}")
-        printf "%%11\t0\t1111\n%%12\t0\t1212\n%%13\t0\t1313\n%%14\t0\t1414\n"
+        printf "%%11\t0\t1111\n"
+        [ -f "${killedHudPanePath}" ] || printf "%%12\t0\t1212\n"
+        [ -f "${wd}/killed-pane-%13" ] || printf "%%13\t0\t1313\n"
+        [ -f "${wd}/killed-pane-%14" ] || printf "%%14\t0\t1414\n"
+        [ ! -f "${restoredHudPanePath}" ] || printf "%%44\t0\t4444\n"
         exit 0
         ;;
 
@@ -1630,7 +1636,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "${restoredHudPanePath}"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -1648,6 +1655,10 @@ case "$1" in
     exit 0
     ;;
   kill-pane)
+    case "$3" in
+      %12) : > "${killedHudPanePath}" ;;
+      %13|%14) : > "${wd}/killed-pane-$3" ;;
+    esac
     # Shared-session runtime coverage should validate pane-targeted teardown
     # only. Detached leader-wrapper signal behavior is covered separately in
     # cli/index detached-session tests.

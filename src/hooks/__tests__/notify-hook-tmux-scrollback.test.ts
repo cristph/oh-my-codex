@@ -92,8 +92,9 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#{pane_current_command}" ]]; then
-    echo "node"
+    echo "codex"
     exit 0
+
   fi
   if [[ "$format" == "#{pane_start_command}" ]]; then
     echo "codex --model gpt-5"
@@ -109,6 +110,10 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   echo "unsupported format: $format" >&2
   exit 1
+fi
+if [[ "$cmd" == "capture-pane" ]]; then
+  printf "› ready\n"
+  exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"

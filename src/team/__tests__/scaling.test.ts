@@ -238,9 +238,9 @@ async function writeSuccessfulScaleUpTmuxStub(
       '  list-panes)',
       '    case "$*" in',
       '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
-      "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
-      "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
-      "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+      "        printf '%s\t%s\t%s\n' '%11' '0' '42411'",
+      "        printf '%s\t%s\t%s\n' '%21' '0' '42421'",
+      `        if [ ! -f "${join(fakeBinDir, 'killed-%31')}" ]; then printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'; fi`,
       '        ;;',
       '      *)',
       '        echo "42424"',
@@ -248,6 +248,9 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    esac',
       '    ;;',
       '  send-keys)',
+      '    ;;',
+      '  kill-pane)',
+      `    : > "${join(fakeBinDir, 'killed-')}$3"`,
       '    ;;',
       '  capture-pane)',
       '    echo ""',
@@ -781,7 +784,7 @@ exit 0
           '      *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)',
           "        printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
           "        printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
-          "        printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
+          `        if [ ! -f "${join(fakeBinDir, 'scale-up-role-killed-%31')}" ]; then printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'; fi`,
           '        ;;',
           '      *)',
           '        echo "42424"',
@@ -789,6 +792,9 @@ exit 0
           '    esac',
           '    ;;',
           '  send-keys)',
+          '    ;;',
+          '  kill-pane)',
+          `    : > "${join(fakeBinDir, 'scale-up-role-killed-')}$3"`,
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -1069,9 +1075,10 @@ printf '%s\\n' "$@" > '${capturePath}'
       assert.match(result.error, /scale_up_rollback_cleanup_debt:pane_proof_unavailable:%31:malformed_snapshot/);
 
       const config = await readTeamConfig('scale-up-owner-tag-rollback', cwd);
-      assert.equal(config?.workers.length, 1);
-      assert.equal(config?.next_worker_index, 2);
-      assert.equal(await readTask('scale-up-owner-tag-rollback', '1', cwd), null);
+      assert.deepEqual(config?.workers.map((worker) => worker.name), ['worker-1', 'worker-2']);
+      assert.equal(config?.workers[1]?.pane_id, '%31');
+      assert.equal(config?.next_worker_index, 3);
+      assert.equal((await readTask('scale-up-owner-tag-rollback', '1', cwd))?.owner, 'worker-2');
       assert.equal(existsSync(
         join(cwd, '.omx', 'state', 'team', 'scale-up-owner-tag-rollback', 'workers', 'worker-2', 'identity.json'),
       ), false);
@@ -1668,7 +1675,7 @@ set -eu
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%21' '0' '42421'
-        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        if [ ! -f "${fakeBinDir}/killed-%31" ]; then printf '%s\t%s\t%s\n' '%31' '0' '42424'; fi
         ;;
       *)
         echo "42424"
@@ -1677,6 +1684,9 @@ set -eu
     ;;
   send-keys)
     exit 1
+    ;;
+  kill-pane)
+    : > "${fakeBinDir}/killed-$3"
     ;;
   capture-pane)
     echo ""
@@ -1761,7 +1771,7 @@ set -eu
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%21' '0' '42421'
-        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        if [ ! -f "${fakeBinDir}/canonical-root-killed-%31" ]; then printf '%s\t%s\t%s\n' '%31' '0' '42424'; fi
         ;;
       *)
         echo "42424"
@@ -1770,6 +1780,9 @@ set -eu
     ;;
   capture-pane)
     echo ""
+    ;;
+  kill-pane)
+    : > "${fakeBinDir}/canonical-root-killed-$3"
     ;;
 esac
 exit 0
@@ -1859,7 +1872,7 @@ case "\${1:-}" in
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%21' '0' '42421'
-        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        if [ ! -f "${fakeBinDir}/frontier-role-killed-%31" ]; then printf '%s\t%s\t%s\n' '%31' '0' '42424'; fi
         ;;
       *)
         echo "42424"
@@ -1868,6 +1881,9 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  kill-pane)
+    : > "${fakeBinDir}/frontier-role-killed-$3"
     ;;
 esac
 exit 0
@@ -1951,7 +1967,7 @@ case "\${1:-}" in
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%21' '0' '42421'
-        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        if [ ! -f "${fakeBinDir}/mini-tuned-killed-%31" ]; then printf '%s\t%s\t%s\n' '%31' '0' '42424'; fi
         ;;
       *)
         echo "42424"
@@ -1960,6 +1976,9 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  kill-pane)
+    : > "${fakeBinDir}/mini-tuned-killed-$3"
     ;;
 esac
 exit 0
@@ -2046,7 +2065,7 @@ case "\${1:-}" in
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%21' '0' '42421'
-        printf '%s\t%s\t%s\n' '%31' '0' '42424'
+        if [ ! -f "${fakeBinDir}/layout-killed-%31" ]; then printf '%s\t%s\t%s\n' '%31' '0' '42424'; fi
         ;;
       *)
         echo "42424"
@@ -2055,6 +2074,9 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  kill-pane)
+    : > "${fakeBinDir}/layout-killed-$3"
     ;;
 esac
 exit 0
@@ -2570,14 +2592,11 @@ printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   -V) echo 'tmux 3.2a' ;;
   list-panes)
-    config_path="${join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'config.json')}"
-    config_text=''; [ ! -f "$config_path" ] || config_text=$(cat "$config_path")
-    case "$config_text" in
-      *'worker-3'*)
-        if [ ! -f "${proofLossUsedPath}" ]; then : > "${proofLossUsedPath}"; exit 1; fi
-        ;;
-    esac
     split_count=0; [ ! -f "${splitCountPath}" ] || split_count=$(cat "${splitCountPath}")
+    if [ "$split_count" -ge 2 ] && [ ! -f "${proofLossUsedPath}" ]; then
+      : > "${proofLossUsedPath}"
+      exit 1
+    fi
     if [ "$split_count" -ge 2 ]; then
       printf '%s\t%s\t%s\n' '%21' '0' '42421'
       printf '%s\t%s\t%s\n' '%31' '0' '42431'
@@ -2599,8 +2618,8 @@ case "\${1:-}" in
     fi
     ;;
   kill-pane)
-    case "$*" in
-      *"%31"*) : > "${fakeBinDir}/rollback-kill-failed"; exit 1 ;;
+    case "$3" in
+      %31|%32) exit 0 ;;
       *) exit 1 ;;
     esac
     ;;
@@ -2635,19 +2654,24 @@ esac
       if (!result.ok) assert.match(result.error, /^scale_up_rollback_cleanup_debt:.*pane_teardown_failed:%31,%32/);
       assert.equal(await readFile(splitCountPath, 'utf-8'), '2');
       const config = await readTeamConfig('rollback-kill-fail', cwd);
-      assert.deepEqual(config?.workers.map((worker) => worker.name), ['worker-1']);
-      assert.equal(config?.worker_count, 1);
-      assert.equal(config?.next_worker_index, 2);
-      assert.equal(await readTask('rollback-kill-fail', '1', cwd), null);
-      assert.equal(await readTask('rollback-kill-fail', '2', cwd), null);
+      assert.deepEqual(config?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
+      assert.equal(config?.worker_count, 3);
+      assert.equal(config?.next_worker_index, 4);
+      assert.equal((await readTask('rollback-kill-fail', '1', cwd))?.owner, 'worker-2');
+      assert.equal((await readTask('rollback-kill-fail', '2', cwd))?.owner, 'worker-3');
       assert.equal(await readTask('rollback-kill-fail', '3', cwd), null);
       for (const workerName of ['worker-2', 'worker-3']) {
         const workerDir = join(cwd, '.omx', 'state', 'team', 'rollback-kill-fail', 'workers', workerName);
-        assert.equal(existsSync(workerDir), true, `${workerName} state must remain retryable`);
-        assert.equal(existsSync(join(workerDir, 'identity.json')), true, `${workerName} identity must remain`);
-        assert.equal(existsSync(join(workerDir, 'inbox.md')), true, `${workerName} inbox must remain`);
         assert.equal(existsSync(workerStartupScriptPath(cwd, 'rollback-kill-fail', workerName)), true, `${workerName} startup script must remain`);
         assert.equal(existsSync(join(cwd, '.omx', 'team', 'rollback-kill-fail', 'worktrees', workerName)), true, `${workerName} worktree must remain`);
+        if (workerName === 'worker-2') {
+          assert.equal(existsSync(workerDir), true, 'worker-2 materialized state must remain retryable');
+          assert.equal(existsSync(join(workerDir, 'identity.json')), true, 'worker-2 identity must remain');
+          assert.equal(existsSync(join(workerDir, 'inbox.md')), true, 'worker-2 inbox must remain');
+        } else {
+          assert.equal(existsSync(join(workerDir, 'identity.json')), false, 'worker-3 proof failed before identity materialization');
+          assert.equal(existsSync(join(workerDir, 'inbox.md')), false, 'worker-3 proof failed before inbox materialization');
+        }
       }
       // P2: retry execution of recorded cleanup debt is intentionally a follow-up surface.
       const tmuxCommands: string[] = await readScaleUpTmuxLogCommands(tmuxLogPath);
@@ -3066,7 +3090,6 @@ esac
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -3094,10 +3117,13 @@ case "\${1:-}" in
       *"#{pane_id}\t#{pane_dead}\t#{pane_pid}"*)
         printf '%s\t%s\t%s\n' '%11' '0' '42411'
         printf '%s\t%s\t%s\n' '%12' '0' '42412'
-        printf '%s\t%s\t%s\n' '%13' '0' '42413'
+        if [ ! -f "${tmuxLogPath}.killed-%13" ]; then printf '%s\t%s\t%s\n' '%13' '0' '42413'; fi
         printf '%s\t%s\t%s\n' '%14' '0' '42414'
         ;;
     esac
+    ;;
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
     ;;
 esac
 exit 0
@@ -3125,15 +3151,17 @@ exit 0
         { workerNames: ['worker-1', 'worker-2', 'worker-3'], force: true },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.match(result.error, /pane_teardown_unresolved:%11.*pane_teardown_unresolved:%12/);
+      assert.deepEqual((await readTeamConfig('exclusions', cwd))?.workers.map((worker) => worker.name), [
+        'worker-1', 'worker-2', 'worker-3', 'worker-4',
+      ]);
 
       const tmuxCommands = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n');
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -3143,7 +3171,7 @@ exit 0
     }
   });
 
-  it('scaleDown preserves worker state when kill-pane fails after exact proof', async () => {
+  it('scaleDown preserves canonical generation and artifacts when kill-pane exits zero but pane ID is reused', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-kill-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-kill-fail-bin-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -3157,10 +3185,15 @@ set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   list-panes)
-    printf '%s\t%s\t%s\n' '%13' '0' '42413'
+    if [ -f "${cwd}/pane-reused" ]; then
+      printf '%s\t%s\t%s\n' '%13' '0' '42414'
+    else
+      printf '%s\t%s\t%s\n' '%13' '0' '42413'
+    fi
     ;;
   kill-pane)
-    exit 1
+    : > "${cwd}/pane-reused"
+    exit 0
     ;;
 esac
 exit 0
@@ -3203,7 +3236,7 @@ exit 0
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%13/);
       const committed = await readTeamConfig('kill-fail', cwd);
-      assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.deepEqual(committed?.workers.map((worker) => worker.name), ['worker-1', 'worker-2']);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'kill-fail', 'workers', 'worker-2')), true);
       assert.equal(await readFile(join(workerDir, 'identity.json'), 'utf8'), '{"worker":"worker-2"}');
       assert.equal(await readFile(join(workerDir, 'inbox.md'), 'utf8'), 'retryable inbox');
@@ -3213,8 +3246,8 @@ exit 0
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -3326,7 +3359,15 @@ esac
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const previousPath = process.env.PATH;
     try {
-      await writeFile(tmuxStubPath, "#!/bin/sh\n[ \"$1\" = list-panes ] && { printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'; exit 0; }\nexit 0\n");
+      await writeFile(tmuxStubPath, `#!/bin/sh
+marker="${tmuxStubPath}.killed"
+if [ "$1" = list-panes ]; then
+  [ -f "$marker" ] || printf '%s\t%s\t%s\n' '%13' '0' '42413'
+  exit 0
+fi
+if [ "$1" = kill-pane ]; then : > "$marker"; exit 0; fi
+exit 0
+`);
       await chmod(tmuxStubPath, 0o755);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
       await initTeamState('atomic-down', 'task', 'executor', 2, cwd);
@@ -3366,7 +3407,15 @@ esac
     const tmuxStubPath = join(fakeBinDir, 'tmux');
     const previousPath = process.env.PATH;
     try {
-      await writeFile(tmuxStubPath, "#!/bin/sh\n[ \"$1\" = list-panes ] && { printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'; exit 0; }\nexit 0\n");
+      await writeFile(tmuxStubPath, `#!/bin/sh
+marker="${tmuxStubPath}.killed"
+if [ "$1" = list-panes ]; then
+  [ -f "$marker" ] || printf '%s\t%s\t%s\n' '%13' '0' '42413'
+  exit 0
+fi
+if [ "$1" = kill-pane ]; then : > "$marker"; exit 0; fi
+exit 0
+`);
       await chmod(tmuxStubPath, 0o755);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
       await initTeamState('rollback-recovery', 'task', 'executor', 2, cwd);
@@ -3435,7 +3484,7 @@ esac
     });
   }
 
-  it('commits a successfully killed pane while restoring the exact status for a later proof-loss pane', async () => {
+  it('preserves canonical state when proof is lost immediately after a successful pane kill', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-success-proof-loss-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3450,14 +3499,15 @@ set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   list-panes)
-    if [ -f "${proofLossMarkerPath}" ]; then exit 1; fi
-    printf '%s\\t%s\\t%s\\n' '%13' '0' '42413'
-    printf '%s\\t%s\\t%s\\n' '%14' '0' '42414'
+    if [ -f "${proofLossMarkerPath}.killed" ]; then exit 1; fi
+    printf '%s\t%s\t%s\n' '%13' '0' '42413'
+    printf '%s\t%s\t%s\n' '%14' '0' '42414'
     ;;
   kill-pane)
-    case "$*" in *'%13'*) : > "${proofLossMarkerPath}" ;; esac
+    if [ "$3" = '%13' ]; then : > "${proofLossMarkerPath}.killed"; fi
     ;;
 esac
+exit 0
 `,
       );
       await chmod(tmuxStubPath, 0o755);
@@ -3490,23 +3540,22 @@ esac
       );
 
       assert.equal(result.ok, false);
-      if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_proof_unavailable:%14:query_failed/);
-      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
+      if (!result.ok) assert.match(result.error, /^scale_down_pane_proof_unavailable:%13:query_failed/);
+      assert.deepEqual((await readTeamConfig('success-proof-loss', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
       assert.equal(existsSync(worker2StatusPath), false);
       assert.equal(existsSync(worker3StatusPath), true);
       assert.equal(await readFile(worker3StatusPath, 'utf8'), worker3Raw);
-      assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, undefined);
-      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, undefined);
-      const reclaimedTask = await readTask('success-proof-loss', resolvedTask.id, cwd);
-      assert.equal(reclaimedTask?.status, 'pending');
-      assert.equal(reclaimedTask?.claim, undefined);
-      assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'kill-pane -t %13',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-      ]);
+      assert.equal((await readTask('success-proof-loss', resolvedTask.id, cwd))?.owner, 'worker-2');
+      assert.equal((await readTask('success-proof-loss', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      const retainedTask = await readTask('success-proof-loss', resolvedTask.id, cwd);
+      assert.equal(retainedTask?.status, 'in_progress');
+      assert.equal(retainedTask?.claim?.owner, 'worker-2');
+      const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.deepEqual(tmuxCommands.filter((command) => command.startsWith('kill-pane ')), ['kill-pane -t %13']);
+      const killIndex = tmuxCommands.indexOf('kill-pane -t %13');
+      assert.ok(killIndex > 0);
+      assert.equal(tmuxCommands[killIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+      assert.equal(tmuxCommands[killIndex + 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -3515,7 +3564,7 @@ esac
     }
   });
 
-  it('commits a proven-gone pane while restoring the exact status for a later kill failure', async () => {
+  it('preserves the entire canonical generation when a later pane teardown fails after an earlier pane is gone', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-gone-kill-fail-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-gone-kill-fail-bin-'));
     const tmuxStubPath = join(fakeBinDir, 'tmux');
@@ -3528,8 +3577,18 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
-  list-panes) printf '%s\\t%s\\t%s\\n' '%14' '0' '42414' ;;
-  kill-pane) exit 1 ;;
+  list-panes)
+    if [ -f "${tmuxLogPath}.killed-%13" ]; then
+      printf '%s\t%s\t%s\n' '%14' '0' '42414'
+    else
+      printf '%s\t%s\t%s\n' '%13' '0' '42413'
+      printf '%s\t%s\t%s\n' '%14' '0' '42414'
+    fi
+    ;;
+  kill-pane)
+    if [ "$3" = '%13' ]; then : > "${tmuxLogPath}.killed-%13"; exit 0; fi
+    exit 1
+    ;;
 esac
 `,
       );
@@ -3563,18 +3622,18 @@ esac
 
       assert.equal(result.ok, false);
       if (!result.ok) assert.match(result.error, /^scale_down_cleanup_debt:pane_teardown_failed:%14/);
-      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1']);
+      assert.deepEqual((await readTeamConfig('gone-kill-fail', cwd))?.workers.map((worker) => worker.name), ['worker-1', 'worker-2', 'worker-3']);
       assert.equal(existsSync(worker2StatusPath), false);
       assert.equal(existsSync(worker3StatusPath), true);
       assert.equal(await readFile(worker3StatusPath, 'utf8'), '{\n "state" : "idle", "reason":"three", "updated_at":"2026-07-14T00:00:01.000Z"\n}\n');
-      assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, undefined);
-      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, undefined);
-      const reclaimedTask = await readTask('gone-kill-fail', resolvedTask.id, cwd);
-      assert.equal(reclaimedTask?.status, 'pending');
-      assert.equal(reclaimedTask?.claim, undefined);
+      assert.equal((await readTask('gone-kill-fail', resolvedTask.id, cwd))?.owner, 'worker-2');
+      assert.equal((await readTask('gone-kill-fail', unresolvedTask.id, cwd))?.owner, 'worker-3');
+      const retainedTask = await readTask('gone-kill-fail', resolvedTask.id, cwd);
+      assert.equal(retainedTask?.status, 'in_progress');
+      assert.equal(retainedTask?.claim?.owner, 'worker-2');
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
-        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+        'kill-pane -t %13',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %14',
