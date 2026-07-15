@@ -2735,14 +2735,15 @@ esac
         );
 
         assert.equal(result.ok, false);
-        if (!result.ok) assert.match(result.error, /scale_up_worker_materialization_failed:worker-2:.*finalization/);
+        if (!result.ok) assert.match(result.error, /scale_up_rollback_membership_persistence_failed:.*rollback-persistence-failure/);
+        await readTeamConfig(teamName, cwd);
         assert.equal(await readFile(configPath, 'utf8'), originalConfigBytes);
         assert.equal(await readFile(manifestPath, 'utf8'), originalManifestBytes);
         assert.equal(existsSync(join(teamDir, '.membership-task-transaction.json')), false);
         assert.equal(await readTask(teamName, '1', cwd), null);
         assert.deepEqual(await listDispatchRequests(teamName, cwd), []);
-        assert.equal(existsSync(join(teamDir, 'workers', 'worker-2')), false);
-        assert.equal(existsSync(workerStartupScriptPath(cwd, teamName, 'worker-2')), false);
+        assert.equal(existsSync(join(teamDir, 'workers', 'worker-2')), true);
+        assert.equal(existsSync(workerStartupScriptPath(cwd, teamName, 'worker-2')), true);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;

@@ -468,7 +468,6 @@ export async function scaleUp(
     const originalConfig = JSON.parse(JSON.stringify(config)) as TeamConfig;
     const configPath = join(resolveCanonicalTeamStateRoot(leaderCwd), 'team', sanitized, 'config.json');
     const manifestPath = join(resolveCanonicalTeamStateRoot(leaderCwd), 'team', sanitized, 'manifest.v2.json');
-    const originalConfigBytes = await readFile(configPath, 'utf8');
     const originalManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
 
     const maxWorkers = config.max_workers;
@@ -570,66 +569,49 @@ export async function scaleUp(
       ).values()];
       const rollbackWorkerNames = new Set(rollbackWorkers.map((worker) => worker.name));
 
-      // Restore and verify original config/manifest membership before any worker
-      // artifact deletion. The committed-direction journal remains recovery
-      // authority until both raw canonical files are proven original.
-      let membershipRollbackError: unknown;
-      let membershipRestored = false;
+      // Persist every concrete rollback worker before pane teardown. If the
+      // process exits after this point, canonical config/manifest state still
+      // identifies each live pane and its retryable resources.
       try {
         await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
           await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
           const currentConfigBytes = await readFile(configPath, 'utf8');
           const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
+          const currentConfig = JSON.parse(currentConfigBytes) as TeamConfig;
+          const trackedByName = new Map(currentConfig.workers.map((worker) => [worker.name, worker]));
+          for (const worker of rollbackWorkers) trackedByName.set(worker.name, worker);
+          const trackedConfig: TeamConfig = {
+            ...currentConfig,
+            workers: [...trackedByName.values()],
+            worker_count: trackedByName.size,
+            next_worker_index: Math.max(
+              currentConfig.next_worker_index ?? (currentConfig.workers.length + 1),
+              ...rollbackWorkers.map((worker) => worker.index + 1),
+            ),
+          };
+          const trackedManifestBytes = currentManifestBytes === null
+            ? null
+            : JSON.stringify({
+              ...(JSON.parse(currentManifestBytes) as Record<string, unknown>),
+              workers: trackedConfig.workers,
+              worker_count: trackedConfig.worker_count,
+              next_worker_index: trackedConfig.next_worker_index,
+            }, null, 2);
           await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
             tasks: [],
-            config: { oldBytes: currentConfigBytes, newBytes: originalConfigBytes },
-            manifest: { oldBytes: currentManifestBytes, newBytes: originalManifestBytes },
-            // A failed rollback must recover toward the original membership,
-            // never back to the just-added workers.
+            config: { oldBytes: currentConfigBytes, newBytes: JSON.stringify(trackedConfig, null, 2) },
+            manifest: { oldBytes: currentManifestBytes, newBytes: trackedManifestBytes },
             recoverToNewOnFailure: true,
-            retainJournalOnSuccess: true,
-            failRollbackPersistence: hasScaleUpFailureInjection(env, 'rollback-membership-persistence'),
-            failRollbackPersistenceAfter: hasScaleUpFailureInjection(env, 'rollback-membership-config-persistence')
-              ? 'config'
-              : hasScaleUpFailureInjection(env, 'rollback-membership-manifest-persistence')
-                ? 'manifest'
-                : undefined,
           });
-          const rawConfigBytes = await readFile(configPath, 'utf8');
-          const rawManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
-          if (rawConfigBytes !== originalConfigBytes || rawManifestBytes !== originalManifestBytes) {
-            throw new Error('canonical_scale_up_rollback_membership_verification_failed');
+          const verified = await readTeamConfig(sanitized, leaderCwd);
+          if (!verified || rollbackWorkers.some((worker) => !verified.workers.some((entry) => entry.name === worker.name && entry.pane_id === worker.pane_id))) {
+            throw new Error('canonical_scale_up_rollback_tracking_verification_failed');
           }
-          await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
-          membershipRestored = true;
+          Object.assign(config, verified);
         });
-      } catch (rollbackError) {
-        membershipRollbackError = rollbackError;
+      } catch (trackingError) {
+        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(trackingError)}` };
       }
-      if (!membershipRestored) {
-        try {
-          await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-            await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd, { retainJournal: true });
-            const rawConfigBytes = await readFile(configPath, 'utf8');
-            const rawManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
-            if (rawConfigBytes !== originalConfigBytes || rawManifestBytes !== originalManifestBytes) {
-              throw new Error('canonical_scale_up_rollback_recovery_verification_failed');
-            }
-            await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
-            membershipRestored = true;
-          });
-        } catch (recoveryError) {
-          membershipRollbackError = recoveryError;
-        }
-      }
-      if (!membershipRestored) {
-        const journalPath = join(teamStateRoot, 'team', sanitized, '.membership-task-transaction.json');
-        if (!existsSync(journalPath)) {
-          return { ok: false, error: `scale_up_rollback_membership_persistence_failed:no_recoverable_journal:${String(membershipRollbackError)}` };
-        }
-        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${String(membershipRollbackError)}` };
-      }
-      Object.assign(config, originalConfig);
 
       const cleanupDebt: string[] = [];
       try {
@@ -666,49 +648,70 @@ export async function scaleUp(
       if (context.workerName && context.paneId && unresolvedPaneIds.has(context.paneId)) {
         unresolvedWorkerNames.add(context.workerName);
       }
-      if (unresolvedWorkerNames.size > 0) {
-        try {
-          await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-            await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
-            const currentConfigBytes = await readFile(configPath, 'utf8');
-            const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
-            const currentConfig = JSON.parse(currentConfigBytes) as TeamConfig;
-            const retainedWorkers = rollbackWorkers.filter((worker) => unresolvedWorkerNames.has(worker.name));
-            const retainedByName = new Map(currentConfig.workers.map((worker) => [worker.name, worker]));
-            for (const worker of retainedWorkers) retainedByName.set(worker.name, worker);
-            const nextConfig: TeamConfig = {
-              ...currentConfig,
-              workers: [...retainedByName.values()],
-              worker_count: retainedByName.size,
-              next_worker_index: Math.max(
-                currentConfig.next_worker_index ?? (currentConfig.workers.length + 1),
-                ...retainedWorkers.map((worker) => Number.parseInt(worker.name.replace(/^worker-/, ''), 10) + 1),
-              ),
-            };
-            const nextManifestBytes = currentManifestBytes === null
-              ? null
-              : JSON.stringify({
-                ...(JSON.parse(currentManifestBytes) as Record<string, unknown>),
-                workers: nextConfig.workers,
-                worker_count: nextConfig.worker_count,
-                next_worker_index: nextConfig.next_worker_index,
-              }, null, 2);
-            await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
-              tasks: [],
-              config: { oldBytes: currentConfigBytes, newBytes: JSON.stringify(nextConfig, null, 2) },
-              manifest: { oldBytes: currentManifestBytes, newBytes: nextManifestBytes },
-              retainJournalOnSuccess: true,
+      try {
+        await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
+          await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
+          const currentConfigBytes = await readFile(configPath, 'utf8');
+          const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
+          const retainedWorkers = rollbackWorkers.filter((worker) => unresolvedWorkerNames.has(worker.name));
+          const desiredByName = new Map(originalConfig.workers.map((worker) => [worker.name, worker]));
+          for (const worker of retainedWorkers) desiredByName.set(worker.name, worker);
+          const desiredConfig: TeamConfig = {
+            ...originalConfig,
+            workers: [...desiredByName.values()],
+            worker_count: desiredByName.size,
+            next_worker_index: Math.max(
+              originalConfig.next_worker_index ?? (originalConfig.workers.length + 1),
+              ...retainedWorkers.map((worker) => worker.index + 1),
+            ),
+          };
+          const desiredManifestBytes = originalManifestBytes === null
+            ? null
+            : JSON.stringify({
+              ...(JSON.parse(originalManifestBytes) as Record<string, unknown>),
+              workers: desiredConfig.workers,
+              worker_count: desiredConfig.worker_count,
+              next_worker_index: desiredConfig.next_worker_index,
+            }, null, 2);
+          const taskChanges = [];
+          for (const taskId of createdTaskIds) {
+            const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`);
+            const task = await readTask(sanitized, taskId, leaderCwd);
+            taskChanges.push({
+              taskId,
+              oldBytes: existsSync(taskPath) ? await readFile(taskPath, 'utf8') : null,
+              newBytes: task && unresolvedWorkerNames.has(task.owner ?? '')
+                ? JSON.stringify(task, null, 2)
+                : null,
             });
-            const verified = await readTeamConfig(sanitized, leaderCwd);
-            if (!verified || retainedWorkers.some((worker) => !verified.workers.some((entry) => entry.name === worker.name && entry.pane_id === worker.pane_id))) {
-              throw new Error('canonical_scale_up_rollback_unresolved_membership_verification_failed');
-            }
-            await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
-            Object.assign(config, verified);
+          }
+          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
+            tasks: taskChanges,
+            config: { oldBytes: currentConfigBytes, newBytes: JSON.stringify(desiredConfig, null, 2) },
+            manifest: { oldBytes: currentManifestBytes, newBytes: desiredManifestBytes },
+            recoverToNewOnFailure: true,
+            retainJournalOnSuccess: true,
+            failRollbackPersistence: hasScaleUpFailureInjection(env, 'rollback-membership-persistence'),
+            failRollbackPersistenceAfter: hasScaleUpFailureInjection(env, 'rollback-membership-config-persistence')
+              ? 'config'
+              : hasScaleUpFailureInjection(env, 'rollback-membership-manifest-persistence')
+                ? 'manifest'
+                : undefined,
           });
-        } catch (rollbackError) {
-          cleanupDebt.push(`unresolved_membership_persistence_failed:${String(rollbackError)}`);
-        }
+          const verified = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
+          if (!verified || retainedWorkers.some((worker) => !verified.workers.some((entry) => entry.name === worker.name && entry.pane_id === worker.pane_id))) {
+            throw new Error('canonical_scale_up_rollback_membership_verification_failed');
+          }
+          if (verified.workers.some((worker) => rollbackWorkerNames.has(worker.name) && !unresolvedWorkerNames.has(worker.name))) {
+            throw new Error('canonical_scale_up_rollback_resolved_membership_verification_failed');
+          }
+          await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
+          Object.assign(config, verified);
+        });
+      } catch (rollbackError) {
+        const journalPath = join(teamStateRoot, 'team', sanitized, '.membership-task-transaction.json');
+        const suffix = existsSync(journalPath) ? String(rollbackError) : `no_recoverable_journal:${String(rollbackError)}`;
+        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${suffix}` };
       }
       const cleanupWorkerNames = new Set([
         ...rollbackWorkers
