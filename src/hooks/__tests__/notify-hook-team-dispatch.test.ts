@@ -1880,6 +1880,58 @@ exit 0
     }
   });
 
+  it('rejects a recycled configured worker pane before dispatch effects', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-recycled-worker-pane-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const exactPaneSequencePath = join(cwd, 'exact-pane-sequence.txt');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      await writeFile(exactPaneSequencePath, '%42\t0\t4242\n');
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+      process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE = exactPaneSequencePath;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const config = await readTeamConfig('alpha', cwd);
+      assert.ok(config?.workers[0]);
+      if (!config?.workers[0]) return;
+      config.workers[0].pane_id = '%42';
+      config.workers[0].pid = 1111;
+      await saveTeamConfig(config, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: '%42',
+        trigger_message: 'must not reach recycled pane',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'exact_pane_unavailable');
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assert.doesNotMatch(tmuxLog, /display-message|capture-pane|send-keys|paste-buffer|set-buffer/);
+      const dispatchLogPath = join(cwd, '.omx', 'logs', `team-dispatch-${new Date().toISOString().slice(0, 10)}.jsonl`);
+      const dispatchLog = (await readFile(dispatchLogPath, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      const failure = dispatchLog.find((entry) => entry.request_id === queued.request.request_id && entry.type === 'dispatch_failed');
+      assert.equal(failure?.exact_pane_proof?.reason, 'pane_pid_changed');
+      assert.equal(failure?.exact_pane_proof?.expectedPid, 1111);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      delete process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE;
+      delete process.env.OMX_TEST_EXACT_PANE_COUNTER_FILE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('stops explicit-pane dispatch after a later exact proof is lost', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-exact-pane-loss-'));
     const fakeBinDir = join(cwd, 'fake-bin');

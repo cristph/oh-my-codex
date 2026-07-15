@@ -146,6 +146,7 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   requireObservableState = false,
   requireCaptureEvidence = undefined,
   exactPaneId = undefined,
+  expectedPanePid = undefined,
 } = {}): Promise<any> {
   const normalizedRequireObservableState = typeof requireCaptureEvidence === 'boolean' ? requireCaptureEvidence : requireObservableState;
   const target = safeString(paneTarget).trim();
@@ -165,11 +166,11 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   const exactPaneIdentity = safeString(exactPaneId).trim();
   const exactPaneIdentityProvided = explicitPaneIdentity(exactPaneId).provided;
   let exactPaneProof: any = null;
-  let expectedPanePid: number | undefined;
+  let pinnedPanePid = typeof expectedPanePid === 'number' ? expectedPanePid : undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity, expectedPanePid);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, pinnedPanePid);
     exactPaneProof = paneProof.proof || null;
-    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') expectedPanePid ??= paneProof.proof.pid;
+    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') pinnedPanePid ??= paneProof.proof.pid;
     return paneProof;
   };
   let paneCurrentCommand = '';
@@ -310,6 +311,7 @@ export async function sendPaneInput({
   typePrompt = true,
   queueFirstSubmit = false,
   exactPaneId = undefined,
+  expectedPanePid = undefined,
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
   if (!target) {
@@ -320,11 +322,11 @@ export async function sendPaneInput({
 
   const exactPaneIdentity = safeString(exactPaneId).trim();
   let exactPaneProof: any = null;
-  let expectedPanePid: number | undefined;
+  let pinnedPanePid = typeof expectedPanePid === 'number' ? expectedPanePid : undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity, expectedPanePid);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, pinnedPanePid);
     exactPaneProof = paneProof.proof || null;
-    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') expectedPanePid ??= paneProof.proof.pid;
+    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') pinnedPanePid ??= paneProof.proof.pid;
     return paneProof;
   };
   const initialProof = await verifyExplicitPane();

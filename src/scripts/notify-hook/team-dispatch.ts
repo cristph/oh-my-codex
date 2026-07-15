@@ -479,10 +479,11 @@ function resolveAddressedWorker(request, config) {
 
 function resolveConfiguredPaneIdentity(request, config) {
   if (request.to_worker === 'leader-fixed') {
-    return { source: 'leader_pane_id', ...explicitPaneIdentity(config?.leader_pane_id) };
+    return { source: 'leader_pane_id', expectedPanePid: undefined, ...explicitPaneIdentity(config?.leader_pane_id) };
   }
   const worker = resolveAddressedWorker(request, config);
-  return { source: 'worker_pane_id', ...explicitPaneIdentity(worker?.pane_id) };
+  const expectedPanePid = Number.isInteger(worker?.pid) && Number(worker.pid) > 0 ? Number(worker.pid) : undefined;
+  return { source: 'worker_pane_id', expectedPanePid, ...explicitPaneIdentity(worker?.pane_id) };
 }
 
 function resolveDispatchTarget(request, config) {
@@ -509,7 +510,7 @@ function resolveDispatchTarget(request, config) {
         };
       }
     }
-    return { target: { type: 'pane', value: requestPane.paneId }, exactPaneId: requestPane.paneId, source: 'request_pane_id', reason: 'explicit_request_pane_id' };
+    return { target: { type: 'pane', value: requestPane.paneId }, exactPaneId: requestPane.paneId, expectedPanePid: configuredPane.expectedPanePid, source: 'request_pane_id', reason: 'explicit_request_pane_id' };
   }
   if (configuredPane.provided) {
     if (!configuredPane.paneId) {
@@ -518,7 +519,7 @@ function resolveDispatchTarget(request, config) {
     if (configuredPane.paneId === hudPaneId) {
       return { failure: 'hud_pane_target', paneId: configuredPane.paneId, paneSource: configuredPane.source };
     }
-    return { target: { type: 'pane', value: configuredPane.paneId }, exactPaneId: configuredPane.paneId, source: configuredPane.source, reason: configuredPane.source };
+    return { target: { type: 'pane', value: configuredPane.paneId }, exactPaneId: configuredPane.paneId, expectedPanePid: configuredPane.expectedPanePid, source: configuredPane.source, reason: configuredPane.source };
   }
   if (request.to_worker === 'leader-fixed') return { target: null };
   if (typeof request.worker_index === 'number' && config.tmux_session) {
@@ -880,6 +881,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     requireIdle: false,
     requireObservableState: leaderTargeted,
     exactPaneId,
+    expectedPanePid: dispatchTarget.expectedPanePid,
   });
   if (!paneGuard.ok) {
     return {
@@ -896,7 +898,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
 
   let exactPaneProof = paneGuard.exactPaneProof || null;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneId);
+    const paneProof = await verifyExactPaneLive(exactPaneId, dispatchTarget.expectedPanePid);
     exactPaneProof = paneProof.proof || null;
     return paneProof;
   };
@@ -932,6 +934,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   const sendResult = await sendPaneInput({
     paneTarget: resolution.paneTarget,
     exactPaneId,
+    expectedPanePid: dispatchTarget.expectedPanePid,
     prompt: request.trigger_message,
     submitKeyPresses,
     typePrompt: shouldTypePrompt,
@@ -985,6 +988,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
           const retrySend = await sendPaneInput({
             paneTarget: resolution.paneTarget,
             exactPaneId,
+            expectedPanePid: dispatchTarget.expectedPanePid,
             prompt: request.trigger_message,
             submitKeyPresses,
             typePrompt: false,
